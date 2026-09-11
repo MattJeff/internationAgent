@@ -31,13 +31,21 @@
 //! une créance et sort un PDF, une réponse à un devis ne s'écrit qu'une fois.
 //! Les lectures sont [`Risk::Read`] et rien d'autre.
 //!
+//! # La seule ligne à corps brut, et ce que le module disait avant
+//!
+//! `POST /v1/prospects/import` n'avait **pas** de ligne ici : son corps est du
+//! `text/csv` — la route refuse tout le reste avec un 415 — et le contrat
+//! d'exécution ne savait porter qu'un corps JSON. Le champ `raw_body` est
+//! arrivé depuis ; `prospects_import` est la seule ligne de ce déploiement à
+//! s'en servir, et le reste de ses arguments part en chaîne de requête faute de
+//! place dans un corps qui est déjà le fichier.
+//!
 //! # Ce qui manque, et ce n'est pas un oubli
 //!
-//! `POST /v1/prospects/import` n'a **pas** de ligne ici. Son corps est du
-//! `text/csv` — la route refuse tout le reste avec un 415 — et le contrat
-//! d'exécution ne sait porter qu'un corps JSON. Une ligne qui l'annoncerait
-//! serait un outil qui échoue à chaque appel ; voir le rapport de cette vague
-//! pour le plus petit changement qui le rendrait possible.
+//! Aucun outil n'**émet** une facture ni un devis, et il ne faut pas en
+//! ajouter : seul un employé le fait, avec un jeton que la Policy Gate a émis
+//! pour lui. Les lignes `invoices_*` et `quotes_*` d'ici ne savent que
+//! constater ou retirer.
 
 use serde_json::{Value, json};
 
@@ -86,13 +94,14 @@ pub fn tools() -> Vec<ToolDef> {
         // prospects — les inconnus, et le vocabulaire qui les range
         // -------------------------------------------------------------------
         ToolDef {
-            name: "prospects_segments",
+            name: "prospects_segments_list",
             title: "Les segments de prospection admis",
-            description: "Rend la liste fermée des segments dans lesquels un compte peut être rangé, telle \
-                 que la contrainte `accounts_segment` de la base l'admet. À appeler avant tout \
-                 import de liste : un segment hors de cette liste est refusé avec un 400 \
-                 `bad_segment`, et c'est la seule façon de connaître l'orthographe exacte \
-                 attendue.",
+            description: "Rend la liste fermée des segments dans lesquels un compte peut être \
+                 rangé, telle que la contrainte `accounts_segment` de la base l'admet. À appeler \
+                 avant tout import de liste : un segment hors de cette liste est refusé avec un \
+                 400 `bad_segment`, et c'est la seule façon de connaître l'orthographe exacte \
+                 attendue. C'est exactement la valeur qu'attend le champ `segment` de \
+                 `prospects_import`.",
             method: Method::Get,
             path: "/v1/prospects/segments",
             schema: nothing(),
@@ -104,13 +113,13 @@ pub fn tools() -> Vec<ToolDef> {
             name: "prospects_import",
             title: "Importer une liste de prospects, à blanc ou pour de vrai",
             description: "Verse un export CSV au format Smartlead — les huit premières colonnes, \
-                 en-tête compris — dans les comptes et contacts de cette entreprise. Le corps \
-                 est le CSV lui-même, pas du JSON. **Passez d'abord `dry_run: true`** : rien \
-                 n'est écrit, et le rapport nomme chaque ligne refusée avec son numéro, ce qui \
-                 est la seule façon de voir un en-tête de travers avant d'avoir importé la \
-                 moitié d'un fichier. Le segment doit venir de `prospects_segments`. Un second \
-                 import du même fichier ne duplique rien : un compte est son domaine, un contact \
-                 son adresse. Corps plafonné à 1 Mio comme toute requête de cette API.",
+                 en-tête compris — dans les comptes et contacts de cette entreprise. Le corps est \
+                 le CSV lui-même, pas du JSON. **Passez d'abord `dry_run: true`** : rien n'est \
+                 écrit, et le rapport nomme chaque ligne refusée avec son numéro, ce qui est la \
+                 seule façon de voir un en-tête de travers avant d'avoir importé la moitié d'un \
+                 fichier. Le segment doit venir de `prospects_segments_list`. Un second import du \
+                 même fichier ne duplique rien : un compte est son domaine, un contact son \
+                 adresse. Corps plafonné à 1 Mio comme toute requête de cette API.",
             method: Method::Post,
             path: "/v1/prospects/import",
             schema: json!({
@@ -122,7 +131,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "segment": {
                         "type": "string",
-                        "description": "un segment rendu par `prospects_segments`"
+                        "description": "un segment rendu par `prospects_segments_list`"
                     },
                     "country": {
                         "type": "string",
@@ -146,15 +155,17 @@ pub fn tools() -> Vec<ToolDef> {
         // outreach — l'activité commerciale, pas l'administration
         // -------------------------------------------------------------------
         ToolDef {
-            name: "outreach_summary",
+            name: "outreach_summary_get",
             title: "Combien d'inconnus approchés, combien de réponses",
-            description: "Rend, sur une fenêtre, le nombre d'inconnus approchés, de fils qui ont répondu, \
-                 d'heures prises sur la page de réservation et d'adresses retirées, avec une \
-                 ligne par jour (zéros compris) et la liste de ce que ces chiffres ne couvrent \
-                 pas. C'est la seule lecture qui dit si l'entreprise *travaille* — `pnl` dit ce \
-                 qu'elle brûle, `autonomy` qui décide, aucune ne dit si quelqu'un a été \
+            description: "Rend, sur une fenêtre, le nombre d'inconnus approchés, de fils qui ont \
+                 répondu, d'heures prises sur la page de réservation et d'adresses retirées, avec \
+                 une ligne par jour (zéros compris) et la liste de ce que ces chiffres ne couvrent \
+                 pas. C'est la seule lecture qui dit si l'entreprise *travaille* — `pnl_get` dit \
+                 ce qu'elle brûle, `autonomy_get` qui décide, aucune ne dit si quelqu'un a été \
                  approché ; lire `unmeasured` avant de citer un chiffre, `approached` compte des \
-                 créneaux réservés et non des envois partis.",
+                 créneaux réservés et non des envois partis. La réputation du domaine qui porte \
+                 ces envois est sur `outreach_health_get`, et ce que le tirage de la file a \
+                 consommé sur `prospects_queue_export`.",
             method: Method::Get,
             path: "/v1/outreach",
             schema: schema(window_props(), &[]),
@@ -163,14 +174,16 @@ pub fn tools() -> Vec<ToolDef> {
             risk: Risk::Read,
         },
         ToolDef {
-            name: "outreach_health",
+            name: "outreach_health_get",
             title: "La réputation du domaine d'envoi",
-            description: "Rend, depuis N jours, les envois, livraisons, ouvertures, clics, rebonds et \
-                 plaintes, plus les deux taux **en pour mille des envois** — l'unité des seuils \
+            description: "Rend, depuis N jours, les envois, livraisons, ouvertures, clics, rebonds \
+                 et plaintes, plus les deux taux **en pour mille des envois** — l'unité des seuils \
                  que Google et Yahoo publient (0,3 % de plaintes = 3 ‰). À consulter avant \
-                 d'augmenter un plafond journalier ou de lancer une campagne : un domaine dont \
-                 le taux de plaintes monte ne se répare pas par une cadence, et cette lecture \
-                 est la seule qui le voie venir.",
+                 d'augmenter un plafond journalier ou de lancer une campagne : un domaine dont le \
+                 taux de plaintes monte ne se répare pas par une cadence, et cette lecture est la \
+                 seule qui le voie venir. Le plafond, lui, se change avec `domains_cap_set` — et \
+                 il ne répare rien : un taux de plaintes qui monte ne se traite pas par une \
+                 cadence.",
             method: Method::Get,
             path: "/v1/outreach/health",
             schema: schema(
@@ -194,9 +207,12 @@ pub fn tools() -> Vec<ToolDef> {
         ToolDef {
             name: "sequences_list",
             title: "Les séquences de l'entreprise",
-            description: "Rend toutes les séquences définies, les vivantes d'abord puis les archivées, \
-                 avec leurs pas. À appeler avant d'enrôler quelqu'un : c'est là que se lisent \
-                 l'identifiant d'une séquence et le nombre de mails qu'elle promet.",
+            description: "Rend toutes les séquences définies, les vivantes d'abord puis les \
+                 archivées, avec leurs pas. À appeler avant d'enrôler quelqu'un : c'est là que se \
+                 lisent l'identifiant d'une séquence et le nombre de mails qu'elle promet. C'est \
+                 la source de l'`id` de `sequences_enroll`, `sequences_runs_list` et \
+                 `sequences_archive` ; pour savoir où en sont les inscrits d'une séquence déjà \
+                 lancée, c'est `sequences_runs_list` et pas celui-ci.",
             method: Method::Get,
             path: "/v1/sequences",
             schema: nothing(),
@@ -205,15 +221,14 @@ pub fn tools() -> Vec<ToolDef> {
             risk: Risk::Read,
         },
         ToolDef {
-            name: "sequences_define",
+            name: "sequences_create",
             title: "Définir une séquence",
-            description: "Crée une séquence : une liste ordonnée de pas `email` (un brief, pas un texte de \
-                 mail), `wait` (des heures) et `branch` (sauter selon une ouverture ou un clic). \
-                 Définir ne contacte personne — c'est `sequences_enroll` qui met quelqu'un \
-                 dessus ; la liste est refusée en 400 si elle est vide, dépasse 12 pas, n'a \
-                 aucun pas `email`, saute hors de la liste ou boucle sans `wait` (elle \
-                 tournerait à chaque tick), et en 409 `name_taken` si une séquence vivante porte \
-                 déjà ce nom.",
+            description: "Crée une séquence : une liste ordonnée de pas `email` (un brief, pas un \
+                 texte de mail), `wait` (des heures) et `branch` (sauter selon une ouverture ou un \
+                 clic). Définir ne contacte personne — c'est `sequences_enroll` qui met quelqu'un \
+                 dessus ; la liste est refusée en 400 si elle est vide, dépasse 12 pas, n'a aucun \
+                 pas `email`, saute hors de la liste ou boucle sans `wait` (elle tournerait à \
+                 chaque tick), et en 409 `name_taken` si une séquence vivante porte déjà ce nom.",
             method: Method::Post,
             path: "/v1/sequences",
             schema: schema(
@@ -294,14 +309,17 @@ pub fn tools() -> Vec<ToolDef> {
         ToolDef {
             name: "sequences_enroll",
             title: "Inscrire un contact dans une séquence",
-            description: "Met un contact sur une séquence sous la responsabilité d'un siège : la position \
-                 est posée et le premier pas est joué au prochain tick. **Un pas `email` ne poste \
-                 rien** — il réserve une promesse au calendrier, et quand elle sonne le siège est \
-                 réveillé et écrit le mail lui-même, qui passe la Gate comme tout autre envoi \
-                 (suppression, budget d'inconnus du jour, `MAX_TOUCHES`) ; refusé en 403 \
+            description: "Met un contact sur une séquence sous la responsabilité d'un siège : la \
+                 position est posée et le premier pas est joué au prochain tick. **Un pas `email` \
+                 ne poste rien** — il réserve une promesse au calendrier, et quand elle sonne le \
+                 siège est réveillé et écrit le mail lui-même, qui passe la Gate comme tout autre \
+                 envoi (suppression, budget d'inconnus du jour, `MAX_TOUCHES`) ; refusé en 403 \
                  `suppressed` si l'adresse a demandé qu'on la laisse tranquille, en 409 si le \
                  contact est déjà inscrit, en 404 si la séquence, le contact ou le siège \
-                 n'appartiennent pas à cette entreprise.",
+                 n'appartiennent pas à cette entreprise. L'`id` vient de `sequences_list`, le \
+                 `contact_id` d'un import fait par `prospects_import`, et l'`employee_id` \
+                 d'`employees_list` ; où en est l'inscrit ensuite se lit sur \
+                 `sequences_runs_list`.",
             method: Method::Post,
             path: "/v1/sequences/{id}/enroll",
             schema: schema(
@@ -329,13 +347,16 @@ pub fn tools() -> Vec<ToolDef> {
             risk: Risk::Destructive,
         },
         ToolDef {
-            name: "sequences_runs",
+            name: "sequences_runs_list",
             title: "Où en est chaque inscrit d'une séquence",
-            description: "Rend, pour une séquence, chaque contact inscrit et sa position : le pas courant, \
-                 quand le prochain est dû, et pourquoi le run s'est arrêté le cas échéant \
+            description: "Rend, pour une séquence, chaque contact inscrit et sa position : le pas \
+                 courant, quand le prochain est dû, et pourquoi le run s'est arrêté le cas échéant \
                  (`replied`, `max_touches`, `not_sent`, `done`). C'est la lecture qui explique \
-                 pourquoi une séquence semble ne rien faire — `not_sent` veut dire que le siège \
-                 a été réveillé et que rien n'est parti, souvent parce que la Gate a refusé.",
+                 pourquoi une séquence semble ne rien faire — `not_sent` veut dire que le siège a \
+                 été réveillé et que rien n'est parti, souvent parce que la Gate a refusé. L'`id` \
+                 vient de `sequences_list`. Un run bloqué en `not_sent` se diagnostique sur \
+                 `refusals_get` et `domains_primary_get` — un plafond journalier épuisé est la \
+                 cause la plus fréquente.",
             method: Method::Get,
             path: "/v1/sequences/{id}/runs",
             schema: schema(
@@ -351,10 +372,11 @@ pub fn tools() -> Vec<ToolDef> {
         ToolDef {
             name: "sequences_archive",
             title: "Archiver une séquence",
-            description: "Archive une séquence pour qu'on ne puisse plus y inscrire personne ; les runs \
-                 déjà en cours vont jusqu'au bout, ce geste ne les arrête pas. 404 si la \
+            description: "Archive une séquence pour qu'on ne puisse plus y inscrire personne ; les \
+                 runs déjà en cours vont jusqu'au bout, ce geste ne les arrête pas. 404 si la \
                  séquence n'est pas à cette entreprise ou est déjà archivée — il n'y a pas de \
-                 désarchivage, le nom redevient seulement disponible.",
+                 désarchivage, le nom redevient seulement disponible. L'`id` vient de \
+                 `sequences_list`.",
             method: Method::Delete,
             path: "/v1/sequences/{id}",
             schema: schema(
@@ -371,13 +393,17 @@ pub fn tools() -> Vec<ToolDef> {
         // domain — le domaine d'envoi, sans lequel aucun siège n'écrit
         // -------------------------------------------------------------------
         ToolDef {
-            name: "domain_get",
+            name: "domains_primary_get",
             title: "Le domaine d'envoi principal",
-            description: "Rend le domaine principal du locataire — celui dont les sièges tirent leur \
-                 adresse — avec son statut chez le fournisseur, les enregistrements DNS qu'il \
+            description: "Rend le domaine principal du locataire — celui dont les sièges tirent \
+                 leur adresse — avec son statut chez le fournisseur, les enregistrements DNS qu'il \
                  réclame, son plafond journalier et ce qui est déjà parti aujourd'hui. 404 \
-                 `no_domain` quand aucun domaine n'est posé : c'est la première chose à \
-                 vérifier quand un envoi ne part pas.",
+                 `no_domain` quand aucun domaine n'est posé : c'est la première chose à vérifier \
+                 quand un envoi ne part pas. Deux suites possibles selon ce qu'on lit : un statut \
+                 qui n'est pas vérifié se traite par `domains_dns_publish` puis `domains_verify` — \
+                 **un siège ne peut pas s'asseoir sur un domaine non vérifié** — et un compteur du \
+                 jour collé à son plafond se traite par `domains_cap_set`, ou en attendant demain. \
+                 Dès qu'il y a plus d'un domaine, `domains_list` les montre tous.",
             method: Method::Get,
             path: "/v1/domain",
             schema: nothing(),
@@ -386,12 +412,12 @@ pub fn tools() -> Vec<ToolDef> {
             risk: Risk::Read,
         },
         ToolDef {
-            name: "domain_list",
+            name: "domains_list",
             title: "Tous les domaines d'envoi",
-            description: "Rend tous les domaines d'envoi du locataire, la primaire en tête, chacun avec \
-                 son statut, ses enregistrements, son plafond et son compteur du jour. À \
-                 préférer à `domain_get` dès qu'il y a plus d'un domaine, notamment pour voir \
-                 lequel a épuisé son plafond.",
+            description: "Rend tous les domaines d'envoi du locataire, la primaire en tête, chacun \
+                 avec son statut, ses enregistrements, son plafond et son compteur du jour. À \
+                 préférer à `domains_primary_get` dès qu'il y a plus d'un domaine, notamment pour \
+                 voir lequel a épuisé son plafond.",
             method: Method::Get,
             path: "/v1/domains",
             schema: nothing(),
@@ -400,13 +426,14 @@ pub fn tools() -> Vec<ToolDef> {
             risk: Risk::Read,
         },
         ToolDef {
-            name: "domain_register",
+            name: "domains_register",
             title: "Ajouter un domaine d'envoi",
-            description: "Déclare un domaine chez le fournisseur email et rend les enregistrements DNS \
-                 qu'il faudra poser ; le premier domaine déclaré devient la primaire. **Le \
+            description: "Déclare un domaine chez le fournisseur email et rend les enregistrements \
+                 DNS qu'il faudra poser ; le premier domaine déclaré devient la primaire. **Le \
                  domaine n'est pas utilisable pour autant** : il faut poser le DNS \
-                 (`domain_dns` ou à la main) puis appeler `domain_verify` — 409 `domain_taken` \
-                 si un autre locataire l'a déjà, 200 au lieu de 201 s'il était déjà là.",
+                 (`domains_dns_publish` ou à la main) puis appeler `domains_verify` — 409 \
+                 `domain_taken` si un autre locataire l'a déjà, 200 au lieu de 201 s'il était déjà \
+                 là.",
             method: Method::Post,
             path: "/v1/domain",
             schema: schema(
@@ -423,13 +450,14 @@ pub fn tools() -> Vec<ToolDef> {
             risk: Risk::Write,
         },
         ToolDef {
-            name: "domain_verify",
+            name: "domains_verify",
             title: "Relire le statut d'un domaine chez le fournisseur",
-            description: "Redemande au fournisseur où en est la vérification d'un domaine et enregistre \
-                 la réponse ; si le domaine devient vérifié, les sièges qui attendaient pour \
-                 écrire sont réveillés. **Un siège ne peut pas s'asseoir sur un domaine non \
-                 vérifié** — c'est cet appel qu'on répète après avoir posé le DNS, sur la \
-                 primaire quand `domain` est omis.",
+            description: "Redemande au fournisseur où en est la vérification d'un domaine et \
+                 enregistre la réponse ; si le domaine devient vérifié, les sièges qui attendaient \
+                 pour écrire sont réveillés. **Un siège ne peut pas s'asseoir sur un domaine non \
+                 vérifié** — c'est cet appel qu'on répète après avoir posé le DNS, sur la primaire \
+                 quand `domain` est omis. Le domaine vient de `domains_list`, et les \
+                 enregistrements qu'il faut avoir posés d'abord de `domains_dns_publish`.",
             method: Method::Post,
             path: "/v1/domain/verify",
             schema: schema(
@@ -446,13 +474,13 @@ pub fn tools() -> Vec<ToolDef> {
             risk: Risk::Write,
         },
         ToolDef {
-            name: "domain_dns",
+            name: "domains_dns_publish",
             title: "Poser les enregistrements DNS chez Cloudflare",
-            description: "Recopie chez Cloudflare, en un appel, les enregistrements que le fournisseur \
-                 réclame pour ce domaine, et rend ce qui a été posé, ce qui existait déjà et la \
-                 zone touchée. Le jeton Cloudflare est lu dans le corps, utilisé une fois et \
-                 jamais stocké ni journalisé ; il faut ensuite `domain_verify` pour que le \
-                 domaine devienne utilisable.",
+            description: "Recopie chez Cloudflare, en un appel, les enregistrements que le \
+                 fournisseur réclame pour ce domaine, et rend ce qui a été posé, ce qui existait \
+                 déjà et la zone touchée. Le jeton Cloudflare est lu dans le corps, utilisé une \
+                 fois et jamais stocké ni journalisé ; il faut ensuite `domains_verify` pour que \
+                 le domaine devienne utilisable.",
             method: Method::Post,
             path: "/v1/domain/dns",
             schema: schema(
@@ -473,13 +501,14 @@ pub fn tools() -> Vec<ToolDef> {
             risk: Risk::Write,
         },
         ToolDef {
-            name: "domain_set_cap",
+            name: "domains_cap_set",
             title: "Changer le plafond journalier d'un domaine",
-            description: "Fixe combien de messages ce domaine peut envoyer par jour UTC. **Le plafond \
-                 s'épuise** : une fois atteint, les envois de la journée sont refusés et \
+            description: "Fixe combien de messages ce domaine peut envoyer par jour UTC. **Le \
+                 plafond s'épuise** : une fois atteint, les envois de la journée sont refusés et \
                  attendent le lendemain — c'est la première explication d'une file qui n'avance \
                  plus l'après-midi ; zéro est refusé en 400 `bad_cap` (pour ne plus envoyer du \
-                 tout, retirer le domaine).",
+                 tout, retirer le domaine). Le domaine vient de `domains_list`, et ce qui est déjà \
+                 parti aujourd'hui de `domains_primary_get`.",
             method: Method::Put,
             path: "/v1/domains/{domain}/cap",
             schema: schema(
@@ -488,7 +517,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "daily_cap": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Messages par jour UTC. Monter ce nombre sans regarder `outreach_health` est la façon habituelle de griller un domaine."
+                        "description": "Messages par jour UTC. Monter ce nombre sans regarder `outreach_health_get` est la façon habituelle de griller un domaine."
                     }
                 }),
                 &["domain", "daily_cap"],
@@ -498,11 +527,12 @@ pub fn tools() -> Vec<ToolDef> {
             risk: Risk::Write,
         },
         ToolDef {
-            name: "domain_remove",
+            name: "domains_remove",
             title: "Retirer un domaine d'envoi",
-            description: "Retire un domaine d'envoi du locataire ; les sièges qui en tiraient leur adresse \
-                 n'en ont plus. 409 `primary_domain` sur la primaire — il faut en désigner une \
-                 autre d'abord — et 404 si le domaine n'est pas à cette entreprise.",
+            description: "Retire un domaine d'envoi du locataire ; les sièges qui en tiraient leur \
+                 adresse n'en ont plus. 409 `primary_domain` sur la primaire — il faut en désigner \
+                 une autre d'abord — et 404 si le domaine n'est pas à cette entreprise. Le domaine \
+                 vient de `domains_list`.",
             method: Method::Delete,
             path: "/v1/domains/{domain}",
             schema: schema(
@@ -519,15 +549,17 @@ pub fn tools() -> Vec<ToolDef> {
         // queue — le fichier de prospection, et ce qu'il dépense
         // -------------------------------------------------------------------
         ToolDef {
-            name: "queue_export",
+            name: "prospects_queue_export",
             title: "Tirer la file de prospection du jour",
-            description: "Construit le fichier CSV des prospects à contacter sous les limites du siège \
-                 nommé, et rend `{queued, csv}`. **Cet appel écrit** : il marque les personnes \
-                 servies comme approchées, dépense le budget d'inconnus du jour et repousse \
-                 leurs relances de 72 h — le rejouer rend un fichier différent, souvent vide, et \
-                 les places dépensées ne reviennent pas ; le rejouer *pour cause d'erreur* \
-                 demande donc de réutiliser la même clé d'idempotence, et `queued: 0` avec un \
-                 200 est une réponse normale (budget épuisé, ou rien de frais).",
+            description: "Construit le fichier CSV des prospects à contacter sous les limites du \
+                 siège nommé, et rend `{queued, csv}`. **Cet appel écrit** : il marque les \
+                 personnes servies comme approchées, dépense le budget d'inconnus du jour et \
+                 repousse leurs relances de 72 h — le rejouer rend un fichier différent, souvent \
+                 vide, et les places dépensées ne reviennent pas ; le rejouer *pour cause \
+                 d'erreur* demande donc de réutiliser la même clé d'idempotence, et `queued: 0` \
+                 avec un 200 est une réponse normale (budget épuisé, ou rien de frais). L'`id` est \
+                 le siège qui contactera, depuis `employees_list` ; ce que le tirage a consommé se \
+                 relit ensuite sur `outreach_summary_get`.",
             method: Method::Post,
             path: "/v1/employees/{id}/queue/export",
             schema: schema(
@@ -560,7 +592,10 @@ pub fn tools() -> Vec<ToolDef> {
                  nul veut dire que la page était la dernière. Il n'y a volontairement aucun \
                  total : un devis n'est dû par personne, le carnet de créances se lit sur \
                  `invoices_list` ; `expired` sur une ligne est une question distincte de \
-                 `state`, un devis accepté à temps peut avoir expiré depuis.",
+                 `state`, un devis accepté à temps peut avoir expiré depuis. C'est la source de \
+                 l'`id` de `quotes_accept` et `quotes_decline`, et la seule lecture des devis : \
+                 rien dans cette table n'en *émet* un, seul un employé le fait avec un jeton de \
+                 la Policy Gate.",
             method: Method::Get,
             path: "/v1/quotes",
             schema: json!({
@@ -591,12 +626,13 @@ pub fn tools() -> Vec<ToolDef> {
         ToolDef {
             name: "quotes_accept",
             title: "Enregistrer qu'un devis a été accepté",
-            description: "Écrit que le client a dit oui, à l'instant du serveur — il n'y a pas de date à \
-                 fournir, une date antidatée ressusciterait un devis périmé. **Cela ne s'écrit \
-                 qu'une fois et ne se retire pas**, et c'est délibérément un geste d'opérateur : \
-                 le siège qui a proposé le devis ne doit pas être ce qui déclare qu'il a été \
-                 accepté ; 404 couvre les quatre refus (pas à cette entreprise, inexistant, déjà \
-                 répondu, **périmé** — seul ce dernier est actionnable et le `detail` le dit).",
+            description: "Écrit que le client a dit oui, à l'instant du serveur — il n'y a pas de \
+                 date à fournir, une date antidatée ressusciterait un devis périmé. **Cela ne \
+                 s'écrit qu'une fois et ne se retire pas**, et c'est délibérément un geste \
+                 d'opérateur : le siège qui a proposé le devis ne doit pas être ce qui déclare \
+                 qu'il a été accepté ; 404 couvre les quatre refus (pas à cette entreprise, \
+                 inexistant, déjà répondu, **périmé** — seul ce dernier est actionnable et le \
+                 `detail` le dit). L'`id` vient de `quotes_list`.",
             method: Method::Post,
             path: "/v1/quotes/{id}/accepted",
             schema: schema(
@@ -612,11 +648,11 @@ pub fn tools() -> Vec<ToolDef> {
         ToolDef {
             name: "quotes_decline",
             title: "Enregistrer qu'un devis a été refusé",
-            description: "Écrit que le client a dit non, à l'instant du serveur, une seule fois et sans \
-                 retour possible. Mêmes quatre refus en 404 que l'acceptation, péremption \
-                 comprise : refuser une offre qui n'était déjà plus faite enregistrerait le \
-                 refus de quelque chose qui n'était pas sur la table — dans ce cas, il faut \
-                 réémettre un devis avec une nouvelle validité.",
+            description: "Écrit que le client a dit non, à l'instant du serveur, une seule fois et \
+                 sans retour possible. Mêmes quatre refus en 404 que l'acceptation, péremption \
+                 comprise : refuser une offre qui n'était déjà plus faite enregistrerait le refus \
+                 de quelque chose qui n'était pas sur la table — dans ce cas, il faut réémettre un \
+                 devis avec une nouvelle validité. L'`id` vient de `quotes_list`.",
             method: Method::Post,
             path: "/v1/quotes/{id}/declined",
             schema: schema(
@@ -635,18 +671,20 @@ pub fn tools() -> Vec<ToolDef> {
         ToolDef {
             name: "invoices_list",
             title: "Le registre des factures",
-            description: "Rend une page du registre, la plus ancienne d'abord, réglées et impayées \
-                 ensemble par défaut, avec `outstanding_minor` **par devise** (il n'y a pas de \
-                 taux de change dans ce produit, et il ne doit pas y en avoir). **Ce total est \
-                 celui du registre entier, jamais celui de la page** : il ne rétrécit pas quand \
-                 on pagine. `state=outstanding` répond à « qui relancer » (les factures \
-                 impayées, avoirs exclus, montant brut), `state=paid` à « qu'est-ce qui est \
-                 rentré » ; sans `state`, les deux et les avoirs avec elles — c'est la seule vue \
-                 qui montre un avoir à côté du document qu'il corrige. La marche se fait avec \
-                 `after` = le `next_after` rendu, qui est un **numéro de facture** et non un \
-                 UUID, parce que le numéro est l'ordre. C'est la seule lecture du registre ; il \
-                 n'existe aucun outil pour *émettre* une facture, parce que seule une décision \
-                 d'employé passée par la Policy Gate en crée une.",
+            description: "Rend une page du registre, la plus ancienne d'abord, réglées et \
+                 impayées ensemble par défaut, avec `outstanding_minor` **par devise** (il n'y a \
+                 pas de taux de change dans ce produit, et il ne doit pas y en avoir). **Ce \
+                 total est celui du registre entier, jamais celui de la page** : il ne rétrécit \
+                 pas quand on pagine. `state=outstanding` répond à « qui relancer » (les \
+                 factures impayées, avoirs exclus, montant brut), `state=paid` à « qu'est-ce qui \
+                 est rentré » ; sans `state`, les deux et les avoirs avec elles — c'est la seule \
+                 vue qui montre un avoir à côté du document qu'il corrige. La marche se fait \
+                 avec `after` = le `next_after` rendu, qui est un **numéro de facture** et non un \
+                 UUID, parce que le numéro est l'ordre. C'est la source de l'`id` de \
+                 `invoices_payment_record` et d'`invoices_credit` ; ce qui n'est pas encore une \
+                 créance — une offre en attente de réponse — est sur `quotes_list`. Il n'existe \
+                 aucun outil pour *émettre* une facture : seule une décision d'employé passée \
+                 par la Policy Gate en crée une.",
             method: Method::Get,
             path: "/v1/invoices",
             schema: json!({
@@ -676,10 +714,13 @@ pub fn tools() -> Vec<ToolDef> {
         ToolDef {
             name: "invoices_issuer_get",
             title: "Les mentions obligatoires de l'émetteur",
-            description: "Rend l'en-tête légal de l'entreprise (forme juridique, adresse, SIREN, ville du \
-                 RCS, TVA, pénalités de retard) et, surtout, la liste nommée de ce qui manque. À \
-                 lire avant tout document : tant que cette liste n'est pas vide, un avoir est \
-                 refusé en 409 et tout PDF émis porte « FACTURE NON CONFORME » en travers.",
+            description: "Rend l'en-tête légal de l'entreprise (forme juridique, adresse, SIREN, \
+                 ville du RCS, TVA, pénalités de retard) et, surtout, la liste nommée de ce qui \
+                 manque. À lire avant tout document : tant que cette liste n'est pas vide, un \
+                 avoir est refusé en 409 et tout PDF émis porte « FACTURE NON CONFORME » en \
+                 travers. À lire avant `invoices_credit`, qui est refusé tant que la liste des \
+                 manques n'est pas vide, et avant `invoices_issuer_set`, qui remplace ce document \
+                 en entier.",
             method: Method::Get,
             path: "/v1/invoices/issuer",
             schema: nothing(),
@@ -690,12 +731,15 @@ pub fn tools() -> Vec<ToolDef> {
         ToolDef {
             name: "invoices_issuer_set",
             title: "Écrire les mentions obligatoires de l'émetteur",
-            description: "Écrit l'en-tête légal de l'entreprise. **C'est un remplacement entier, pas une \
-                 retouche** : un champ omis est effacé, donc relire `invoices_issuer_get` et \
-                 renvoyer l'ensemble ; le nom n'est pas ici (c'est l'identité de l'entreprise, \
+            description: "Écrit l'en-tête légal de l'entreprise. **C'est un remplacement entier, \
+                 pas une retouche** : un champ omis est effacé, donc relire `invoices_issuer_get` \
+                 et renvoyer l'ensemble ; le nom n'est pas ici (c'est l'identité de l'entreprise, \
                  changée ailleurs), un taux de TVA de zéro est refusé — une entreprise hors TVA \
                  remplit `vat_exemption_reason` — et un en-tête qui resterait inémettable est \
-                 refusé tout de suite avec les mentions manquantes nommées.",
+                 refusé tout de suite avec les mentions manquantes nommées. **Aucun champ n'est \
+                 obligatoire au schéma** — c'est la route qui l'est — donc le plus petit corps \
+                 possible efface l'en-tête entier : à n'appeler qu'avec le document complet que \
+                 `invoices_issuer_get` vient de rendre, corrigé.",
             method: Method::Put,
             path: "/v1/invoices/issuer",
             schema: schema(
@@ -716,18 +760,25 @@ pub fn tools() -> Vec<ToolDef> {
                 &[],
             ),
             query: &[],
+            // Destructif, et corrigé le 2026-09-11 : rien n'est `required`
+            // ici, donc le plus petit corps possible efface tout l'en-tête
+            // légal et rend l'entreprise inémettable jusqu'à ce que quelqu'un
+            // le retape. Un remplacement qui reprend est destructif.
             raw_body: None,
-            risk: Risk::Write,
+            risk: Risk::Destructive,
         },
         ToolDef {
-            name: "invoices_mark_paid",
+            name: "invoices_payment_record",
             title: "Déclarer qu'une facture a été payée",
-            description: "Enregistre que l'argent est arrivé, à l'instant du serveur — il n'y a pas de \
-                 date de valeur à fournir. Rien ici n'observe une banque : c'est une \
+            description: "Enregistre que l'argent est arrivé, à l'instant du serveur — il n'y a \
+                 pas de date de valeur à fournir. Rien ici n'observe une banque : c'est une \
                  **affirmation d'opérateur**, écrite une fois et jamais retirée ni redatée (un \
-                 second appel répond 404, comme une facture qui n'est pas à cette entreprise), \
-                 et elle laisse une ligne au journal avec `source: operator` — le webhook Stripe \
-                 écrit la même colonne pour les règlements qu'il constate.",
+                 second appel répond 404, comme une facture qui n'est pas à cette entreprise), et \
+                 elle laisse une ligne au journal avec `source: operator` — le webhook Stripe \
+                 écrit la même colonne pour les règlements qu'il constate. À utiliser pour un \
+                 virement constaté hors Stripe, et pour rien d'autre : retirer une créance est \
+                 `invoices_credit`, qui, lui, produit un document chez le client. L'`id` vient \
+                 d'`invoices_list`.",
             method: Method::Post,
             path: "/v1/invoices/{id}/paid",
             schema: schema(
@@ -743,12 +794,14 @@ pub fn tools() -> Vec<ToolDef> {
         ToolDef {
             name: "invoices_credit",
             title: "Émettre un avoir sur une facture",
-            description: "Retire tout ou partie d'une facture émise en créant un avoir, qui produit un \
-                 document destiné au client. Refusé en 409 si la facture a déjà son avoir (un \
-                 seul par facture, garanti par un index unique) ou si les mentions de l'émetteur \
-                 sont incomplètes, et en 404 si la facture n'est pas à cette entreprise, est \
-                 elle-même un avoir, ou est plus petite que le montant retiré ; c'est le seul \
-                 geste d'opérateur qui *émet* un document commercial, et il ne se défait pas.",
+            description: "Retire tout ou partie d'une facture émise en créant un avoir, qui \
+                 produit un document destiné au client. Refusé en 409 si la facture a déjà son \
+                 avoir (un seul par facture, garanti par un index unique) ou si les mentions de \
+                 l'émetteur sont incomplètes, et en 404 si la facture n'est pas à cette \
+                 entreprise, est elle-même un avoir, ou est plus petite que le montant retiré ; \
+                 c'est le seul geste d'opérateur qui *émet* un document commercial, et il ne se \
+                 défait pas. L'`id` vient d'`invoices_list`, et l'en-tête légal qu'il exige \
+                 complet de `invoices_issuer_get`.",
             method: Method::Post,
             path: "/v1/invoices/{id}/credit",
             schema: schema(
@@ -776,14 +829,14 @@ pub fn tools() -> Vec<ToolDef> {
         // billing, accounting, pnl, forecast — ce que ça coûte et rapporte
         // -------------------------------------------------------------------
         ToolDef {
-            name: "billing_read",
+            name: "billing_get",
             title: "La base de notre facture : jours-siège et jours-connecteur",
-            description: "Compte, sur une fenêtre, les jours-siège et les jours-connecteur du locataire, \
-                 avec une ligne par jour (zéros compris) et le détail par siège et par \
+            description: "Compte, sur une fenêtre, les jours-siège et les jours-connecteur du \
+                 locataire, avec une ligne par jour (zéros compris) et le détail par siège et par \
                  connecteur, de sorte que les totaux se recoupent ligne à ligne. **Aucun montant \
-                 n'y figure** : c'est la mesure du service rendu, le tarif appartient au contrat \
-                 — et ce ne sont jamais des jetons, ceux-là sont chez le client et se lisent avec \
-                 `usage_read`.",
+                 n'y figure** : c'est la mesure du service rendu, le tarif appartient au contrat — \
+                 et ce ne sont jamais des jetons, ceux-là sont chez le client et se lisent avec \
+                 `usage_get`.",
             method: Method::Get,
             path: "/v1/billing",
             schema: schema(
@@ -798,12 +851,13 @@ pub fn tools() -> Vec<ToolDef> {
             risk: Risk::Read,
         },
         ToolDef {
-            name: "billing_worked_seats",
+            name: "billing_worked_seats_get",
             title: "Les sièges qui ont travaillé ce mois-ci",
-            description: "Sur un mois, dit combien de sièges existent et combien ont décidé quelque chose \
-                 — autorisé ou refusé, un refus compte comme du travail. C'est la position \
-                 commerciale qu'on imprime sur un contrat (« un siège qui n'a jamais rien décidé \
-                 ne coûte rien »), à lire à côté de `billing_read` qui, lui, est le compteur.",
+            description: "Sur un mois, dit combien de sièges existent et combien ont décidé \
+                 quelque chose — autorisé ou refusé, un refus compte comme du travail. C'est la \
+                 position commerciale qu'on imprime sur un contrat (« un siège qui n'a jamais rien \
+                 décidé ne coûte rien »), à lire à côté de `billing_get` qui, lui, est le \
+                 compteur.",
             method: Method::Get,
             path: "/v1/billing/worked-seats",
             schema: schema(
@@ -823,12 +877,12 @@ pub fn tools() -> Vec<ToolDef> {
         ToolDef {
             name: "accounting_export",
             title: "Export comptable, une ligne par mouvement",
-            description: "Rend en CSV le journal demandé — `invoices` (documents émis ou payés dans la \
-                 fenêtre), `spend` (réservations, `released` compris, que le P&L ne compte pas) \
-                 ou `usage` (une ligne par siège et par jour, **vide sans tarif déclaré, jamais \
-                 zéro**) — pour l'outil d'un comptable. C'est la même matière que `pnl_read`, \
-                 lue mouvement par mouvement : sommées sur la même fenêtre, les lignes donnent \
-                 exactement les chiffres du P&L, et les cellules sont neutralisées contre \
+            description: "Rend en CSV le journal demandé — `invoices` (documents émis ou payés \
+                 dans la fenêtre), `spend` (réservations, `released` compris, que le P&L ne compte \
+                 pas) ou `usage` (une ligne par siège et par jour, **vide sans tarif déclaré, \
+                 jamais zéro**) — pour l'outil d'un comptable. C'est la même matière que \
+                 `pnl_get`, lue mouvement par mouvement : sommées sur la même fenêtre, les lignes \
+                 donnent exactement les chiffres du P&L, et les cellules sont neutralisées contre \
                  l'injection de formules.",
             method: Method::Get,
             path: "/v1/accounting/export",
@@ -846,13 +900,16 @@ pub fn tools() -> Vec<ToolDef> {
             risk: Risk::Read,
         },
         ToolDef {
-            name: "pnl_read",
+            name: "pnl_get",
             title: "Ce que chaque siège a brûlé et encaissé",
-            description: "Rend, par siège et pour l'entreprise entière, la consommation de modèle valorisée \
-                 **au tarif que le locataire a lui-même déclaré**, face aux factures émises, aux \
-                 encaissements, aux avoirs et aux dépenses. Sans tarif déclaré le coût est `null` \
-                 et jamais zéro ; les montants sont donnés par devise et ne sont jamais \
-                 additionnés entre devises, et `cost_source` dit d'où vient chaque chiffre.",
+            description: "Rend, par siège et pour l'entreprise entière, la consommation de modèle \
+                 valorisée **au tarif que le locataire a lui-même déclaré**, face aux factures \
+                 émises, aux encaissements, aux avoirs et aux dépenses. Sans tarif déclaré le coût \
+                 est `null` et jamais zéro ; les montants sont donnés par devise et ne sont jamais \
+                 additionnés entre devises, et `cost_source` dit d'où vient chaque chiffre. C'est \
+                 la lecture de « est-ce que ça vaut le coup » ; `billing_get` est ce que nous \
+                 facturons au locataire, `usage_get` ce que le modèle a consommé chez lui, et \
+                 `accounting_export` exactement cette matière mouvement par mouvement.",
             method: Method::Get,
             path: "/v1/pnl",
             schema: schema(window_props(), &[]),
@@ -861,14 +918,17 @@ pub fn tools() -> Vec<ToolDef> {
             risk: Risk::Read,
         },
         ToolDef {
-            name: "forecast_read",
+            name: "forecast_get",
             title: "Le débit des N prochains jours, et le point mort",
-            description: "Estime, sur une fenêtre à venir, combien de tours les cadences produiront, \
-                 combien d'appels de modèle cela fait, combien de personnes peuvent être \
-                 approchées, ce que ça facturera, et à combien se situe le point mort. **Aucun \
-                 pourcentage de réussite n'est rendu** — il n'est pas mesurable ici ; `cost_usd` \
-                 est `null` quand le locataire tourne sur un abonnement CLI (il n'y a alors pas \
-                 de facture au jeton), et un siège sans cadence est signalé plutôt que compté.",
+            description: "Estime, sur une fenêtre à venir, combien de tours les cadences \
+                 produiront, combien d'appels de modèle cela fait, combien de personnes peuvent \
+                 être approchées, ce que ça facturera, et à combien se situe le point mort. \
+                 **Aucun pourcentage de réussite n'est rendu** — il n'est pas mesurable ici ; \
+                 `cost_usd` est `null` quand le locataire tourne sur un abonnement CLI (il n'y a \
+                 alors pas de facture au jeton), et un siège sans cadence est signalé plutôt que \
+                 compté. La seule lecture de cette table tournée vers l'avant : à consulter avant \
+                 de changer une cadence (`initiatives_set`) ou un plafond de domaine \
+                 (`domains_cap_set`), puisque ce sont les deux entrées qu'elle projette.",
             method: Method::Get,
             path: "/v1/forecast",
             schema: schema(
@@ -894,13 +954,13 @@ pub fn tools() -> Vec<ToolDef> {
         // usage, spend, reports, events — la consommation et le journal
         // -------------------------------------------------------------------
         ToolDef {
-            name: "usage_read",
+            name: "usage_get",
             title: "Les jetons consommés, par siège",
-            description: "Rend, par siège et au total, les appels et les jetons consommés sur la fenêtre. \
-                 **Il n'y a aucun montant ici** — ces jetons sont ceux du client, sur son propre \
-                 contrat, et `billing_read` est notre facture à nous ; vérifier `complete` avant \
-                 de citer `tokens_measured`, qui n'est qu'un plancher dès qu'un appel n'a pas été \
-                 mesuré (inconnu n'est pas gratuit).",
+            description: "Rend, par siège et au total, les appels et les jetons consommés sur la \
+                 fenêtre. **Il n'y a aucun montant ici** — ces jetons sont ceux du client, sur son \
+                 propre contrat, et `billing_get` est notre facture à nous ; vérifier `complete` \
+                 avant de citer `tokens_measured`, qui n'est qu'un plancher dès qu'un appel n'a \
+                 pas été mesuré (inconnu n'est pas gratuit).",
             method: Method::Get,
             path: "/v1/usage",
             schema: schema(
@@ -915,11 +975,12 @@ pub fn tools() -> Vec<ToolDef> {
             risk: Risk::Read,
         },
         ToolDef {
-            name: "usage_by_model",
+            name: "usage_models_get",
             title: "La part de chaque modèle",
-            description: "Rend la répartition des appels et des jetons par modèle sur les N derniers \
-                 jours. C'est la lecture qui répond à « le routage a-t-il changé quelque chose » \
-                 — une semaine suffit, d'où le défaut de 7 jours et le maximum de 90.",
+            description: "Rend la répartition des appels et des jetons par modèle sur les N \
+                 derniers jours. C'est la lecture qui répond à « le routage a-t-il changé quelque \
+                 chose » — une semaine suffit, d'où le défaut de 7 jours et le maximum de 90. La \
+                 même matière, par siège au lieu de par modèle, est sur `usage_get`.",
             method: Method::Get,
             path: "/v1/usage/models",
             schema: schema(
@@ -940,11 +1001,12 @@ pub fn tools() -> Vec<ToolDef> {
         ToolDef {
             name: "spend_caps_get",
             title: "Les plafonds de dépense d'un siège",
-            description: "Rend, pour un siège et **une devise**, le plafond journalier, le plafond par \
-                 paiement et le nombre de paiements permis par jour. `caps: null` ne veut pas \
+            description: "Rend, pour un siège et **une devise**, le plafond journalier, le plafond \
+                 par paiement et le nombre de paiements permis par jour. `caps: null` ne veut pas \
                  dire « illimité » mais « ne peut pas payer » : sans ligne de plafonds, la Gate \
                  refuse toute dépense avec `no_spend_policy` — c'est l'état d'un déploiement où \
-                 personne n'a encore écrit de plafonds.",
+                 personne n'a encore écrit de plafonds. L'`id` vient d'`employees_list` ; pour \
+                 écrire ces plafonds, `spend_caps_set`.",
             method: Method::Get,
             path: "/v1/employees/{id}/spend-caps",
             schema: schema(
@@ -964,12 +1026,16 @@ pub fn tools() -> Vec<ToolDef> {
         ToolDef {
             name: "spend_caps_set",
             title: "Écrire les plafonds de dépense d'un siège",
-            description: "Fixe pour un siège, dans une devise, le plafond journalier, le plafond par \
-                 paiement et le nombre de paiements par jour — les deux montants doivent être \
+            description: "Fixe pour un siège, dans une devise, le plafond journalier, le plafond \
+                 par paiement et le nombre de paiements par jour — les deux montants doivent être \
                  dans la même devise, et c'est elle qui identifie la ligne. C'est de la \
-                 configuration et non de l'exécution : baisser un plafond ne reprend pas ce que \
-                 la journée a déjà réservé, et zéro n'existe pas (pour interdire toute dépense, \
-                 il faut n'avoir aucune ligne de plafonds).",
+                 configuration et non de l'exécution : baisser un plafond ne reprend pas ce que la \
+                 journée a déjà réservé, et zéro n'existe pas (pour interdire toute dépense, il \
+                 faut n'avoir aucune ligne de plafonds). L'`id` vient d'`employees_list` ; lire \
+                 `spend_caps_get` d'abord, dans la même devise, pour savoir s'il y avait une \
+                 ligne — c'est un plafond d'argent réel, pas de tours : le budget de tours d'un \
+                 siège est sur `employees_turns_get` et celui de son équipe sur \
+                 `teams_budget_set`.",
             method: Method::Put,
             path: "/v1/employees/{id}/spend-caps",
             schema: schema(
@@ -1006,13 +1072,17 @@ pub fn tools() -> Vec<ToolDef> {
             risk: Risk::Write,
         },
         ToolDef {
-            name: "reports_read",
+            name: "employees_reports_list",
             title: "L'équipe d'un siège, et ce qu'elle coûte",
-            description: "Rend, pour un siège, la ligne de chacun de ses subordonnés **directs** : tours \
-                 joués, jetons, plafond de tours, dépense du jour face au plafond, et ce qui est \
-                 resté sans réponse. Un seul lien, jamais l'arbre entier — la ligne du \
+            description: "Rend, pour un siège, la ligne de chacun de ses subordonnés **directs** : \
+                 tours joués, jetons, plafond de tours, dépense du jour face au plafond, et ce qui \
+                 est resté sans réponse. Un seul lien, jamais l'arbre entier — la ligne du \
                  responsable du dessous se demande avec son propre identifiant — et il n'y a pas \
-                 de coût en euros ici, seulement la mesure.",
+                 de coût en euros ici, seulement la mesure. L'`id` vient d'`employees_list`, et \
+                 les subordonnés d'un siège se lisent aussi, sans chiffres, sur \
+                 `teams_members_list`. À utiliser quand la question est « que font les gens sous \
+                 lui » ; pour ses propres tours, `employees_turns_get`, et pour ce qui le borne, \
+                 `controls_get`.",
             method: Method::Get,
             path: "/v1/employees/{id}/reports",
             schema: schema(
@@ -1026,15 +1096,17 @@ pub fn tools() -> Vec<ToolDef> {
             risk: Risk::Read,
         },
         ToolDef {
-            name: "events_read",
+            name: "events_list",
             title: "Le journal de ce que l'entreprise a fait",
             description: "Rend le journal d'activité — un verdict, un envoi, un message reçu, un \
                  changement de configuration — avec une étiquette d'autonomie par ligne et un \
                  curseur `next_since` pour reprendre. Sans `since` la page part des plus récents \
-                 vers le passé ; **avec `since` elle repart de la marque vers le présent**, ce \
-                 qui est ce qu'il faut pour rattraper une nuit sans rien sauter, et `limit` est \
-                 un plancher de page (un groupe d'événements au même horodatage n'est jamais \
-                 coupé). Aucun texte de tiers n'en sort.",
+                 vers le passé ; **avec `since` elle repart de la marque vers le présent**, ce qui \
+                 est ce qu'il faut pour rattraper une nuit sans rien sauter, et `limit` est un \
+                 plancher de page (un groupe d'événements au même horodatage n'est jamais coupé). \
+                 Aucun texte de tiers n'en sort. À utiliser quand la question est « qu'a fait \
+                 cette entreprise, et dans quel ordre » ; pour « est-ce que ça tourne encore », \
+                 `company_health_get` répond en un appel et en trois mots.",
             method: Method::Get,
             path: "/v1/events",
             schema: schema(
@@ -1165,14 +1237,14 @@ mod tests {
         let lying_get = ToolDef {
             raw_body: None,
             risk: Risk::Destructive,
-            ..find("pnl_read")
+            ..find("pnl_get")
         };
         assert_eq!(lying_get.method, Method::Get);
         assert!(lying_get.risk.destructive());
         let lying_delete = ToolDef {
             raw_body: None,
             risk: Risk::Read,
-            ..find("domain_remove")
+            ..find("domains_remove")
         };
         assert_eq!(lying_delete.method, Method::Delete);
         assert!(lying_delete.risk.read_only());
@@ -1185,16 +1257,16 @@ mod tests {
     fn what_engages_the_company_before_a_third_party_is_destructive() {
         for name in [
             // l'envoi : quarante inconnus marqués contactés, le budget dépensé
-            "queue_export",
+            "prospects_queue_export",
             // le document : un avoir part chez le client (il n'existe aucune
             // route d'*émission* de facture, par construction — voir le module)
             "invoices_credit",
             // la machine qui écrira à quelqu'un
             "sequences_enroll",
             // l'argent déclaré arrivé, une fois, sans retour
-            "invoices_mark_paid",
+            "invoices_payment_record",
             "quotes_accept",
-            "domain_remove",
+            "domains_remove",
         ] {
             let tool = find(name);
             assert!(
@@ -1213,7 +1285,7 @@ mod tests {
     /// `enroll` a besoin du contact **et** du siège qui écrira.
     #[test]
     fn the_sequence_family_asks_for_what_the_routes_check() {
-        let define = find("sequences_define");
+        let define = find("sequences_create");
         assert_eq!(required(&define), ["name", "steps"]);
         let steps = &define.schema["properties"]["steps"];
         assert_eq!(steps["maxItems"], json!(12));
@@ -1236,16 +1308,19 @@ mod tests {
     /// travailler sur la primaire, donc `domain` y est facultatif.
     #[test]
     fn the_domain_family_asks_for_what_the_routes_check() {
-        assert_eq!(required(&find("domain_register")), ["domain"]);
-        assert_eq!(required(&find("domain_remove")), ["domain"]);
-        assert_eq!(required(&find("domain_set_cap")), ["domain", "daily_cap"]);
+        assert_eq!(required(&find("domains_register")), ["domain"]);
+        assert_eq!(required(&find("domains_remove")), ["domain"]);
+        assert_eq!(required(&find("domains_cap_set")), ["domain", "daily_cap"]);
         assert_eq!(
-            find("domain_set_cap").schema["properties"]["daily_cap"]["minimum"],
+            find("domains_cap_set").schema["properties"]["daily_cap"]["minimum"],
             json!(1),
             "un plafond de zéro est un 400 bad_cap"
         );
-        assert_eq!(required(&find("domain_verify")), Vec::<String>::new());
-        assert_eq!(required(&find("domain_dns")), ["cloudflare_api_token"]);
+        assert_eq!(required(&find("domains_verify")), Vec::<String>::new());
+        assert_eq!(
+            required(&find("domains_dns_publish")),
+            ["cloudflare_api_token"]
+        );
     }
 
     /// L'export de file n'a pas de corps : tout ce dont il a besoin est déjà
@@ -1253,7 +1328,7 @@ mod tests {
     /// limite.
     #[test]
     fn the_queue_family_asks_for_a_seat_and_nothing_else() {
-        let export = find("queue_export");
+        let export = find("prospects_queue_export");
         assert_eq!(required(&export), ["id"]);
         assert_eq!(export.properties(), vec!["id"]);
         assert!(export.query.is_empty());
@@ -1274,15 +1349,15 @@ mod tests {
             credit.schema["properties"].get("currency").is_none(),
             "la devise est celle de la facture corrigée, jamais une seconde réponse"
         );
-        for name in ["invoices_mark_paid", "quotes_accept", "quotes_decline"] {
+        for name in ["invoices_payment_record", "quotes_accept", "quotes_decline"] {
             let tool = find(name);
             assert_eq!(tool.properties(), vec!["id"], "{name}");
             assert_eq!(required(&tool), ["id"], "{name}");
         }
         assert!(
             !tools().iter().any(|t| t.name == "invoices_issue"),
-            "aucune route n'émet une facture : seul un employé le fait, avec un \
-             jeton de la Policy Gate"
+            "aucune route n'émet une facture : seul un employé le fait, avec un jeton de la Policy \
+             Gate"
         );
     }
 
@@ -1296,20 +1371,20 @@ mod tests {
             export.schema["properties"]["journal"]["enum"],
             json!(["invoices", "spend", "usage"])
         );
-        for name in ["pnl_read", "outreach_summary", "accounting_export"] {
+        for name in ["pnl_get", "outreach_summary_get", "accounting_export"] {
             let tool = find(name);
             for key in WINDOW {
                 assert!(tool.query.contains(key), "{name}: {key}");
             }
         }
-        assert_eq!(find("billing_worked_seats").query.to_vec(), ["month"]);
+        assert_eq!(find("billing_worked_seats_get").query.to_vec(), ["month"]);
         assert_eq!(
-            find("forecast_read").schema["properties"]["days"]["maximum"],
+            find("forecast_get").schema["properties"]["days"]["maximum"],
             json!(90),
             "au-delà d'un trimestre, les entrées sont plus périssables que la réponse"
         );
         assert_eq!(
-            required(&find("forecast_read")),
+            required(&find("forecast_get")),
             ["days"],
             "la route refuse une fenêtre absente : il n'y a pas de défaut honnête"
         );
@@ -1345,17 +1420,12 @@ mod tests {
     #[test]
     fn the_reading_family_puts_its_window_in_the_query_string() {
         for name in [
-            "events_read",
-            "usage_read",
-            "usage_by_model",
-            "outreach_health",
-            "billing_read",
-            "forecast_read",
-            // Arrivés ici le 2026-09-11, depuis la liste des lectures sans
-            // entrée d'en dessous : sans fenêtre, ces deux-là versaient un
-            // registre entier dans le contexte d'un modèle à chaque appel.
-            "quotes_list",
-            "invoices_list",
+            "events_list",
+            "usage_get",
+            "usage_models_get",
+            "outreach_health_get",
+            "billing_get",
+            "forecast_get",
         ] {
             let tool = find(name);
             assert_eq!(tool.method, Method::Get, "{name}");
@@ -1369,12 +1439,12 @@ mod tests {
             );
         }
         assert_eq!(
-            required(&find("usage_by_model")),
+            required(&find("usage_models_get")),
             Vec::<String>::new(),
             "la route a un défaut de 7 jours : exiger `days` serait exiger plus qu'elle"
         );
         assert_eq!(
-            find("events_read").schema["properties"]["limit"]["maximum"],
+            find("events_list").schema["properties"]["limit"]["maximum"],
             json!(200)
         );
     }
@@ -1384,10 +1454,10 @@ mod tests {
     #[test]
     fn the_input_less_readings_still_declare_an_object() {
         for name in [
-            "prospects_segments",
+            "prospects_segments_list",
             "sequences_list",
-            "domain_get",
-            "domain_list",
+            "domains_primary_get",
+            "domains_list",
             "invoices_issuer_get",
         ] {
             let tool = find(name);

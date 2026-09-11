@@ -7,7 +7,7 @@
 //!
 //! # L'ordre est celui d'une prise en main
 //!
-//! `companies_create` d'abord, parce que rien n'existe avant lui ; puis
+//! `company_create` d'abord, parce que rien n'existe avant lui ; puis
 //! l'organigramme, les sièges, le bureau où on leur parle, les approbations
 //! qu'ils demandent, les limites qui les bornent, et enfin l'interrupteur. Un
 //! modèle qui lit la liste de haut en bas lit le mode d'emploi.
@@ -87,16 +87,19 @@ pub fn tools() -> Vec<ToolDef> {
         // Le registre public : la seule chose que cette société publie d'elle
         // -------------------------------------------------------------------
         t(
-            "health_company",
+            "company_health_get",
             "Est-ce que cette société travaille encore ?",
-            "Rend, en un appel, si les employés prennent leurs tours ou non : combien tentés \
-             et combien ratés aujourd'hui, la date du dernier qui a réussi, le code et la \
-             phrase du dernier échec, et un verdict — `working`, `degraded`, `stopped`. \
-             **C'est le premier outil à appeler quand quelque chose semble immobile** : un \
-             employé qui ne répond pas, une campagne qui n'avance pas, une demande sans suite. \
-             Une société au repos rend `working` et pas `degraded` : ne rien avoir à faire \
-             n'est pas une panne. `stopped` nomme la cause dans `last_failure_detail`, et \
-             c'est presque toujours la connexion au modèle.",
+            "Rend, en un appel, si les employés prennent leurs tours ou non : combien tentés et \
+             combien ratés aujourd'hui, la date du dernier qui a réussi, le code et la phrase du \
+             dernier échec, et un verdict — `working`, `degraded`, `stopped`. **C'est le premier \
+             outil à appeler quand quelque chose semble immobile** : un employé qui ne répond pas, \
+             une campagne qui n'avance pas, une demande sans suite. Une société au repos rend \
+             `working` et pas `degraded` : ne rien avoir à faire n'est pas une panne. `stopped` \
+             nomme la cause dans `last_failure_detail`, et c'est presque toujours la connexion au \
+             modèle. Trois suites selon le verdict : `stopped` va voir `model_get` puis \
+             `halt_get`, `degraded` va lire `refusals_get` et `events_list`, et un `working` sur \
+             une société qui n'avance quand même pas va voir `initiatives_list` — un siège sans \
+             cadence ne se réveille jamais tout seul.",
             Method::Get,
             "/v1/health/company",
             nothing(),
@@ -104,13 +107,15 @@ pub fn tools() -> Vec<ToolDef> {
             Risk::Read,
         ),
         t(
-            "public_register_read",
+            "public_register_get",
             "Lire le registre public : ce que les gates des entreprises consentantes ont arrêté",
-            "Rend le tableau public, en temps réel, de ce que les politiques ont refusé chez \
-             les entreprises qui l'ont accepté. Sert à situer la vôtre, et à répondre à « à quoi \
-             sert la gate » par un chiffre plutôt que par une phrase. Lecture publique : aucune \
-             donnée d'un locataire n'y figure sans son consentement explicite, et une entreprise \
-             qui n'a rien accepté n'apparaît pas, même agrégée.",
+            "Rend le tableau public, en temps réel, de ce que les politiques ont refusé chez les \
+             entreprises qui l'ont accepté. Sert à situer la vôtre, et à répondre à « à quoi sert \
+             la gate » par un chiffre plutôt que par une phrase. Lecture publique : aucune donnée \
+             d'un locataire n'y figure sans son consentement explicite, et une entreprise qui n'a \
+             rien accepté n'apparaît pas, même agrégée. Le consentement de cette société-ci se \
+             bascule avec `public_register_consent_set`, et ce que sa propre gate a refusé se lit \
+             sur `refusals_get`.",
             Method::Get,
             "/v1/public-register",
             nothing(),
@@ -118,14 +123,14 @@ pub fn tools() -> Vec<ToolDef> {
             Risk::Read,
         ),
         t(
-            "public_register_consent",
+            "public_register_consent_set",
             "Décider si cette société figure au registre public",
-            "Bascule le consentement de cette entreprise à figurer au registre public. \
-             `consent: true` la publie, `false` la retire. C'est une décision du fondateur et \
-             pas un réglage : à `true`, un chiffre tiré de vos refus devient visible de \
-             n'importe qui. La bascule et sa ligne d'audit sont écrites dans la même \
-             transaction, donc un registre qui montre une entreprise montre aussi quand elle a \
-             dit oui.",
+            "Bascule le consentement de cette entreprise à figurer au registre public. `consent: \
+             true` la publie, `false` la retire. C'est une décision du fondateur et pas un \
+             réglage : à `true`, un chiffre tiré de vos refus devient visible de n'importe qui. La \
+             bascule et sa ligne d'audit sont écrites dans la même transaction, donc un registre \
+             qui montre une entreprise montre aussi quand elle a dit oui. Ce que la bascule publie \
+             se relit sur `public_register_get`.",
             Method::Post,
             "/v1/public-register/consent",
             json!({
@@ -145,21 +150,21 @@ pub fn tools() -> Vec<ToolDef> {
         // La société : la porte par laquelle tout commence
         // -------------------------------------------------------------------
         t(
-            "companies_create",
+            "company_create",
             "Créer la société : organigramme, limites par rôle et date d'arrêt, en un appel",
-            "Monte une société entière — la ligne « tenant », l'organigramme complet, une \
-             couche de limites par rôle, et l'instant où ses agents s'arrêtent — en une seule \
-             transaction. À utiliser une fois, sur une société qui n'existe pas encore : elle \
-             ne remplace jamais rien, un rôle dont la couche diffère est un 409 \
-             `role_layer_exists` et une fenêtre différente un 409 `window_exists`. Trois refus, \
-             avant toute écriture : `window_ends_at` est obligatoire et sans défaut (une durée \
-             serait un prix que personne ici n'a le droit d'inventer), chaque `team` cité dans \
-             `org.rows` doit avoir son entrée dans `roles` (une couche absente hérite du \
-             plafond, donc un siège sans couche devient l'employé le plus permissif de la \
-             maison), et chaque valeur de `roles` est un document de limites **complet** — un \
-             champ manquant n'est pas « ne touche pas », c'est un remplacement total qui coûte \
-             au siège ses canaux, ses domaines et son modèle. Ensuite, pour éditer, c'est \
-             `org_apply` ; pour retoucher une limite, `policy_role_put`.",
+            "Monte une société entière — la ligne « tenant », l'organigramme complet, une couche \
+             de limites par rôle, et l'instant où ses agents s'arrêtent — en une seule \
+             transaction. À utiliser une fois, sur une société qui n'existe pas encore : elle ne \
+             remplace jamais rien, un rôle dont la couche diffère est un 409 `role_layer_exists` \
+             et une fenêtre différente un 409 `window_exists`. Trois refus, avant toute écriture : \
+             `window_ends_at` est obligatoire et sans défaut (une durée serait un prix que \
+             personne ici n'a le droit d'inventer), chaque `team` cité dans `org.rows` doit avoir \
+             son entrée dans `roles` (une couche absente hérite du plafond, donc un siège sans \
+             couche devient l'employé le plus permissif de la maison), et chaque valeur de `roles` \
+             est un document de limites **complet** — un champ manquant n'est pas « ne touche pas \
+             », c'est un remplacement total qui coûte au siège ses canaux, ses domaines et son \
+             modèle. Ensuite, pour éditer, c'est `org_apply` ; pour retoucher une limite, \
+             `policy_role_set`.",
             Method::Post,
             "/v1/companies",
             json!({
@@ -189,7 +194,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "roles": {
                         "type": "object",
-                        "description": "Un document de limites complet par `role_name` (le slug d'équipe), du même format que le corps de `policy_role_put`.",
+                        "description": "Un document de limites complet par `role_name` (le slug d'équipe), du même format que le corps de `policy_role_set`.",
                         "additionalProperties": { "type": "object" },
                     },
                 },
@@ -204,12 +209,14 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "employees_list",
             "La liste des sièges de cette société, du plus ancien au plus récent",
-            "Rend les employés du locataire avec leur `id`, leur `slug` et leur cycle de vie, \
-             page par page. C'est la source des UUID que presque toutes les autres lignes de \
-             cette table réclament — appelle-la d'abord plutôt que de deviner un identifiant. \
-             Pagination par clé : `limit` (50 par défaut, 200 au plus) et `after`, qui est le \
-             dernier `id` de la page précédente ; une page pleine porte `next_after`, une page \
-             courte termine la marche.",
+            "Rend les employés du locataire avec leur `id`, leur `slug` et leur cycle de vie, page \
+             par page. C'est la source des UUID que presque toutes les autres lignes de cette \
+             table réclament — appelle-la d'abord plutôt que de deviner un identifiant. Pagination \
+             par clé : `limit` (50 par défaut, 200 au plus) et `after`, qui est le dernier `id` de \
+             la page précédente ; une page pleine porte `next_after`, une page courte termine la \
+             marche. L'`id` d'ici ouvre `employees_get` (le détail d'un siège), `initiatives_get` \
+             (ce qu'il fait), `employees_turns_get` (ce qu'il a consommé aujourd'hui) et \
+             `controls_get` (ce qui le borne).",
             Method::Get,
             "/v1/employees",
             json!({
@@ -235,12 +242,11 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "employees_get",
             "Un siège en entier : cycle de vie, santé, et l'état de ses onze ressources",
-            "Rend un employé complet — son adresse, son `lifecycle`, sa santé dérivée, les \
-             onze étapes de provisionnement avec leur fournisseur, et les appels fournisseur \
-             partis sans revenir. À utiliser quand `employees_list` ne suffit pas : c'est ici \
-             qu'on voit *pourquoi* un siège reste en `draft` ou porte une santé dégradée. \
-             L'`id` vient de `employees_list` ; un identifiant d'une autre société est un 404, \
-             jamais un 403.",
+            "Rend un employé complet — son adresse, son `lifecycle`, sa santé dérivée, les onze \
+             étapes de provisionnement avec leur fournisseur, et les appels fournisseur partis \
+             sans revenir. À utiliser quand `employees_list` ne suffit pas : c'est ici qu'on voit \
+             *pourquoi* un siège reste en `draft` ou porte une santé dégradée. L'`id` vient de \
+             `employees_list` ; un identifiant d'une autre société est un 404, jamais un 403.",
             Method::Get,
             "/v1/employees/{id}",
             employee_id_only("L'UUID du siège, tel que `employees_list` le rend."),
@@ -250,13 +256,16 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "employees_create",
             "Embaucher un siège : la ligne, ses onze ressources en attente, et l'événement qui les fait acheter",
-            "Crée un employé et le remet au provisionneur. Répond **202 et jamais 201** : la \
-             ligne existe, mais rien de ce qu'il lui faut pour travailler n'existe encore — \
-             boîte mail, numéro, identité sont `pending` et une boucle vient les chercher. À \
-             utiliser pour un siège isolé ; pour monter ou corriger tout un organigramme d'un \
-             coup, `org_apply` embauche aussi et le fait en une transaction. Le `slug` devient \
-             la partie locale de l'adresse et l'identité du siège : il ne se change plus \
-             après.",
+            "Crée un employé et le remet au provisionneur. Répond **202 et jamais 201** : la ligne \
+             existe, mais rien de ce qu'il lui faut pour travailler n'existe encore — boîte mail, \
+             numéro, identité sont `pending` et une boucle vient les chercher. À utiliser pour un \
+             siège isolé ; pour monter ou corriger tout un organigramme d'un coup, `org_apply` \
+             embauche aussi et le fait en une transaction. Le `slug` devient la partie locale de \
+             l'adresse et l'identité du siège : il ne se change plus après. **Un siège ne peut pas \
+             s'asseoir sur un domaine non vérifié** : le domaine qu'on lui donne ici doit être \
+             passé par `domains_verify`, sinon la ligne existe et rien ne partira jamais de cette \
+             adresse. Et embaucher ne dit pas à quoi le siège sert : c'est `initiatives_set` qui \
+             lui donne un objectif et une cadence, sans quoi il ne se réveillera jamais tout seul.",
             Method::Post,
             "/v1/employees",
             json!({
@@ -279,12 +288,12 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "employees_suspend",
             "Mettre un siège en pause, sans rien lui reprendre",
-            "Passe l'employé en `suspended` : il cesse d'agir — plus de tour, plus de réveil, \
-             plus de jeton d'autorisation — mais **rien ne lui est retiré**. Son tableau de \
-             travail, ses rendez-vous futurs et ses ressources restent à lui, et \
-             `employees_resume` le remet exactement où il était. C'est le verbe à choisir quand \
-             on hésite avec `employees_terminate`, qui, lui, est irréversible et rend tout. Un \
-             employé `terminated` refuse la suspension par un 409.",
+            "Passe l'employé en `suspended` : il cesse d'agir — plus de tour, plus de réveil, plus \
+             de jeton d'autorisation — mais **rien ne lui est retiré**. Son tableau de travail, \
+             ses rendez-vous futurs et ses ressources restent à lui, et `employees_resume` le \
+             remet exactement où il était. C'est le verbe à choisir quand on hésite avec \
+             `employees_terminate`, qui, lui, est irréversible et rend tout. Un employé \
+             `terminated` refuse la suspension par un 409.",
             Method::Post,
             "/v1/employees/{id}/suspend",
             employee_id_only("L'UUID du siège à mettre en pause, depuis `employees_list`."),
@@ -294,14 +303,14 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "employees_resume",
             "Remettre au travail un siège suspendu",
-            "L'inverse exact de `employees_suspend`, et seulement lui : `suspended → active`. \
-             Il ne restaure rien parce qu'une suspension n'avait rien pris ; la semaine \
-             d'absence n'est pas rejouée, l'initiative repart sur sa propre horloge. Deux refus \
-             distincts : un siège `terminated` est un 409 `illegal_lifecycle` (l'état est \
-             absorbant et ses ressources ont déjà été rendues), un siège `draft` est un 409 \
+            "L'inverse exact de `employees_suspend`, et seulement lui : `suspended → active`. Il \
+             ne restaure rien parce qu'une suspension n'avait rien pris ; la semaine d'absence \
+             n'est pas rejouée, l'initiative repart sur sa propre horloge. Deux refus distincts : \
+             un siège `terminated` est un 409 `illegal_lifecycle` (l'état est absorbant et ses \
+             ressources ont déjà été rendues), un siège `draft` est un 409 \
              `draft_is_not_resumable` — ce passage-là appartient à la boucle de provisionnement \
-             seule, et le forcer donnerait un employé actif ne possédant ni numéro, ni boîte, \
-             ni identité.",
+             seule, et le forcer donnerait un employé actif ne possédant ni numéro, ni boîte, ni \
+             identité.",
             Method::Post,
             "/v1/employees/{id}/resume",
             employee_id_only("L'UUID du siège suspendu, depuis `employees_list`."),
@@ -311,13 +320,13 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "employees_terminate",
             "Fin de vie d'un siège : absorbant, et il rend tout",
-            "Passe l'employé en `terminated`, état **absorbant** : rien n'en sort, une \
-             suspension postérieure est un 409 et il n'y a pas de verbe pour revenir. Dans la \
-             même transaction, son tableau de travail retourne au pot non assigné et ses \
-             rendez-vous à venir sont annulés ; ses ressources fournisseur — numéro, boîte — \
-             sont rendues juste après par le gestionnaire d'événement, ce qui coûte de l'argent \
-             réel à ré-acheter. À n'utiliser que si `employees_suspend`, qui est réversible et \
-             ne reprend rien, ne suffit pas.",
+            "Passe l'employé en `terminated`, état **absorbant** : rien n'en sort, une suspension \
+             postérieure est un 409 et il n'y a pas de verbe pour revenir. Dans la même \
+             transaction, son tableau de travail retourne au pot non assigné et ses rendez-vous à \
+             venir sont annulés ; ses ressources fournisseur — numéro, boîte — sont rendues juste \
+             après par le gestionnaire d'événement, ce qui coûte de l'argent réel à ré-acheter. À \
+             n'utiliser que si `employees_suspend`, qui est réversible et ne reprend rien, ne \
+             suffit pas.",
             Method::Post,
             "/v1/employees/{id}/terminate",
             employee_id_only("L'UUID du siège à résilier, depuis `employees_list`."),
@@ -331,18 +340,17 @@ pub fn tools() -> Vec<ToolDef> {
             "org_apply",
             "L'organigramme entier, appliqué d'un bloc et en une transaction",
             "Applique le tableau de l'opérateur — *Fonction, Responsable, Mission* — d'un seul \
-             coup : équipes créées ou renommées, employés manquants embauchés, missions \
-             écrites, lignes hiérarchiques tracées, le tout dans une transaction, donc une \
-             mauvaise ligne 7 défait l'équipe de la ligne 1. C'est le verbe à préférer dès \
-             qu'on touche plus d'un siège : le document est déclaratif, on le ré-applique après \
-             l'avoir édité et cela converge sans clé d'idempotence. Il **n'enlève jamais** : \
-             une équipe ou un siège tombé du document reste debout, et sortir quelqu'un est \
-             `teams_member_remove`. Il **n'accorde rien** non plus — pas une ligne de \
-             `policy_layers` n'est écrite ici, une mission est de la prose et jamais une \
-             limite. Réponses : 202 s'il a embauché, 200 sinon ; 400 si deux lignes nomment la \
-             même équipe ou le même responsable, ou si un `reports_to` désigne un responsable \
-             qu'aucune ligne ne définit ; 409 `reporting_cycle` si une ligne ferme une boucle. \
-             500 lignes au plus.",
+             coup : équipes créées ou renommées, employés manquants embauchés, missions écrites, \
+             lignes hiérarchiques tracées, le tout dans une transaction, donc une mauvaise ligne 7 \
+             défait l'équipe de la ligne 1. C'est le verbe à préférer dès qu'on touche plus d'un \
+             siège : le document est déclaratif, on le ré-applique après l'avoir édité et cela \
+             converge sans clé d'idempotence. Il **n'enlève jamais** : une équipe ou un siège \
+             tombé du document reste debout, et sortir quelqu'un est `teams_members_remove`. Il \
+             **n'accorde rien** non plus — pas une ligne de `policy_layers` n'est écrite ici, une \
+             mission est de la prose et jamais une limite. Réponses : 202 s'il a embauché, 200 \
+             sinon ; 400 si deux lignes nomment la même équipe ou le même responsable, ou si un \
+             `reports_to` désigne un responsable qu'aucune ligne ne définit ; 409 \
+             `reporting_cycle` si une ligne ferme une boucle. 500 lignes au plus.",
             Method::Post,
             "/v1/org",
             json!({
@@ -397,8 +405,9 @@ pub fn tools() -> Vec<ToolDef> {
             "teams_list",
             "Les équipes de cette société, par slug",
             "Rend chaque équipe avec son `id`, son slug, son nom, sa mission et le `role_name` \
-             sous lequel ses limites sont lues. C'est la source des `team_id` que réclament \
-             toutes les lignes `teams_*` ci-dessous.",
+             sous lequel ses limites sont lues. C'est la source des `team_id` que réclament toutes \
+             les lignes `teams_*` ci-dessous. Le `team_id` d'ici va dans `teams_members_list`, \
+             `teams_budget_get`, `teams_mission_set` et `teams_policy_role_set`.",
             Method::Get,
             "/v1/teams",
             nothing(),
@@ -408,12 +417,12 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "teams_create",
             "Une équipe, et la portée de politique par laquelle elle lira ses limites",
-            "Crée une équipe seule. 201 et non 202 : contrairement à un employé, une équipe \
-             est finie dès que la ligne est écrite — rien n'est provisionné, personne ne vient \
-             la chercher. Le `slug` sert aussi de `role_name` initial, ce qui ne **crée pas** \
-             ses limites : tant que personne n'a écrit de couche sous ce rôle, l'équipe hérite \
-             de celle du locataire, c'est-à-dire de la plus large. Pour monter plusieurs \
-             équipes à la fois avec leurs responsables, `org_apply`.",
+            "Crée une équipe seule. 201 et non 202 : contrairement à un employé, une équipe est \
+             finie dès que la ligne est écrite — rien n'est provisionné, personne ne vient la \
+             chercher. Le `slug` sert aussi de `role_name` initial, ce qui ne **crée pas** ses \
+             limites : tant que personne n'a écrit de couche sous ce rôle, l'équipe hérite de \
+             celle du locataire, c'est-à-dire de la plus large. Pour monter plusieurs équipes à la \
+             fois avec leurs responsables, `org_apply`.",
             Method::Post,
             "/v1/teams",
             json!({
@@ -460,8 +469,8 @@ pub fn tools() -> Vec<ToolDef> {
             "Une sous-unité dans une équipe",
             "Crée une section : EMEA dans achats, niveau 1 dans support. Purement \
              organisationnel — aucune politique et aucun budget ne s'y attachent, ni ici ni \
-             ailleurs. Une section n'est utile que si `teams_member_add` ou `teams_member_set` \
-             y place quelqu'un, et elle appartient à exactement une équipe.",
+             ailleurs. Une section n'est utile que si `teams_members_add` ou `teams_members_set` y \
+             place quelqu'un, et elle appartient à exactement une équipe.",
             Method::Post,
             "/v1/teams/{team_id}/sections",
             json!({
@@ -483,9 +492,9 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "teams_members_list",
             "Le trombinoscope d'une équipe, du plus ancien membre au plus récent",
-            "Rend qui est sur cette équipe, avec la section, le titre et la ligne hiérarchique \
-             de chaque siège. À lire avant `teams_member_remove` : ôter un responsable qui a \
-             des rapports est refusé par un 409 qui les nomme, et cette liste dit lesquels.",
+            "Rend qui est sur cette équipe, avec la section, le titre et la ligne hiérarchique de \
+             chaque siège. À lire avant `teams_members_remove` : ôter un responsable qui a des \
+             rapports est refusé par un 409 qui les nomme, et cette liste dit lesquels.",
             Method::Get,
             "/v1/teams/{team_id}/members",
             json!({
@@ -503,15 +512,15 @@ pub fn tools() -> Vec<ToolDef> {
             Risk::Read,
         ),
         t(
-            "teams_member_add",
+            "teams_members_add",
             "Mettre un employé sur une équipe — ou refuser parce qu'il est déjà sur une autre",
             "Ajoute un employé à une équipe et **ne remplace jamais** : un siège déjà sur une \
              équipe est un 409 qui nomme laquelle. C'est délibéré — un employé sur deux équipes \
-             donnerait au chargeur de politique deux couches `role`, et il garderait celle \
-             arrivée en dernier, c'est-à-dire un tirage au sort entre le budget des achats et \
-             celui des ventes, chaque décision paraissant correcte dans les journaux. Pour \
-             déplacer quelqu'un d'une équipe à une autre, c'est `teams_member_set`. Cette ligne \
-             n'écrit aucune position : ni titre, ni `reports_to`.",
+             donnerait au chargeur de politique deux couches `role`, et il garderait celle arrivée \
+             en dernier, c'est-à-dire un tirage au sort entre le budget des achats et celui des \
+             ventes, chaque décision paraissant correcte dans les journaux. Pour déplacer \
+             quelqu'un d'une équipe à une autre, c'est `teams_members_set`. Cette ligne n'écrit \
+             aucune position : ni titre, ni `reports_to`.",
             Method::Post,
             "/v1/teams/{team_id}/members",
             json!({
@@ -539,16 +548,16 @@ pub fn tools() -> Vec<ToolDef> {
             Risk::Write,
         ),
         t(
-            "teams_member_set",
+            "teams_members_set",
             "Asseoir un employé : cette équipe, cette section, ce titre, sous ce responsable",
-            "Le seul verbe qui remplace une appartenance et le seul qui écrive une \
-             **position**. **Chaque champ omis est effacé, jamais conservé** : n'envoyer que \
-             `team_id` et `employee_id` déplace le siège sur l'équipe sans section, sans titre \
-             et sans responsable. Il n'y a pas de troisième état « garde l'ancienne valeur » — \
-             lis d'abord `teams_members_list` et renvoie ce que tu veux garder. Trois refus : \
-             un `reports_to` qui ne tient aucun siège chez ce locataire est un 400, un qui \
-             ferme une boucle dans l'organigramme est un 409 `reporting_cycle`, et un employé \
-             qui se rapporte à lui-même tombe sur les deux.",
+            "Le seul verbe qui remplace une appartenance et le seul qui écrive une **position**. \
+             **Chaque champ omis est effacé, jamais conservé** : n'envoyer que `team_id` et \
+             `employee_id` déplace le siège sur l'équipe sans section, sans titre et sans \
+             responsable. Il n'y a pas de troisième état « garde l'ancienne valeur » — lis d'abord \
+             `teams_members_list` et renvoie ce que tu veux garder. Trois refus : un `reports_to` \
+             qui ne tient aucun siège chez ce locataire est un 400, un qui ferme une boucle dans \
+             l'organigramme est un 409 `reporting_cycle`, et un employé qui se rapporte à lui-même \
+             tombe sur les deux.",
             Method::Put,
             "/v1/teams/{team_id}/members/{employee_id}",
             json!({
@@ -585,14 +594,14 @@ pub fn tools() -> Vec<ToolDef> {
             Risk::Destructive,
         ),
         t(
-            "teams_member_remove",
+            "teams_members_remove",
             "Sortir un employé d'une équipe",
             "Retire l'appartenance. **Cela desserre**, cela ne resserre pas : un employé sans \
              équipe n'est pas un employé sans politique, sa couche `role` devient absente et le \
              chargeur la résout par celle du locataire — donc sortir quelqu'un des achats le \
-             remonte au plafond du locataire. Un responsable qui a des rapports n'est pas \
-             retiré mais **refusé**, par un 409 nommant chaque employé dont la ligne casserait \
-             : re-pointe-les avec `teams_member_set` d'abord. Supprimer une appartenance que \
+             remonte au plafond du locataire. Un responsable qui a des rapports n'est pas retiré \
+             mais **refusé**, par un 409 nommant chaque employé dont la ligne casserait : \
+             re-pointe-les avec `teams_members_set` d'abord. Supprimer une appartenance que \
              l'employé n'a pas est un 404, et non un succès silencieux qui l'aurait sorti de \
              l'équipe où il est vraiment.",
             Method::Delete,
@@ -619,13 +628,12 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "teams_mission_set",
             "Dire à quoi sert cette fonction",
-            "Écrit la mission d'une équipe — la troisième colonne de l'organigramme, et la \
-             seule phrase durable qu'une équipe possède en propre : sans elle, une nouvelle \
-             recrue de l'équipe croissance connaît sa tâche et rien de la croissance. \
-             Idempotent, et il marche sur une équipe créée il y a un an comme sur une créée il \
-             y a une seconde. Une mission n'est **pas** une limite : rien ici n'ouvre ni ne \
-             ferme quoi que ce soit, les restrictions restent des lignes de `policy_layers` \
-             qu'on lit par `policy_role_get`.",
+            "Écrit la mission d'une équipe — la troisième colonne de l'organigramme, et la seule \
+             phrase durable qu'une équipe possède en propre : sans elle, une nouvelle recrue de \
+             l'équipe croissance connaît sa tâche et rien de la croissance. Idempotent, et il \
+             marche sur une équipe créée il y a un an comme sur une créée il y a une seconde. Une \
+             mission n'est **pas** une limite : rien ici n'ouvre ni ne ferme quoi que ce soit, les \
+             restrictions restent des lignes de `policy_layers` qu'on lit par `policy_role_get`.",
             Method::Put,
             "/v1/teams/{team_id}/mission",
             json!({
@@ -651,11 +659,11 @@ pub fn tools() -> Vec<ToolDef> {
             "Pointer une équipe vers le `role_name` sous lequel ses limites sont écrites",
             "Déplace un pointeur et n'écrit rien d'autre — aucun plafond ne se règle ici. \
              **Attention au sens du danger** : un rôle pour lequel personne n'a écrit de couche \
-             est une couche *absente*, qui hérite de celle du locataire ; pointer une équipe \
-             vers une faute de frappe ne la verrouille donc pas, cela la **dé-restreint**, et \
-             l'ancienne portée est perdue. Deux équipes peuvent partager un rôle — \
-             `purchasing-eu` et `purchasing-us` sous `purchasing`. Vérifie avec \
-             `policy_role_get` que le rôle visé a bien une couche avant d'appeler.",
+             est une couche *absente*, qui hérite de celle du locataire ; pointer une équipe vers \
+             une faute de frappe ne la verrouille donc pas, cela la **dé-restreint**, et \
+             l'ancienne portée est perdue. Deux équipes peuvent partager un rôle — `purchasing-eu` \
+             et `purchasing-us` sous `purchasing`. Vérifie avec `policy_role_get` que le rôle visé \
+             a bien une couche avant d'appeler.",
             Method::Put,
             "/v1/teams/{team_id}/policy-role",
             json!({
@@ -710,11 +718,13 @@ pub fn tools() -> Vec<ToolDef> {
             "teams_budget_set",
             "Ce que toute une équipe peut réserver en un jour, dans une devise",
             "Fixe le plafond quotidien d'une équipe, par devise et de façon idempotente : le \
-             renvoyer remplace le nombre. Baisser un budget ne **reprend pas** ce que la \
-             journée a déjà réservé, cela contraint la suite — le registre des réservations \
-             n'est pas touché. Le montant est en unités mineures avec son code : `{\"minor\": \
-             500000, \"currency\": \"USD\"}`, et zéro est refusé des deux côtés, au parseur puis \
-             dans la base.",
+             renvoyer remplace le nombre. Baisser un budget ne **reprend pas** ce que la journée a \
+             déjà réservé, cela contraint la suite — le registre des réservations n'est pas \
+             touché. Le montant est en unités mineures avec son code : `{\"minor\": 500000, \
+             \"currency\": \"USD\"}`, et zéro est refusé des deux côtés, au parseur puis dans la \
+             base. Le `team_id` vient de `teams_list` et l'état courant du budget de \
+             `teams_budget_get` ; pour plafonner l'argent d'un siège et non d'une équipe, c'est \
+             `spend_caps_set`.",
             Method::Put,
             "/v1/teams/{team_id}/budget",
             json!({
@@ -747,12 +757,12 @@ pub fn tools() -> Vec<ToolDef> {
         // Le bureau : la seule façon de parler à un employé
         // -------------------------------------------------------------------
         t(
-            "desk_read",
+            "desk_messages_list",
             "Ce qui attend sur un bureau, le plus récent d'abord",
-            "Rend les messages posés sur le bureau d'un siège — répondus et non répondus \
-             ensemble, sans filtre, parce que ce qu'on veut sur un écran c'est ce qui est en \
-             cours *et* ce qui a été traité. C'est ici qu'on prend l'`id` d'une question pour le \
-             mettre dans le champ `answers` de `desk_send`. Tous les bureaux sont lisibles, pas \
+            "Rend les messages posés sur le bureau d'un siège — répondus et non répondus ensemble, \
+             sans filtre, parce que ce qu'on veut sur un écran c'est ce qui est en cours *et* ce \
+             qui a été traité. C'est ici qu'on prend l'`id` d'une question pour le mettre dans le \
+             champ `answers` de `desk_messages_send`. Tous les bureaux sont lisibles, pas \
              seulement ceux des fauteuils : c'est comme cela qu'un opérateur voit ce que sa \
              hiérarchie dit réellement à un employé qui travaille.",
             Method::Get,
@@ -762,19 +772,19 @@ pub fn tools() -> Vec<ToolDef> {
             Risk::Read,
         ),
         t(
-            "desk_send",
+            "desk_messages_send",
             "Parler à un employé depuis un siège : un ordre, une question, ou une réponse",
-            "Le verbe qui manquait au produit : la seule façon d'envoyer à un employé une \
-             phrase qu'il lira. Trois pièges, dans l'ordre où ils mordent. **Le siège dans le \
-             chemin est l'expéditeur, pas le destinataire**, et il doit être un *fauteuil* — un \
-             siège dont le plafond de tours intersecté vaut zéro, ce qui est la façon dont ce \
-             système écrit « une personne s'assoit ici » ; le destinataire est le `to`, par \
-             slug. **Le message réveille le destinataire et lui coûte un tour** de son budget \
-             du jour, sur le modèle et la facture du client — un budget épuisé est un 409. **Un \
-             `answers` répond à une question précise** : il porte l'`id` d'un message lu sur \
-             `desk_read`, il est obligatoire pour `kind: \"answer\"` et ignoré par les deux \
-             autres. Un siège que cette société n'a pas est un 404 ; tout ce que \
-             l'organigramme, la question ou le budget refusent est un 409 nommé.",
+            "Le verbe qui manquait au produit : la seule façon d'envoyer à un employé une phrase \
+             qu'il lira. Trois pièges, dans l'ordre où ils mordent. **Le siège dans le chemin est \
+             l'expéditeur, pas le destinataire**, et il doit être un *fauteuil* — un siège dont le \
+             plafond de tours intersecté vaut zéro, ce qui est la façon dont ce système écrit \
+             « une personne s'assoit ici » ; le destinataire est le `to`, par slug. **Le message \
+             réveille le destinataire et lui coûte un tour** de son budget du jour, sur le modèle \
+             et la facture du client — un budget épuisé est un 409. **Un `answers` répond à une \
+             question précise** : il porte l'`id` d'un message lu sur `desk_messages_list`, il est \
+             obligatoire pour `kind: \"answer\"` et ignoré par les deux autres. Un siège que cette \
+             société n'a pas est un 404 ; tout ce que l'organigramme, la question ou le budget \
+             refusent est un 409 nommé.",
             Method::Post,
             "/v1/employees/{id}/desk",
             json!({
@@ -801,7 +811,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "answers": {
                         "type": "string",
                         "format": "uuid",
-                        "description": "Pour un `answer` : l'`id` du message qu'il referme, relevé sur `desk_read`. Ignoré par `order` et `question`.",
+                        "description": "Pour un `answer` : l'`id` du message qu'il referme, relevé sur `desk_messages_list`. Ignoré par `order` et `question`.",
                     },
                     "attachments": {
                         "type": "array",
@@ -825,13 +835,13 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "approvals_list",
             "La file d'attente humaine : ce que les employés demandent, du plus ancien au plus récent",
-            "Rend les approbations `pending` de cette société. **Rien ne sort de cette file \
-             tout seul** : `state` n'a pas de valeur « expirée », un jeton dure 24 heures et \
-             personne ne déplace une ligne périmée — donc une quinzaine sans surveillance donne \
-             une file dont la tête est le travail le plus certainement mort et dont la seule \
-             ligne encore utilisable est en bas. Le compteur de supervision, lui, filtre les \
-             périmées : les deux chiffres ne coïncident pas, et c'est connu. Une ligne périmée \
-             reste refusable par `approvals_deny`, un appel chacune.",
+            "Rend les approbations `pending` de cette société. **Rien ne sort de cette file tout \
+             seul** : `state` n'a pas de valeur « expirée », un jeton dure 24 heures et personne \
+             ne déplace une ligne périmée — donc une quinzaine sans surveillance donne une file \
+             dont la tête est le travail le plus certainement mort et dont la seule ligne encore \
+             utilisable est en bas. Le compteur de supervision, lui, filtre les périmées : les \
+             deux chiffres ne coïncident pas, et c'est connu. Une ligne périmée reste refusable \
+             par `approvals_deny`, un appel chacune.",
             Method::Get,
             "/v1/approvals",
             nothing(),
@@ -843,8 +853,8 @@ pub fn tools() -> Vec<ToolDef> {
             "Une approbation, dans l'état où elle est",
             "Rend une demande, décidée ou non — « qu'est-il arrivé à ma demande ? » est la \
              deuxième question que tout le monde pose. C'est ici qu'on lit l'action exacte à \
-             recopier dans le corps d'`approvals_approve` : elle doit être restituée mot pour \
-             mot. L'`id` vient d'`approvals_list`.",
+             recopier dans le corps d'`approvals_approve` : elle doit être restituée mot pour mot. \
+             L'`id` vient d'`approvals_list`.",
             Method::Get,
             "/v1/approvals/{id}",
             json!({
@@ -864,18 +874,17 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "approvals_approve",
             "Dépenser une approbation sur l'action que le corps restitue",
-            "Engage la société : pour `payment_create`, **l'argent part vraiment** ; pour \
-             toutes les autres natures, le jeton est frappé, la décision enregistrée et le \
-             jeton jeté. Le corps porte l'action, et ce n'est pas une formalité — l'échec que \
-             cette route existe pour empêcher n'est pas « on a approuvé la mauvaise chose », \
-             c'est « on a approuvé *ceci* et *cela* a été exécuté » : l'action est re-hachée \
-             contre celle déposée à la demande, et une différence est un \
-             `approval_action_mismatch`. Recopie-la donc depuis `approvals_get`, sans \
-             reformuler : le hachage est **octet par octet**, un même nom écrit en NFC et en \
-             NFD sont deux approbations différentes. Deux gardes précèdent tout : \
-             l'approbateur ne peut pas être le demandeur, et sa clé doit porter le rôle exigé. \
-             Un 502 signifie approbation dépensée et argent peut-être en vol — il n'y a pas de \
-             rejeu.",
+            "Engage la société : pour `payment_create`, **l'argent part vraiment** ; pour toutes \
+             les autres natures, le jeton est frappé, la décision enregistrée et le jeton jeté. Le \
+             corps porte l'action, et ce n'est pas une formalité — l'échec que cette route existe \
+             pour empêcher n'est pas « on a approuvé la mauvaise chose », c'est « on a approuvé \
+             *ceci* et *cela* a été exécuté » : l'action est re-hachée contre celle déposée à la \
+             demande, et une différence est un `approval_action_mismatch`. Recopie-la donc depuis \
+             `approvals_get`, sans reformuler : le hachage est **octet par octet**, un même nom \
+             écrit en NFC et en NFD sont deux approbations différentes. Deux gardes précèdent \
+             tout : l'approbateur ne peut pas être le demandeur, et sa clé doit porter le rôle \
+             exigé. Un 502 signifie approbation dépensée et argent peut-être en vol — il n'y a pas \
+             de rejeu.",
             Method::Post,
             "/v1/approvals/{id}/approve",
             json!({
@@ -901,12 +910,12 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "approvals_deny",
             "Refuser une approbation. Le jeton n'est plus dépensable, jamais",
-            "Annule définitivement la demande : le nonce est brûlé et l'employé devra en \
-             déposer une nouvelle. Contrairement à `approvals_approve`, il n'y a pas de règle \
-             des quatre yeux — refuser sa propre demande est une annulation, il n'y a rien à \
-             empêcher — et une ligne déjà périmée s'accepte sans regarder sa date, ce qui est \
-             la seule façon de vider la file. La `note` est facultative et vaut la peine d'être \
-             écrite : c'est ce que lira le prochain opérateur.",
+            "Annule définitivement la demande : le nonce est brûlé et l'employé devra en déposer \
+             une nouvelle. Contrairement à `approvals_approve`, il n'y a pas de règle des quatre \
+             yeux — refuser sa propre demande est une annulation, il n'y a rien à empêcher — et \
+             une ligne déjà périmée s'accepte sans regarder sa date, ce qui est la seule façon de \
+             vider la file. La `note` est facultative et vaut la peine d'être écrite : c'est ce \
+             que lira le prochain opérateur.",
             Method::Post,
             "/v1/approvals/{id}/deny",
             json!({
@@ -930,15 +939,14 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "capability_requests_list",
             "Ce qu'un employé se voit refuser sans arrêt, et à quelle fréquence",
-            "L'autre sens de la file : non pas « il veut faire une chose qui demande un \
-             humain », mais « il lui manque une permission ». **Personne n'a écrit ces \
-             lignes** : chacune est dérivée de la piste d'audit que la Gate écrit déjà, une \
-             ligne par jugement — donc une demande ne peut pas revendiquer un refus qui n'a pas \
-             eu lieu, et un modèle ne peut pas en composer une. Le vocabulaire est \
-             volontairement pauvre : un slug, une nature d'action, une raison de refus, un \
-             décompte, deux dates. Pas de nom d'outil, pas de domaine — les mettre ferait de \
-             l'écran d'approbation une surface qu'un inconnu peut écrire. Répondre à une ligne \
-             est `capability_requests_decide`.",
+            "L'autre sens de la file : non pas « il veut faire une chose qui demande un humain », \
+             mais « il lui manque une permission ». **Personne n'a écrit ces lignes** : chacune \
+             est dérivée de la piste d'audit que la Gate écrit déjà, une ligne par jugement — donc \
+             une demande ne peut pas revendiquer un refus qui n'a pas eu lieu, et un modèle ne \
+             peut pas en composer une. Le vocabulaire est volontairement pauvre : un slug, une \
+             nature d'action, une raison de refus, un décompte, deux dates. Pas de nom d'outil, \
+             pas de domaine — les mettre ferait de l'écran d'approbation une surface qu'un inconnu \
+             peut écrire. Répondre à une ligne est `capability_requests_decide`.",
             Method::Get,
             "/v1/capability-requests",
             nothing(),
@@ -949,16 +957,16 @@ pub fn tools() -> Vec<ToolDef> {
             "capability_requests_decide",
             "Répondre à une demande de permission — et ne changer aucune politique en le faisant",
             "Enregistre la décision d'un humain sur un refus récurrent : une ligne dans le \
-             registre des décisions, une ligne d'audit, une transaction. **Cela n'élargit rien, \
-             et c'est la moitié honnête de la fonctionnalité** : accorder ici n'écrit pas une \
-             couche de politique, parce que remplacer une couche existante n'a aucune propriété \
-             de rétrécissement — la réponse dit en toutes lettres qu'il reste à installer la \
-             couche à la main. Un accord que personne n'installe n'est pas perdu : l'employé \
-             continue d'être refusé et la demande revient avec son ancienne décision attachée. \
-             La demande n'a pas d'identifiant — c'est une clé de regroupement — donc on la \
-             nomme par sa forme, telle que `capability_requests_list` la rend. La clé doit \
-             porter le rôle d'approbateur (403 `role_required`) ; un refus que la piste de \
-             cette société ne connaît pas est un 404.",
+             registre des décisions, une ligne d'audit, une transaction. **Cela n'élargit rien, et \
+             c'est la moitié honnête de la fonctionnalité** : accorder ici n'écrit pas une couche \
+             de politique, parce que remplacer une couche existante n'a aucune propriété de \
+             rétrécissement — la réponse dit en toutes lettres qu'il reste à installer la couche à \
+             la main. Un accord que personne n'installe n'est pas perdu : l'employé continue \
+             d'être refusé et la demande revient avec son ancienne décision attachée. La demande \
+             n'a pas d'identifiant — c'est une clé de regroupement — donc on la nomme par sa \
+             forme, telle que `capability_requests_list` la rend. La clé doit porter le rôle \
+             d'approbateur (403 `role_required`) ; un refus que la piste de cette société ne \
+             connaît pas est un 404.",
             Method::Post,
             "/v1/capability-requests/decide",
             json!({
@@ -1004,13 +1012,13 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "policy_role_get",
             "La couche de limites d'un rôle, telle qu'elle est stockée",
-            "Rend le document écrit sous ce `role_name` — **et non** l'intersection que la \
-             Gate applique réellement. 404 quand le rôle n'a pas de couche à lui, et c'est la \
-             réponse honnête : une couche absente hérite au *chargement*, donc afficher celle \
-             du locataire rendrait « ce rôle n'a rien d'écrit » et « ce rôle a exactement les \
-             limites du plafond » indiscernables. À lire avant tout `policy_role_put`, qui \
-             exige un document complet. Ce que la Gate applique pour un siège donné se lit \
-             plutôt sur `controls_get`.",
+            "Rend le document écrit sous ce `role_name` — **et non** l'intersection que la Gate \
+             applique réellement. 404 quand le rôle n'a pas de couche à lui, et c'est la réponse \
+             honnête : une couche absente hérite au *chargement*, donc afficher celle du locataire \
+             rendrait « ce rôle n'a rien d'écrit » et « ce rôle a exactement les limites du \
+             plafond » indiscernables. À lire avant tout `policy_role_set`, qui exige un document \
+             complet. Ce que la Gate applique pour un siège donné se lit plutôt sur \
+             `controls_get`.",
             Method::Get,
             "/v1/policy/roles/{role}",
             json!({
@@ -1027,19 +1035,18 @@ pub fn tools() -> Vec<ToolDef> {
             Risk::Read,
         ),
         t(
-            "policy_role_put",
+            "policy_role_set",
             "Remplacer la couche d'un rôle par une couche plus étroite",
-            "La seule route qui puisse changer une limite, et elle ne peut que **resserrer** : \
-             un corps qui n'est pas contenu dans la couche qu'il déplace est un 409 \
-             `policy_widens`, refusé et non silencieusement intersecté. Deux pièges. **Le corps \
-             est un document entier, pas un correctif** : un champ manquant n'est pas « laisse \
-             comme c'était », c'est un remplacement total — `{\"max_turns_per_day\": 30}` a \
-             l'air d'une retouche et coûte au siège ses canaux, ses domaines et son modèle ; \
-             lis d'abord `policy_role_get` et renvoie le document complet modifié. **Elle ne \
-             crée pas** : un rôle sans couche est un 404, la création appartient à \
-             `companies_create`, qui connaît l'organigramme. Le plafond de la plateforme et les \
-             couches locataire et employé ne sont pas atteignables ici. `installed: false` \
-             signifie que la couche disait déjà exactement cela.",
+            "La seule route qui puisse changer une limite, et elle ne peut que **resserrer** : un \
+             corps qui n'est pas contenu dans la couche qu'il déplace est un 409 `policy_widens`, \
+             refusé et non silencieusement intersecté. Deux pièges. **Le corps est un document \
+             entier, pas un correctif** : un champ manquant n'est pas « laisse comme c'était », \
+             c'est un remplacement total — `{\"max_turns_per_day\": 30}` a l'air d'une retouche et \
+             coûte au siège ses canaux, ses domaines et son modèle ; lis d'abord `policy_role_get` \
+             et renvoie le document complet modifié. **Elle ne crée pas** : un rôle sans couche \
+             est un 404, la création appartient à `company_create`, qui connaît l'organigramme. Le \
+             plafond de la plateforme et les couches locataire et employé ne sont pas atteignables \
+             ici. `installed: false` signifie que la couche disait déjà exactement cela.",
             Method::Put,
             "/v1/policy/roles/{role}",
             json!({
@@ -1105,7 +1112,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "max_turns_per_day": {
                         "type": "integer",
                         "minimum": 0,
-                        "description": "Tours par jour. **Zéro veut dire « ne peut pas agir de lui-même »**, et c'est ce qui fait d'un siège un fauteuil au sens de `desk_send`.",
+                        "description": "Tours par jour. **Zéro veut dire « ne peut pas agir de lui-même »**, et c'est ce qui fait d'un siège un fauteuil au sens de `desk_messages_send`.",
                     },
                     "allow_file_upload": { "type": "boolean" },
                     "allow_credential_change": { "type": "boolean" },
@@ -1126,16 +1133,15 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "controls_get",
             "Ce qui borne chaque siège, et le bouton d'arrêt — en une lecture",
-            "La page que regarde un client qui paie cher et se demande deux choses : est-ce \
-             que ça coûte sans limite, et est-ce que ça s'arrête. Elle réunit ce qu'il fallait \
-             six routes pour lire, et dit trois choses qu'aucune ne disait : **quelle couche a \
-             posé chaque plafond** (`set_by`, ou `tightest_of` quand plusieurs disent le même \
-             chiffre — une couche héritée n'apparaît jamais, elle n'a rien posé), \
-             **`acts_on_its_own`** en clair, et **ce que le plafond libère réellement \
-             aujourd'hui** une fois la chauffe du domaine passée, avec `contacts_held_back` qui \
-             nomme le mur. Le budget de l'équipe y est aussi, lu comme le magasin le lit. À \
-             préférer à `policy_role_get` quand la question est « qu'est-ce qui arrête ce siège \
-             en premier ».",
+            "La page que regarde un client qui paie cher et se demande deux choses : est-ce que ça \
+             coûte sans limite, et est-ce que ça s'arrête. Elle réunit ce qu'il fallait six routes \
+             pour lire, et dit trois choses qu'aucune ne disait : **quelle couche a posé chaque \
+             plafond** (`set_by`, ou `tightest_of` quand plusieurs disent le même chiffre — une \
+             couche héritée n'apparaît jamais, elle n'a rien posé), **`acts_on_its_own`** en \
+             clair, et **ce que le plafond libère réellement aujourd'hui** une fois la chauffe du \
+             domaine passée, avec `contacts_held_back` qui nomme le mur. Le budget de l'équipe y \
+             est aussi, lu comme le magasin le lit. À préférer à `policy_role_get` quand la \
+             question est « qu'est-ce qui arrête ce siège en premier ».",
             Method::Get,
             "/v1/controls",
             nothing(),
@@ -1143,13 +1149,15 @@ pub fn tools() -> Vec<ToolDef> {
             Risk::Read,
         ),
         t(
-            "employee_turns_get",
+            "employees_turns_get",
             "Ce qu'un siège a consommé aujourd'hui, et ce qui lui reste",
-            "Rend le budget de tours du jour pour un employé. `turns_taken: 0` avec un 200 est \
-             la réponse ordinaire d'un siège qui ne s'est pas encore réveillé — il n'y a pas de \
-             ligne de compteur avant la première réservation, et « rien de consommé » est un \
-             fait, pas une ressource absente. Le 404 est pour un employé qui n'existe pas *dans \
-             cette société*. Le compteur repart de lui-même à minuit UTC.",
+            "Rend le budget de tours du jour pour un employé. `turns_taken: 0` avec un 200 est la \
+             réponse ordinaire d'un siège qui ne s'est pas encore réveillé — il n'y a pas de ligne \
+             de compteur avant la première réservation, et « rien de consommé » est un fait, pas \
+             une ressource absente. Le 404 est pour un employé qui n'existe pas *dans cette \
+             société*. Le compteur repart de lui-même à minuit UTC. L'`id` vient \
+             d'`employees_list`. Pour savoir quelle couche a posé ce plafond et ce qui arrêtera le \
+             siège en premier, `controls_get` ; pour ce qu'il s'est vu refuser, `refusals_get`.",
             Method::Get,
             "/v1/employees/{id}/turns",
             employee_id_only("L'UUID du siège, depuis `employees_list`."),
@@ -1162,9 +1170,9 @@ pub fn tools() -> Vec<ToolDef> {
             "Compte les refus et rend les cinquante plus récents — ce qu'un humain relit ; le \
              reste est dans les décomptes. À utiliser quand un employé « ne fait rien » : c'est \
              ici qu'on voit s'il est refusé, et pourquoi. La fenêtre s'écrit `days` (N jours \
-             calendaires UTC finissant aujourd'hui) ou `from`/`to`, `to` étant **inclusif** ; \
-             ce sont les mêmes bornes que `autonomy_get`, pour que les deux se lisent côte à \
-             côte. Zéro partout avec un 200 est la réponse ordinaire d'une fenêtre sans refus.",
+             calendaires UTC finissant aujourd'hui) ou `from`/`to`, `to` étant **inclusif** ; ce \
+             sont les mêmes bornes que `autonomy_get`, pour que les deux se lisent côte à côte. \
+             Zéro partout avec un 200 est la réponse ordinaire d'une fenêtre sans refus.",
             Method::Get,
             "/v1/refusals",
             json!({
@@ -1194,12 +1202,12 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "autonomy_get",
             "Quelle part du travail les agents ont faite eux-mêmes, sur une fenêtre",
-            "Le chiffre commercial de ce produit : `autonomy_pct` par siège et pour la \
-             société. `null` et non zéro quand il n'y avait rien à diviser — « pas de données » \
-             n'est pas « 0 % autonome » — et la division tronque vers le bas, comme toute \
-             ambiguïté ici. La fenêtre est celle de `refusals_get` : `from`/`to` en jours UTC, \
-             `to` inclus, 366 jours au plus. À lire à côté de `refusals_get` : l'un dit ce que \
-             les agents ont fait, l'autre ce qu'on les a empêchés de faire.",
+            "Le chiffre commercial de ce produit : `autonomy_pct` par siège et pour la société. \
+             `null` et non zéro quand il n'y avait rien à diviser — « pas de données » n'est pas \
+             « 0 % autonome » — et la division tronque vers le bas, comme toute ambiguïté ici. La \
+             fenêtre est celle de `refusals_get` : `from`/`to` en jours UTC, `to` inclus, 366 \
+             jours au plus. À lire à côté de `refusals_get` : l'un dit ce que les agents ont fait, \
+             l'autre ce qu'on les a empêchés de faire.",
             Method::Get,
             "/v1/autonomy",
             json!({
@@ -1225,14 +1233,14 @@ pub fn tools() -> Vec<ToolDef> {
         // L'initiative : ce qu'un employé fait quand personne ne lui écrit
         // -------------------------------------------------------------------
         t(
-            "initiative_fleet",
+            "initiatives_list",
             "Tous les sièges programmés de cette société, en une lecture",
-            "Le pluriel d'`initiative_get`, et la raison d'être de cette ligne : un écran \
-             d'accueil qui montre « qui travaille en ce moment » faisait une requête par siège. \
-             **Un siège sans cadence n'y est pas** — il ne se réveille jamais tout seul, donc \
-             il ne *travaille* pas au sens de cette question. La surface qui liste tous les \
-             sièges, programmés ou non, est `interview_questionnaire`, et c'est elle qu'il faut \
-             pour une société neuve, où aucun siège n'est encore lancé.",
+            "Toute la flotte d'un coup là où `initiatives_get` lit un siège, et la raison d'être \
+             de cette ligne : un écran d'accueil qui montre « qui travaille en ce moment » faisait \
+             une requête par siège. **Un siège sans cadence n'y est pas** — il ne se réveille \
+             jamais tout seul, donc il ne *travaille* pas au sens de cette question. La surface \
+             qui liste tous les sièges, programmés ou non, est `interview_questions_list`, et \
+             c'est elle qu'il faut pour une société neuve, où aucun siège n'est encore lancé.",
             Method::Get,
             "/v1/initiative",
             nothing(),
@@ -1240,37 +1248,40 @@ pub fn tools() -> Vec<ToolDef> {
             Risk::Read,
         ),
         t(
-            "initiative_get",
+            "initiatives_get",
             "La cadence d'un siège, sa prochaine échéance, ce qui s'est passé la dernière fois, et le plan tel qu'il tient aujourd'hui",
-            "Répond aux trois questions qu'un opérateur a vraiment : est-ce qu'il travaille, \
-             quand agit-il ensuite, et s'il ne travaille pas, que lui manque-t-il. Le plan est \
+            "Répond aux trois questions qu'un opérateur a vraiment : est-ce qu'il travaille, quand \
+             agit-il ensuite, et s'il ne travaille pas, que lui manque-t-il. Le plan est \
              **recalculé** à chaque lecture depuis l'objectif stocké, jamais stocké : c'est le \
-             moyen le plus rapide de découvrir qu'un objectif qu'on vient de poser a un trou — \
-             la réponse porte alors `clarify` et pose la question, dans le même aller-retour. \
-             404 quand le siège n'a pas d'initiative, n'existe pas, ou appartient à une autre \
-             société : les trois sont indiscernables exprès.",
+             moyen le plus rapide de découvrir qu'un objectif qu'on vient de poser a un trou — la \
+             réponse porte alors `clarify` et pose la question, dans le même aller-retour. 404 \
+             quand le siège n'a pas d'initiative, n'existe pas, ou appartient à une autre \
+             société : les trois sont indiscernables exprès. Si c'est toute la société qui semble \
+             immobile et pas ce siège-là, `company_health_get` d'abord : une cadence parfaitement \
+             réglée ne produit rien quand le modèle n'est pas connecté ou que la société est à \
+             l'arrêt. L'`id` vient d'`employees_list`.",
             Method::Get,
             "/v1/employees/{id}/initiative",
-            employee_id_only("L'UUID du siège, depuis `employees_list` ou `initiative_fleet`."),
+            employee_id_only("L'UUID du siège, depuis `employees_list` ou `initiatives_list`."),
             &[],
             Risk::Read,
         ),
         t(
-            "initiative_set",
+            "initiatives_set",
             "Lancer un siège : son objectif, et la fréquence à laquelle il y travaille seul",
-            "La seule route qui écrive les deux moitiés à la fois — l'objectif (*ce pour quoi* \
-             le siège est là) et la cadence (*quand* il agit) — dans une transaction, parce \
-             qu'un employé réveillé sur une cadence pour un objectif annulé n'a pas de sens. \
-             **C'est un remplacement, pas un correctif** : les deux champs sont obligatoires et \
-             l'ancien objectif est perdu ; lis `initiative_get` d'abord si tu veux en garder une \
-             partie. C'est aussi la route qui **choisit le rôle** d'un siège, ce qu'aucun modèle \
-             ne fait à ta place : le tag `role` de l'objectif est un choix fermé. Une cadence \
-             hors bornes est **refusée et jamais rabotée** — plancher 300 s, plafond 30 jours — \
-             parce qu'un raccourci silencieux ferait croire à l'opérateur que sa valeur a été \
-             prise. Poser une cadence **déplace la prochaine échéance** à un intervalle d'ici. \
-             Chaque valeur repasse par son constructeur : un pays écrit « Germany » ou un prix \
-             nul est un 400 qui nomme le champ. Pour compléter un objectif en prose plutôt \
-             qu'en JSON, `interview_answer`.",
+            "La seule route qui écrive les deux moitiés à la fois — l'objectif (*ce pour quoi* le \
+             siège est là) et la cadence (*quand* il agit) — dans une transaction, parce qu'un \
+             employé réveillé sur une cadence pour un objectif annulé n'a pas de sens. **C'est un \
+             remplacement, pas un correctif** : les deux champs sont obligatoires et l'ancien \
+             objectif est perdu ; lis `initiatives_get` d'abord si tu veux en garder une partie. \
+             C'est aussi la route qui **choisit le rôle** d'un siège, ce qu'aucun modèle ne fait à \
+             ta place : le tag `role` de l'objectif est un choix fermé. Une cadence hors bornes \
+             est **refusée et jamais rabotée** — plancher 300 s, plafond 30 jours — parce qu'un \
+             raccourci silencieux ferait croire à l'opérateur que sa valeur a été prise. Poser une \
+             cadence **déplace la prochaine échéance** à un intervalle d'ici. Chaque valeur \
+             repasse par son constructeur : un pays écrit « Germany » ou un prix nul est un 400 \
+             qui nomme le champ. Pour compléter un objectif en prose plutôt qu'en JSON, \
+             `interview_answer`.",
             Method::Put,
             "/v1/employees/{id}/initiative",
             json!({
@@ -1289,7 +1300,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "objective": {
                         "type": "object",
-                        "description": "Ce sur quoi il agit, union étiquetée par `role`. `international-buyer` : `what`, `quantity`, `max_unit_price {minor,currency}`, `delivery_country`, `requirements[]`. `sales-development` : `segment` (obligatoire), `market`, `target_accounts[]`. `customer-success` : `product`, `first_response_hours`, `escalate_to`. `growth` : `topic`, `market`, `measure`. `finance` : `period`, `currency`, `obligations[]`. `entry-requirements` : `destinations`, `passports[]`, `max_age_days`. `engineering` : `repository`, `checks`, `reviewer`. `managing` : `mission`, `seats {slug: role}`. Sauf `segment`, tout a un défaut : un objectif incomplet est stockable, et `initiative_get` rend la question en `clarify` plutôt qu'un refus.",
+                        "description": "Ce sur quoi il agit, union étiquetée par `role`. `international-buyer` : `what`, `quantity`, `max_unit_price {minor,currency}`, `delivery_country`, `requirements[]`. `sales-development` : `segment` (obligatoire), `market`, `target_accounts[]`. `customer-success` : `product`, `first_response_hours`, `escalate_to`. `growth` : `topic`, `market`, `measure`. `finance` : `period`, `currency`, `obligations[]`. `entry-requirements` : `destinations`, `passports[]`, `max_age_days`. `engineering` : `repository`, `checks`, `reviewer`. `managing` : `mission`, `seats {slug: role}`. Sauf `segment`, tout a un défaut : un objectif incomplet est stockable, et `initiatives_get` rend la question en `clarify` plutôt qu'un refus.",
                         "properties": {
                             "role": {
                                 "type": "string",
@@ -1312,17 +1323,17 @@ pub fn tools() -> Vec<ToolDef> {
         // L'entretien : finir la société en parlant
         // -------------------------------------------------------------------
         t(
-            "interview_questionnaire",
+            "interview_questions_list",
             "Toutes les questions ouvertes de cette société, siège par siège",
-            "Après `companies_create` et `model_connect`, aucun siège ne sait encore à quoi il \
+            "Après `company_create` et `model_connect`, aucun siège ne sait encore à quoi il \
              sert : cette liste est ce qui reste à dire. **Tous les employés, pas tous les \
              chartés** — un siège que personne n'a chargé d'une mission est justement celui que \
              cette liste doit montrer, puisque c'est l'état dans lequel une société neuve est \
-             entièrement. Chaque question porte un code, qu'on repasse à `interview_answer` \
-             pour dire laquelle on répond. Une question marquée `answerable: false` ne se ferme \
-             par aucune phrase : son remède est une couche de politique. C'est aussi la seule \
-             surface qui liste chaque siège, programmé ou non, là où `initiative_fleet` n'a que \
-             les programmés.",
+             entièrement. Chaque question porte un code, qu'on repasse à `interview_answer` pour \
+             dire laquelle on répond. Une question marquée `answerable: false` ne se ferme par \
+             aucune phrase : son remède est une couche de politique. C'est aussi la seule surface \
+             qui liste chaque siège, programmé ou non, là où `initiatives_list` n'a que les \
+             programmés.",
             Method::Get,
             "/v1/interview",
             nothing(),
@@ -1333,17 +1344,17 @@ pub fn tools() -> Vec<ToolDef> {
             "interview_answer",
             "Un siège, une réponse en prose : le modèle propose, les constructeurs décident",
             "Fait dire au fondateur, en mots, ce qu'il aurait dû taper en JSON tagué dans \
-             `initiative_set` — un tour gaté et compté transforme la prose en valeurs \
-             candidates. La frontière de confiance est nette : une proposition ne peut toucher \
-             qu'une clé **que l'objectif possède déjà** et **encore vide**, jamais le tag `role` \
-             ni un champ déjà répondu, puis chaque valeur repasse par le constructeur — donc ce \
-             que l'entretien écrit est exactement ce qu'un opérateur aurait pu taper à la main. \
-             Tout ou rien : une seule valeur que les constructeurs refusent jette l'objet entier \
-             et les questions reviennent inchangées. Passe `question` avec le code lu sur \
-             `interview_questionnaire` — sans lui, le modèle reçoit les trente-cinq questions \
-             et devine laquelle une phrase referme, mal. Un code qui ne nomme aucune question \
-             ouverte est ignoré, pas refusé. **Cette route ne choisit pas le rôle d'un siège** : \
-             c'est `initiative_set`, et elle seule.",
+             `initiatives_set` — un tour gaté et compté transforme la prose en valeurs candidates. \
+             La frontière de confiance est nette : une proposition ne peut toucher qu'une clé \
+             **que l'objectif possède déjà** et **encore vide**, jamais le tag `role` ni un champ \
+             déjà répondu, puis chaque valeur repasse par le constructeur — donc ce que \
+             l'entretien écrit est exactement ce qu'un opérateur aurait pu taper à la main. Tout \
+             ou rien : une seule valeur que les constructeurs refusent jette l'objet entier et les \
+             questions reviennent inchangées. Passe `question` avec le code lu sur \
+             `interview_questions_list` — sans lui, le modèle reçoit les trente-cinq questions et \
+             devine laquelle une phrase referme, mal. Un code qui ne nomme aucune question ouverte \
+             est ignoré, pas refusé. **Cette route ne choisit pas le rôle d'un siège** : c'est \
+             `initiatives_set`, et elle seule.",
             Method::Post,
             "/v1/employees/{id}/interview",
             json!({
@@ -1352,7 +1363,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "id": {
                         "type": "string",
                         "format": "uuid",
-                        "description": "L'UUID du siège, depuis `interview_questionnaire` ou `employees_list`.",
+                        "description": "L'UUID du siège, depuis `interview_questions_list` ou `employees_list`.",
                     },
                     "answer": {
                         "type": "string",
@@ -1360,7 +1371,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "question": {
                         "type": "string",
-                        "description": "Le code de la question à l'écran, relevé sur `interview_questionnaire`. Absent quand le fondateur parle librement.",
+                        "description": "Le code de la question à l'écran, relevé sur `interview_questions_list`. Absent quand le fondateur parle librement.",
                     },
                 },
                 "required": ["id", "answer"],
@@ -1372,13 +1383,15 @@ pub fn tools() -> Vec<ToolDef> {
         // Le modèle
         // -------------------------------------------------------------------
         t(
-            "model_status",
+            "model_get",
             "Ce qui est connecté, et quand ça a été prouvé",
-            "Rend le chemin d'accès au modèle de cette société et la date de sa vérification. \
-             404 quand rien n'est connecté : un locataire non connecté est un locataire sans \
-             cette ressource, la même réponse que donne le chemin d'exécution d'un tour. La \
-             moitié scellée du secret n'est jamais rendue — le type qui la porte n'est même pas \
-             sérialisable.",
+            "Rend le chemin d'accès au modèle de cette société et la date de sa vérification. 404 \
+             quand rien n'est connecté : un locataire non connecté est un locataire sans cette \
+             ressource, la même réponse que donne le chemin d'exécution d'un tour. La moitié \
+             scellée du secret n'est jamais rendue — le type qui la porte n'est même pas \
+             sérialisable. Un 404 ici est la première cause d'un `stopped` sur \
+             `company_health_get` : ce qui le répare est `model_connect`, qui prouve la clé avant \
+             de la stocker.",
             Method::Get,
             "/v1/model",
             nothing(),
@@ -1388,15 +1401,16 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "model_connect",
             "Prouver une clé de modèle, puis la stocker",
-            "Vérifie la connexion par **un vrai appel de modèle**, facturé à qui possède la \
-             clé qu'on prouve, puis scelle celle-ci sur la ligne du locataire. Deux chemins et \
-             pas un troisième : `api_key` — le locataire colle sa clé Anthropic, **sa clé \
-             paie**, et c'est le chemin dont la production parle — ou `cli`, qui dépense la \
-             session de l'hôte lui-même. **Un abonnement Claude d'un locataire n'est plus une \
-             voie d'entrée** : un `cli` accompagné d'un jeton est refusé avant même la sonde, \
-             la licence interdisant de collecter, stocker ou intermédier un identifiant \
-             Claude.ai — l'outil ne propose donc pas ce champ. Prouver un modèle ne prouve rien \
-             des trois autres : l'appel en nomme exactement un, et la réponse dit lequel.",
+            "Vérifie la connexion par **un vrai appel de modèle**, facturé à qui possède la clé \
+             qu'on prouve, puis scelle celle-ci sur la ligne du locataire. Deux chemins et pas un \
+             troisième : `api_key` — le locataire colle sa clé Anthropic, **sa clé paie**, et \
+             c'est le chemin dont la production parle — ou `cli`, qui dépense la session de l'hôte \
+             lui-même. **Un abonnement Claude d'un locataire n'est plus une voie d'entrée** : un \
+             `cli` accompagné d'un jeton est refusé avant même la sonde, la licence interdisant de \
+             collecter, stocker ou intermédier un identifiant Claude.ai — l'outil ne propose donc \
+             pas ce champ. Prouver un modèle ne prouve rien des trois autres : l'appel en nomme \
+             exactement un, et la réponse dit lequel. Ce qui est connecté, et depuis quand, se \
+             relit ensuite sur `model_get`.",
             Method::Post,
             "/v1/model",
             json!({
@@ -1438,16 +1452,16 @@ pub fn tools() -> Vec<ToolDef> {
         // L'interrupteur
         // -------------------------------------------------------------------
         t(
-            "halt_status",
+            "halt_get",
             "Cette société est-elle arrêtée, et qu'a-t-elle refusé pendant ce temps",
-            "Dit si un arrêt est posé, la phrase de qui l'a posé, la date de fin de fenêtre, \
-             et **le nombre d'actions refusées** — la réponse à « qu'est-ce qui n'a pas eu lieu \
+            "Dit si un arrêt est posé, la phrase de qui l'a posé, la date de fin de fenêtre, et \
+             **le nombre d'actions refusées** — la réponse à « qu'est-ce qui n'a pas eu lieu \
              pendant qu'on était à l'arrêt », dérivée de la piste d'audit et non d'un compteur, \
              donc elle ne peut pas dériver. `window_ends_at` est à côté de `halted` et non \
-             dessous : les deux sont indépendants, une société qui tourne peut avoir une \
-             fenêtre, et une société arrêtée peut l'être par sa fenêtre, par un opérateur, ou \
-             par les deux. Même forme de réponse que `halt_place`, pour qu'un client teste le \
-             même champ dans les deux cas.",
+             dessous : les deux sont indépendants, une société qui tourne peut avoir une fenêtre, \
+             et une société arrêtée peut l'être par sa fenêtre, par un opérateur, ou par les deux. \
+             Même forme de réponse que `halt_place`, pour qu'un client teste le même champ dans \
+             les deux cas.",
             Method::Get,
             "/v1/halt",
             nothing(),
@@ -1458,16 +1472,15 @@ pub fn tools() -> Vec<ToolDef> {
             "halt_place",
             "Tout arrêter",
             "Le bouton rouge de la société : plus un tour, plus un envoi, plus un jeton \
-             d'autorisation, pour tous les sièges à la fois. La `reason` est **obligatoire et \
-             sans défaut** — elle est toute la valeur probante de la ligne : elle est montrée à \
-             chaque refus, recopiée dans la piste d'audit, et relue au post-mortem, et un \
-             gestionnaire qui l'inventerait mettrait des mots dans la bouche d'un opérateur au \
-             sujet d'une urgence. 409 si la société est déjà arrêtée, et volontairement pas un \
-             200 silencieux : la raison du second appelant n'est **pas** enregistrée, donc lui \
+             d'autorisation, pour tous les sièges à la fois. La `reason` est **obligatoire et sans \
+             défaut** — elle est toute la valeur probante de la ligne : elle est montrée à chaque \
+             refus, recopiée dans la piste d'audit, et relue au post-mortem, et un gestionnaire \
+             qui l'inventerait mettrait des mots dans la bouche d'un opérateur au sujet d'une \
+             urgence. 409 si la société est déjà arrêtée, et volontairement pas un 200 \
+             silencieux : la raison du second appelant n'est **pas** enregistrée, donc lui \
              répondre « c'est fait » lui ferait croire que sa phrase est celle qui figure au \
-             dossier. On relâche avec `halt_release`. Un trou connu : la boucle de \
-             provisionnement continue d'acheter les ressources des sièges embauchés, arrêt ou \
-             pas.",
+             dossier. On relâche avec `halt_release`. Un trou connu : la boucle de provisionnement \
+             continue d'acheter les ressources des sièges embauchés, arrêt ou pas.",
             Method::Post,
             "/v1/halt",
             json!({
@@ -1486,16 +1499,15 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "halt_release",
             "Laisser la société repartir",
-            "Retire l'arrêt de l'opérateur : les sièges reprennent leurs tours, leurs envois \
-             et leurs réveils. Engage la société autant que `halt_place` et dans l'autre sens — \
-             c'est la reprise d'une activité que quelqu'un avait délibérément stoppée, avec sa \
-             phrase au dossier ; relis-la avec `halt_status` avant d'appeler. 409 si elle \
-             n'était pas arrêtée, pour la même raison que le 409 de `halt_place` : « relâchée » \
-             et « n'a jamais été arrêtée » sont deux faits différents, et un opérateur qui \
-             croit avoir redémarré une société qui tournait depuis le début est un opérateur \
-             qui cesse de chercher le vrai problème. Cela ne touche pas la fenêtre : une \
-             société dont la fenêtre est épuisée reste arrêtée, et c'est `window_set` qui la \
-             prolonge.",
+            "Retire l'arrêt de l'opérateur : les sièges reprennent leurs tours, leurs envois et \
+             leurs réveils. Engage la société autant que `halt_place` et dans l'autre sens — c'est \
+             la reprise d'une activité que quelqu'un avait délibérément stoppée, avec sa phrase au \
+             dossier ; relis-la avec `halt_get` avant d'appeler. 409 si elle n'était pas arrêtée, \
+             pour la même raison que le 409 de `halt_place` : « relâchée » et « n'a jamais été \
+             arrêtée » sont deux faits différents, et un opérateur qui croit avoir redémarré une \
+             société qui tournait depuis le début est un opérateur qui cesse de chercher le vrai \
+             problème. Cela ne touche pas la fenêtre : une société dont la fenêtre est épuisée \
+             reste arrêtée, et c'est `window_set` qui la prolonge.",
             Method::Delete,
             "/v1/halt",
             nothing(),
@@ -1505,17 +1517,16 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "window_set",
             "Dire quand les agents de cette société s'arrêtent",
-            "Écrit la fenêtre d'exploitation — un **instant**, jamais une durée : « 2 jours / \
-             1 semaine / 1 mois » est une arithmétique que quelqu'un fait une fois, et la faire \
-             ici obligerait chaque lecteur ultérieur à la refaire depuis une date de départ \
-             qu'il ne voit pas. Il n'y a pas de défaut et personne n'a le droit d'en inventer \
-             un : le nombre serait un prix. Deux choses à savoir. **Prolonger une fenêtre déjà \
-             épuisée fait repartir la société**, en un appel — c'est ce qui rend cette ligne \
-             engageante. Et cela ne lève **jamais** l'arrêt d'un opérateur : quand les deux \
-             existent, c'est le sien qui prime, et il se retire par `halt_release`. Idempotent \
-             : le même corps deux fois laisse la même ligne, un corps différent la remplace ; \
-             une date dans le passé est refusée, parce que ce serait un arrêt immédiat sans la \
-             phrase de personne.",
+            "Écrit la fenêtre d'exploitation — un **instant**, jamais une durée : « 2 jours / 1 \
+             semaine / 1 mois » est une arithmétique que quelqu'un fait une fois, et la faire ici \
+             obligerait chaque lecteur ultérieur à la refaire depuis une date de départ qu'il ne \
+             voit pas. Il n'y a pas de défaut et personne n'a le droit d'en inventer un : le \
+             nombre serait un prix. Deux choses à savoir. **Prolonger une fenêtre déjà épuisée \
+             fait repartir la société**, en un appel — c'est ce qui rend cette ligne engageante. \
+             Et cela ne lève **jamais** l'arrêt d'un opérateur : quand les deux existent, c'est le \
+             sien qui prime, et il se retire par `halt_release`. Idempotent : le même corps deux \
+             fois laisse la même ligne, un corps différent la remplace ; une date dans le passé \
+             est refusée, parce que ce serait un arrêt immédiat sans la phrase de personne.",
             Method::Put,
             "/v1/window",
             json!({
@@ -1783,13 +1794,13 @@ mod tests {
         for name in [
             "employees_suspend",
             "employees_terminate",
-            "teams_member_set",
-            "teams_member_remove",
+            "teams_members_set",
+            "teams_members_remove",
             "teams_policy_role_set",
             "approvals_approve",
             "approvals_deny",
-            "policy_role_put",
-            "initiative_set",
+            "policy_role_set",
+            "initiatives_set",
             "halt_place",
             "halt_release",
             "window_set",
@@ -1832,9 +1843,9 @@ mod tests {
         demands("org_apply", &["rows"]);
         demands("teams_create", &["slug", "name"]);
         demands("teams_sections_create", &["slug", "name"]);
-        demands("teams_member_add", &["employee_id"]);
-        demands("teams_member_set", &[]);
-        demands("teams_member_remove", &[]);
+        demands("teams_members_add", &["employee_id"]);
+        demands("teams_members_set", &[]);
+        demands("teams_members_remove", &[]);
         demands("teams_mission_set", &["mission"]);
         demands("teams_policy_role_set", &["role_name"]);
         demands("teams_budget_set", &["daily_total"]);
@@ -1862,19 +1873,19 @@ mod tests {
         // propres mots plutôt que par serde, parce qu'une durée par défaut
         // serait un prix.
         demands(
-            "companies_create",
+            "company_create",
             &["slug", "name", "org", "window_ends_at", "roles"],
         );
     }
 
     #[test]
     fn the_desk_family_demands_a_sender_a_recipient_and_words() {
-        demands("desk_send", &["to", "kind", "body"]);
+        demands("desk_messages_send", &["to", "kind", "body"]);
         // `answers` reste facultatif au niveau du schéma : il n'est exigé que
         // par `kind: "answer"`, ce qu'un JSON Schema plat ne sait pas dire — la
         // description le dit, et la route répond 409.
-        assert!(!required(&tool_named("desk_send")).contains(&"answers"));
-        demands("desk_read", &[]);
+        assert!(!required(&tool_named("desk_messages_send")).contains(&"answers"));
+        demands("desk_messages_list", &[]);
     }
 
     #[test]
@@ -1896,7 +1907,7 @@ mod tests {
         // `#[serde(default)]` et son défaut n'accorde rien. Les quatorze champs
         // sont donc exigés, comme la route les exige.
         demands(
-            "policy_role_put",
+            "policy_role_set",
             &[
                 "spend",
                 "allowed_channels",
@@ -1922,8 +1933,8 @@ mod tests {
         // Une cadence sans objectif est un employé qui se réveille sans rien à
         // faire ; un objectif sans cadence est un employé qui ne se réveille
         // jamais.
-        demands("initiative_set", &["interval_secs", "objective"]);
-        let tool = tool_named("initiative_set");
+        demands("initiatives_set", &["interval_secs", "objective"]);
+        let tool = tool_named("initiatives_set");
         let objective = &tool.schema["properties"]["objective"]["required"];
         assert!(
             objective
@@ -1933,8 +1944,8 @@ mod tests {
                 .any(|value| value == "role"),
             "le tag `role` fait l'union : sans lui rien ne se désérialise"
         );
-        demands("initiative_get", &[]);
-        demands("initiative_fleet", &[]);
+        demands("initiatives_get", &[]);
+        demands("initiatives_list", &[]);
     }
 
     #[test]
@@ -1943,7 +1954,7 @@ mod tests {
         // Le code de la question reste facultatif : un fondateur qui parle
         // librement n'en a pas, et un code qui ne nomme rien est ignoré.
         assert!(!required(&tool_named("interview_answer")).contains(&"question"));
-        demands("interview_questionnaire", &[]);
+        demands("interview_questions_list", &[]);
     }
 
     #[test]
@@ -1957,7 +1968,7 @@ mod tests {
                 .properties()
                 .contains(&"oauth_token")
         );
-        demands("model_status", &[]);
+        demands("model_get", &[]);
     }
 
     #[test]
@@ -1968,7 +1979,7 @@ mod tests {
         // Un `DELETE` sans corps : un schéma sans propriétés, donc rien n'est
         // envoyé — ce qui le distingue d'un `POST {}`.
         assert!(tool_named("halt_release").properties().is_empty());
-        demands("halt_status", &[]);
+        demands("halt_get", &[]);
     }
 
     #[test]
@@ -1976,7 +1987,7 @@ mod tests {
         assert_eq!(tool_named("autonomy_get").query, ["from", "to"]);
         assert_eq!(tool_named("refusals_get").query, ["days", "from", "to"]);
         demands("controls_get", &[]);
-        demands("employee_turns_get", &[]);
+        demands("employees_turns_get", &[]);
     }
 
     /// La garde des champs exigés, désarmée : `demands` doit rougir sur un
@@ -2021,7 +2032,7 @@ mod tests {
     fn every_family_of_this_domain_has_at_least_one_tool() {
         let names: Vec<&str> = tools().iter().map(|tool| tool.name).collect();
         for prefix in [
-            "companies_",
+            "company_",
             "employees_",
             "org_",
             "teams_",
@@ -2030,10 +2041,10 @@ mod tests {
             "capability_requests_",
             "policy_",
             "controls_",
-            "employee_turns_",
+            "employees_turns_",
             "refusals_",
             "autonomy_",
-            "initiative_",
+            "initiatives_",
             "interview_",
             "model_",
             "halt_",
