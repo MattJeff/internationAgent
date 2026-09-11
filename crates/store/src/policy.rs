@@ -2186,9 +2186,24 @@ pub(crate) mod tests {
         let Some(db) = db().await else { return };
         let _guard = platform(&db, (50_000, 200_000, 50_000), &["example.com"]).await;
         let (tenant, employee) = seed(&db, "inherit").await;
-        let (_, other_employee) = seed(&db, "inherit-other").await;
 
         let mut admin = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        // Un collègue, et **du même locataire**. Il venait d'un second
+        // locataire jusqu'à `0103`, et la ligne d'en dessous passait quand
+        // même : la policy de `policy_layers` ne regarde que `tenant_id` —
+        // celui de A, que la ligne portait correctement — et Postgres vérifiait
+        // la clé étrangère vers `employees` hors de la RLS. Le défaut que
+        // `0103` referme, écrit dans une fixture et vert tout ce temps.
+        let other_employee = EmployeeId::new_v7(Utc::now());
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, 'inherit-other', 'inherit-other', 'active')",
+        )
+        .bind(other_employee.as_uuid())
+        .bind(tenant.as_uuid())
+        .execute(&mut *admin)
+        .await
+        .expect("insert colleague");
         let version = insert_version(&mut admin, Some(tenant.as_uuid()), "v1", true).await;
         insert_layer(
             &mut admin,
