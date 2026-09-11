@@ -1,4 +1,6 @@
--- 0103: toute clé étrangère vers `employees` porte le locataire.
+-- 0103_une_cle_etrangere_porte_son_locataire : toute clé étrangère vers
+-- `employees` porte le locataire, pour que Postgres la vérifie et plus
+-- l'appelant.
 --
 -- # Le défaut, une fois, en entier
 --
