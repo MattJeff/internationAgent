@@ -344,6 +344,13 @@ mod tests {
         "release",
         "reassign",
         "amend",
+        // Soumettre à quelqu'un d'autre ce qu'il décidera. Ajouté le 2026-09-11
+        // pour `content_drafts_propose`, et il a fallu qu'aucun des trente
+        // autres ne dise le geste : `publish` et `post` promettent que c'est en
+        // ligne, `send` qu'il n'y a rien à décider, `create` et `add` que c'est
+        // chez nous. Une pull request est les trois contraires — chez le
+        // client, pas en ligne, et elle attend qu'une personne tranche.
+        "propose",
     ];
 
     /// `domaine[_objet]_verbe` : au moins deux segments, et le dernier est un

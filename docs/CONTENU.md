@@ -128,7 +128,8 @@ C'est le chiffre de départ, et c'est exactement ce que la boucle ci-dessous ser
 | **2. la mesure** | `content_questions_measure` / `POST /v1/content/questions/{id}/measure` — **nomme un siège** | `content_citations`, en ajout seul |
 | **3. le brief** | `content_briefs_get` / `GET /v1/content/briefs?question_id` | rien : une fonction pure de (1) et (2) |
 | **4. le texte** | **un employé, avec son modèle** — rien dans ce dépôt n'engendre de prose | `content_drafts`, par `content_drafts_add` |
-| **5. la publication** | **une personne, à la main** — voir § 5 | `content_drafts.url`, constatée par `content_drafts_amend` |
+| **5a. la proposition** | `content_drafts_propose` / `POST /v1/content/drafts/{id}/propose` — **nomme un siège** | `content_drafts.state = 'proposed'`, `review_url` |
+| **5b. la publication** | **une personne**, qui fusionne la pull request — voir § 5 | `content_drafts.url`, constatée par `content_drafts_amend` |
 | **6. la mesure suivante** | `content_questions_measure`, à nouveau | la série de `content_citations` |
 
 Trois choses méritent d'être dites au-dessus du tableau.
@@ -179,7 +180,19 @@ GET /v1/content/briefs?question_id={id}
 # 4. l'employé écrit, et le range
 POST /v1/content/drafts   { "question_id": "…", "title": "…", "body": "…" }
 
-# 5. une personne publie, puis le constate
+# 4bis. le dépôt qui sert le site du client, attaché à un siège (une fois)
+PUT  /v1/content/repos/{employee_id}
+  { "server": "github", "repo": "orizn/site",
+    "branch": "main", "folder": "content/blog" }
+
+# 5a. l'article part dans le dépôt, sur une branche à lui, et une pull request
+#     demande à une personne de le lire. Ça ne publie pas.
+POST /v1/content/drafts/{id}/propose   { "employee_id": "…" }
+→ { "draft": { "state": "proposed",
+               "review_url": "https://github.com/orizn/site/pull/7" },
+    "proposal": { "branch": "article/019…", "path": "content/blog/…md" } }
+
+# 5b. une personne fusionne, puis constate l'adresse publique
 PUT  /v1/content/drafts/{id}
   { "title": "…", "body": "…", "url": "https://visa.orizn.app/blog/…" }
 
@@ -189,31 +202,58 @@ GET /v1/content/citations?question_id={id}&days=90
 
 ---
 
-## 5. Ce qui manque pour publier — et il manque tout
+## 5. Ce qui publie, et ce qui ne publie toujours pas
 
-**Aujourd'hui, rien ne publie.** Un brouillon est un document rangé dans une
-table ; `content_drafts.url` est une adresse **constatée**, écrite par la
-personne qui a publié, pas par le produit. Le mot « publié » dans `state` veut
-dire *quelqu'un a vu l'article à cette adresse*, et le `CHECK` de `0100` refuse
-un publié sans adresse ni date pour que ce mot ne puisse pas être menti.
+**Le produit ne publie toujours pas, et c'est une propriété, pas un manque.**
+`content_drafts.url` reste une adresse **constatée**, écrite par la personne qui
+a vu l'article en ligne. Le mot « publié » dans `state` veut dire *quelqu'un a vu
+l'article à cette adresse*, et le `CHECK` de `0100` refuse un publié sans adresse
+ni date pour que ce mot ne puisse pas être menti.
 
-Il y a deux chemins pour lever ça, et **aucun des deux n'est codé** :
+Ce qui a changé le 2026-09-11 est ce qui vient **avant** ce mot : l'article sort
+d'ici tout seul, jusqu'à la porte du client.
 
-### Chemin A — le dépôt GitHub du client
+### Chemin A — le dépôt GitHub du client : **codé**
 
 L'article devient un fichier Markdown poussé sur le dépôt qui sert le site du
-client (Jekyll, Hugo, Next, Astro — peu importe, ils lisent tous un dossier).
-Le connecteur GitHub est déjà au catalogue (`agentos_app::catalog`), donc ce qui
-manque est : une entrée dans `employee_resources` pour le dépôt et la branche, un
-effet `publish_article` derrière la Gate — un `McpCall` ou un `ActionKind`
-nouveau, à trancher — et la relecture d'un humain avant la fusion.
+client (Jekyll, Hugo, Next, Astro — peu importe, ils lisent tous un dossier),
+sur une branche à lui, et une pull request demande à une personne de le lire.
+
+* **Le dépôt et la branche sont une ressource d'un siège** : `content_repos`
+  (`migrations/0102`), posée par `content_repos_set`. Deux clients ont deux
+  dépôts ; rien ne vient d'une variable d'environnement. La table pend au
+  branchement MCP par une clé étrangère, donc un dépôt ne se pose pas sur un
+  GitHub que personne n'a branché. Ce n'est **pas** une ligne
+  d'`employee_resources`, et 0102 dit pourquoi : `employee::load` exige de cette
+  table-là une ligne par étape de provisionnement, exactement, et un dépôt n'est
+  pas une étape — personne ne l'achète et rien ne le relâche.
+* **Trois appels d'outil, trois verdicts de la Gate** : `create-branch`,
+  `create-or-update-file`, `create-pull-request` sur le connecteur GitHub, qui
+  était déjà au catalogue. Un `McpCall` par geste, pas d'`ActionKind` nouveau —
+  la Gate savait déjà statuer là-dessus, pour un siège nommé, avec sa ligne
+  d'`audit_log`. Un siège dont la politique ne nomme pas les trois outils
+  n'ouvre rien, et le refus arrive avant que quoi que ce soit sorte.
+* **La relecture humaine est la pull request**, et rien n'a été inventé à côté.
+  Ce dépôt ne sait pas fusionner.
+* **`proposed` n'est pas `published`.** Le brouillon passe à `proposed` et porte
+  `review_url` — l'adresse de la demande, rebâtie à partir de nos propres
+  chaînes et d'un entier lu chez GitHub, jamais d'un lien recopié. `url` et
+  `published_at` ne bougent pas. `migrations/0102` argumente le troisième état
+  et les trois façons de s'en passer qui ne tiennent pas.
 
 *Ce qu'il coûte* : rien en argent. *Ce qu'il demande* : que le client héberge son
 site sur un dépôt qu'il accepte de nous ouvrir. *Ce qu'il gagne* : la revue de
 code du client est déjà le garde-fou, et une pull request est un brouillon qu'un
 humain approuve sans que nous ayons à inventer un circuit d'approbation.
 
-### Chemin B — un domaine web à nous, pour le client
+*Ce qui n'est pas vérifié, et ne pouvait pas l'être* : aucun appel n'a jamais été
+fait contre le vrai serveur MCP de GitHub. Il demande un compte et un passage
+OAuth, et ce chantier n'avait pas le droit d'en ouvrir un. Les tests parlent à un
+faux GitHub monté à la main. Ce qui reste à prouver au premier vrai branchement
+est que GitHub épelle ces trois outils comme nous — et un nom faux sort en
+`unknown_tool` au premier appel, avant qu'un octet soit écrit.
+
+### Chemin B — un domaine web à nous, pour le client : **pas codé**
 
 Le client nous donne un sous-domaine (`blog.client.com` en CNAME), et le produit
 sert les articles. `tenant_domains` existe déjà et `sending_domain.rs` sait poser
@@ -238,7 +278,8 @@ telle, et le premier client à s'en apercevoir aurait raison de partir.
 | fichier | ce qu'il porte |
 |---|---|
 | `migrations/0100_une_question_merite_une_reponse.sql` | les trois tables, leur RLS, et l'argument de l'ajout seul |
-| `crates/app/src/content.rs` | la mesure, le scan, le brief, et les limites de chacun |
-| `apps/server/src/routes/content.rs` | les neuf routes, et pourquoi la mesure nomme un siège |
-| `crates/app/src/mcp_tools/contenu.rs` | les neuf outils, un par route |
+| `migrations/0102_une_pull_request_nest_pas_une_publication.sql` | le dépôt d'un siège, le troisième état, et pourquoi ce n'est pas `employee_resources` |
+| `crates/app/src/content.rs` | la mesure, le scan, le brief, la proposition, et les limites de chacun |
+| `apps/server/src/routes/content.rs` | les douze routes, et pourquoi la mesure comme la proposition nomment un siège |
+| `crates/app/src/mcp_tools/contenu.rs` | les douze outils, un par route |
 | `docs/ROADMAP_CROISSANCE.md` § 2.1 | pourquoi ce levier passe devant les autres |

@@ -814,6 +814,10 @@ fn app(
                 db: db.clone(),
                 gate: gate.clone(),
                 ports: ports.clone(),
+                // Le même registre que `routes::social` reçoit plus bas : une
+                // proposition d'article écrit dans le GitHub de son locataire,
+                // donc elle a besoin de la flotte de ce locataire-là.
+                fleets: fleets.clone(),
             }))
             .merge(routes::prospects::router(db.clone()))
             .merge(routes::sequences::router(db.clone()))

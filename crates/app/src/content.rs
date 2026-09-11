@@ -67,15 +67,36 @@
 //! valeurs, choisi par une règle sur le rang. Le texte est écrit par un
 //! employé, avec son modèle, et atterrit dans `content_drafts`. Rien ici
 //! n'écrit une phrase à publier.
+//!
+//! # Ce qui sort d'ici, et ce que ça ne prétend pas être
+//!
+//! [`propose`] est le **chemin A** de `docs/CONTENU.md` § 5 : l'article devient
+//! un fichier Markdown sur une branche à lui, dans le dépôt qui sert le site du
+//! client, et une pull request demande à une personne de le lire. Le dépôt et
+//! la branche sont une ressource d'un siège ([`repos`]), jamais une variable
+//! d'environnement — deux clients ont deux dépôts, et c'est la Gate qui statue,
+//! pour un siège nommé, à chacun des trois appels.
+//!
+//! **Ouvrir une pull request n'est pas publier.** `state` passe à `proposed` ;
+//! `published` continue de vouloir dire *quelqu'un a vu l'article à cette
+//! adresse*, et `url` reste une adresse constatée que personne d'autre qu'un
+//! humain n'écrit. `migrations/0102` porte l'argument entier, y compris les
+//! trois façons de se passer d'un état de plus et pourquoi aucune ne tient.
+//!
+//! Le chemin B — un domaine web à nous — n'est pas ici et n'est pas commencé.
+//! Publier dix clients sur un domaine à nous serait une ferme de contenu, et
+//! le § 5 explique pourquoi c'est un refus et pas un manque.
 
-use agentos_domain::action::Domain;
+use agentos_domain::action::{Domain, McpTool};
+use agentos_domain::ids::Slug;
 use agentos_store::db::{StoreError, TenantTx};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use serde_json::{Value, json};
 use url::Url;
 use uuid::Uuid;
 
-use crate::effects::{BrowserRead, EffectError, Effects};
+use crate::effects::{BrowserRead, EffectError, Effects, McpCall};
 use crate::gate::{Denied, PolicyGate};
 use crate::turn::WHOLE_PAGE;
 
@@ -803,6 +824,11 @@ pub mod drafts {
         pub body: String,
         pub state: String,
         pub url: Option<String>,
+        /// Où une personne **relit** : la pull request ouverte par
+        /// [`super::propose`]. Nulle tant que personne n'a proposé, et jamais
+        /// confondue avec `url` — l'une est l'adresse d'une relecture, l'autre
+        /// celle d'un article en ligne. `migrations/0102` argumente.
+        pub review_url: Option<String>,
         pub created_at: DateTime<Utc>,
         pub published_at: Option<DateTime<Utc>>,
     }
@@ -832,7 +858,7 @@ pub mod drafts {
             "INSERT INTO content_drafts \
                  (id, tenant_id, question_id, title, body, state, created_at) \
              VALUES ($1, $2, $3, $4, $5, 'draft', $6) \
-             RETURNING id, question_id, title, body, state, url, created_at, published_at",
+             RETURNING id, question_id, title, body, state, url, review_url, created_at, published_at",
         )
         .bind(Uuid::now_v7())
         .bind(tenant.as_uuid())
@@ -848,7 +874,7 @@ pub mod drafts {
     /// Tous les brouillons de ce locataire, du plus récent au plus ancien.
     pub async fn list(tx: &mut TenantTx<'_>) -> Result<Vec<Draft>, StoreError> {
         let rows = sqlx::query_as(
-            "SELECT id, question_id, title, body, state, url, created_at, published_at \
+            "SELECT id, question_id, title, body, state, url, review_url, created_at, published_at \
                FROM content_drafts ORDER BY created_at DESC",
         )
         .fetch_all(&mut ***tx)
@@ -861,6 +887,17 @@ pub mod drafts {
     /// `published_at` est posé la première fois qu'une adresse arrive et ne
     /// bouge plus : la date de publication d'un article est celle de sa
     /// publication, pas celle de sa dernière correction de typo.
+    ///
+    /// **Sans adresse, l'état retombe sur ce que la ligne porte déjà**, et pas
+    /// sur `draft` : un brouillon dont la pull request est ouverte reste
+    /// `proposed` quand on corrige son texte. Le CHECK de `0102` l'exigerait de
+    /// toute façon — `proposed` sans `review_url` n'existe pas — mais l'écrire
+    /// comme un `CASE` sur la colonne plutôt que comme un argument de plus est
+    /// ce qui empêche un appelant de rétrograder une proposition par omission.
+    /// Ce que ça ne fait pas, et qui est assumé : la pull request ouverte ne
+    /// porte pas la correction, puisque rien ne la repousse. C'est
+    /// [`super::propose`] qu'il faut rappeler, et il refuse tant que la
+    /// première n'est pas retombée.
     pub async fn update(
         tx: &mut TenantTx<'_>,
         id: Uuid,
@@ -871,12 +908,15 @@ pub mod drafts {
                 SET title = $2, \
                     body = $3, \
                     url = $4, \
-                    state = CASE WHEN $4::text IS NULL THEN 'draft' ELSE 'published' END, \
+                    state = CASE \
+                        WHEN $4::text IS NOT NULL THEN 'published' \
+                        WHEN review_url IS NOT NULL THEN 'proposed' \
+                        ELSE 'draft' END, \
                     published_at = CASE \
                         WHEN $4::text IS NULL THEN NULL \
                         ELSE coalesce(published_at, $5) END \
               WHERE id = $1 \
-             RETURNING id, question_id, title, body, state, url, created_at, published_at",
+             RETURNING id, question_id, title, body, state, url, review_url, created_at, published_at",
         )
         .bind(id)
         .bind(revision.title)
@@ -887,7 +927,509 @@ pub mod drafts {
         .await?;
         Ok(row)
     }
+
+    /// **Constater qu'une pull request est ouverte pour ce brouillon.**
+    ///
+    /// Écrit après que [`super::propose`] a poussé le fichier et ouvert la
+    /// demande — donc après trois appels sortis de la machine, et jamais avant.
+    /// Une base injoignable ici laisse une pull request ouverte que la table
+    /// ignore : c'est le sens conservateur, la pull request est visible chez le
+    /// client et un deuxième appel la rouvrirait plutôt que d'écraser un état
+    /// qu'on n'a pas su écrire.
+    ///
+    /// `WHERE state = 'draft'` : seul un brouillon se propose. `None` quand la
+    /// ligne n'existe pas **ou** qu'elle n'est plus un brouillon, et c'est
+    /// l'appelant qui a déjà lu son état qui sait lequel des deux — voir
+    /// [`super::ProposeError::NotADraft`].
+    pub async fn propose(
+        tx: &mut TenantTx<'_>,
+        id: Uuid,
+        review_url: &str,
+    ) -> Result<Option<Draft>, StoreError> {
+        let row = sqlx::query_as(
+            "UPDATE content_drafts \
+                SET state = 'proposed', review_url = $2 \
+              WHERE id = $1 AND state = 'draft' \
+             RETURNING id, question_id, title, body, state, url, review_url, created_at, published_at",
+        )
+        .bind(id)
+        .bind(review_url)
+        .fetch_optional(&mut ***tx)
+        .await?;
+        Ok(row)
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Le dépôt d'un siège
+// ---------------------------------------------------------------------------
+
+/// Où le site d'un client est servi, et par quel branchement on y écrit.
+///
+/// Une ligne de `content_repos`. `migrations/0102` dit pourquoi c'est une table
+/// à elle et pas une douzième ligne d'`employee_resources` : la totalité que
+/// `agentos_store::employee::load` exige de cette table-là ferait de chaque
+/// siège qui en porterait une un employé **corrompu**, et un dépôt n'est de
+/// toute façon pas une étape de provisionnement — personne ne l'achète et
+/// `release` n'aurait rien à rendre.
+pub mod repos {
+    use super::{DateTime, Serialize, Slug, StoreError, TenantTx, Utc, Uuid};
+
+    /// Le dépôt d'un siège, tel qu'il est rangé.
+    #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+    pub struct Repo {
+        pub employee_id: Uuid,
+        /// Le handle du branchement MCP — celui qu'un `Action::McpCall` nomme.
+        /// La clé étrangère de `0102` garantit qu'il est branché.
+        pub server: String,
+        /// `propriétaire/nom`.
+        pub repo: String,
+        /// La branche **qui sert le site** : la cible de la pull request, pas
+        /// celle qui porte l'article.
+        pub branch: String,
+        /// Le dossier que le générateur lit.
+        pub folder: String,
+        pub created_at: DateTime<Utc>,
+    }
+
+    impl Repo {
+        /// `propriétaire`, `nom`. `None` si la ligne ne porte pas la forme que
+        /// `content_repos_repo_shape` impose — inatteignable tant que le CHECK
+        /// est là, et pas un `expect` pour autant : c'est une donnée de base,
+        /// pas une constante de ce fichier.
+        #[must_use]
+        pub fn owner_and_name(&self) -> Option<(&str, &str)> {
+            let (owner, name) = self.repo.split_once('/')?;
+            (!owner.is_empty() && !name.is_empty() && !name.contains('/')).then_some((owner, name))
+        }
+
+        /// Le handle, en [`Slug`]. `None` pour une ligne qu'`agentos_app::mcp`
+        /// ne saurait pas router non plus — il ignore les branchements dont le
+        /// handle ne se lit pas.
+        #[must_use]
+        pub fn handle(&self) -> Option<Slug> {
+            Slug::parse(&self.server).ok()
+        }
+    }
+
+    /// Les dépôts de ce locataire, un par siège qui en a un.
+    pub async fn list(tx: &mut TenantTx<'_>) -> Result<Vec<Repo>, StoreError> {
+        let rows = sqlx::query_as(
+            "SELECT employee_id, server, repo, branch, folder, created_at \
+               FROM content_repos ORDER BY created_at ASC",
+        )
+        .fetch_all(&mut ***tx)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Le dépôt d'un siège. `None` : ce siège ne publie nulle part.
+    pub async fn of(tx: &mut TenantTx<'_>, employee_id: Uuid) -> Result<Option<Repo>, StoreError> {
+        let row = sqlx::query_as(
+            "SELECT employee_id, server, repo, branch, folder, created_at \
+               FROM content_repos WHERE employee_id = $1",
+        )
+        .bind(employee_id)
+        .fetch_optional(&mut ***tx)
+        .await?;
+        Ok(row)
+    }
+
+    /// Attacher un dépôt à un siège, ou remplacer le sien.
+    ///
+    /// `None` quand rien n'est branché sous ce handle chez ce locataire. La clé
+    /// étrangère de `0102` le refuserait aussi — mais elle le refuserait en
+    /// `StoreError`, c'est-à-dire en 500 pour un appelant qui a simplement mal
+    /// recopié un nom. Une lecture d'abord, et la faute revient à qui peut la
+    /// corriger.
+    pub async fn set(
+        tx: &mut TenantTx<'_>,
+        employee_id: Uuid,
+        server: &str,
+        repo: &str,
+        branch: &str,
+        folder: &str,
+    ) -> Result<Option<Repo>, StoreError> {
+        // La policy RLS de `mcp_servers` borne déjà la lecture au locataire.
+        let bound: Option<(String,)> =
+            sqlx::query_as("SELECT server FROM mcp_servers WHERE server = $1")
+                .bind(server)
+                .fetch_optional(&mut ***tx)
+                .await?;
+        if bound.is_none() {
+            return Ok(None);
+        }
+
+        let tenant = tx.tenant_id();
+        let row = sqlx::query_as(
+            "INSERT INTO content_repos \
+                 (employee_id, tenant_id, server, repo, branch, folder, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (employee_id) DO UPDATE \
+                SET server = excluded.server, repo = excluded.repo, \
+                    branch = excluded.branch, folder = excluded.folder \
+             RETURNING employee_id, server, repo, branch, folder, created_at",
+        )
+        .bind(employee_id)
+        .bind(tenant.as_uuid())
+        .bind(server)
+        .bind(repo)
+        .bind(branch)
+        .bind(folder)
+        .bind(Utc::now())
+        .fetch_one(&mut ***tx)
+        .await?;
+        Ok(Some(row))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// La proposition : un fichier poussé, et une pull request
+// ---------------------------------------------------------------------------
+
+/// Les trois outils de GitHub qu'une proposition prononce, en orthographe
+/// [`Slug`].
+///
+/// `agentos_app::mcp` replie les `_` d'un nom de la table d'un serveur en `-`
+/// (`handle`), donc `create_pull_request` chez GitHub est `create-pull-request`
+/// ici. **Cette liste est la surface entière** : `propose` ne prononce rien
+/// d'autre, aucune valeur de requête ne l'agrandit, et chacun des trois passe
+/// par la Policy Gate séparément.
+///
+/// # Ce qui n'a pas été vérifié, et ne pouvait pas l'être
+///
+/// Les trois noms et la forme de leurs arguments sont ceux que le serveur MCP
+/// distant de GitHub publie. **Aucun appel n'a été fait contre le vrai
+/// serveur** : il demande un compte GitHub et un passage OAuth, c'est-à-dire
+/// exactement ce que ce chantier n'avait pas le droit d'ouvrir. Ce que les
+/// tests prouvent est ce que *nous* envoyons, dans quel ordre, et ce que nous
+/// faisons de la réponse ; ce qu'ils ne prouvent pas est que GitHub épelle ces
+/// trois outils comme ici. Le jour du premier vrai branchement, un nom faux
+/// sort en `unknown_tool` au premier appel, avant qu'un octet soit écrit.
+const CREATE_BRANCH: &str = "create-branch";
+/// Voir [`CREATE_BRANCH`].
+const CREATE_OR_UPDATE_FILE: &str = "create-or-update-file";
+/// Voir [`CREATE_BRANCH`].
+const CREATE_PULL_REQUEST: &str = "create-pull-request";
+
+/// Ce qu'une proposition a produit chez le client.
+#[derive(Debug, Clone, Serialize)]
+pub struct Proposal {
+    /// La branche créée pour cet article, une par brouillon.
+    pub branch: String,
+    /// Le chemin du fichier écrit, dans le dossier du dépôt.
+    pub path: String,
+    /// **L'adresse où un humain relit.** Rebâtie à partir de nos propres
+    /// chaînes ; voir [`review_url`].
+    pub review_url: String,
+}
+
+/// Ce qui peut empêcher une proposition.
+#[derive(Debug, thiserror::Error)]
+pub enum ProposeError {
+    /// Ce siège n'a pas de dépôt. Le premier geste est `content_repos_set`.
+    #[error("ce siège n'a pas de dépôt : il n'y a nulle part où pousser")]
+    NoRepo,
+    /// Le brouillon a déjà été proposé, ou il est publié. Porte l'état lu.
+    #[error("ce brouillon est {0}, et seul un brouillon se propose")]
+    NotADraft(String),
+    /// La ligne de `content_repos` ne se lit pas : un `repo` qui n'est pas
+    /// `propriétaire/nom`, ou un handle qui n'est pas un [`Slug`]. Les CHECK de
+    /// `0102` le rendent inatteignable ; il est nommé plutôt que dépiauté par
+    /// un `expect` sur une donnée de base.
+    #[error("la ligne de dépôt de ce siège ne se lit pas")]
+    MalformedRepo,
+    /// GitHub a répondu, et sa réponse dit qu'elle a échoué (`isError`). Porte
+    /// l'outil, jamais le message du serveur — c'est la prose d'un étranger.
+    #[error("GitHub a refusé {0}")]
+    Refused(&'static str),
+    /// La pull request est peut-être ouverte, et sa réponse ne porte pas une
+    /// adresse qui soit **dans ce dépôt**. Rien n'est écrit en base : aller
+    /// voir la branche nommée dans le journal d'audit.
+    #[error("la réponse ne porte aucune adresse de pull request dans ce dépôt")]
+    NoReviewUrl,
+    #[error(transparent)]
+    Denied(#[from] Denied),
+    #[error(transparent)]
+    Effect(#[from] EffectError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+impl ProposeError {
+    /// Le vocabulaire fermé qu'une route rend en `code`.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoRepo => "no_repo",
+            Self::NotADraft(_) => "not_a_draft",
+            Self::MalformedRepo => "repo_malformed",
+            Self::Refused(_) => "github_refused",
+            Self::NoReviewUrl => "no_review_url",
+            Self::Denied(_) => "denied",
+            Self::Effect(err) => err.code(),
+            Self::Store(_) => "store_unavailable",
+        }
+    }
+}
+
+/// **La proposition.** L'article devient un fichier Markdown sur une branche à
+/// lui, et une pull request demande à une personne de le lire.
+///
+/// # Ce que ça n'est pas
+///
+/// Ce n'est **pas** une publication, et `content_drafts.state` le dit : la
+/// ligne passe à `proposed`, pas à `published`. `url` reste nulle jusqu'à ce
+/// qu'une personne constate l'article à une adresse — `migrations/0102`
+/// argumente les trois façons de s'en passer et pourquoi aucune ne tient.
+///
+/// Ce n'est pas non plus un circuit d'approbation de plus. `docs/CONTENU.md`
+/// § 5 : *« la revue de code du client est déjà le garde-fou, et une pull
+/// request est un brouillon qu'un humain approuve sans que nous ayons à
+/// inventer un circuit d'approbation »*. Rien ici ne fusionne, et rien ici ne
+/// sait fusionner : les trois outils prononcés n'écrivent que sur une branche
+/// que personne d'autre ne lit.
+///
+/// # Trois appels, trois verdicts
+///
+/// Le jeton est émis ici, pour le principal que l'`Effects` porte, comme
+/// [`measure`] — et **trois fois**, une par outil. Ce n'est pas une économie
+/// ratée : un siège à qui la politique donne `create-branch` sans
+/// `create-pull-request` doit pouvoir échouer entre les deux, et le journal
+/// d'audit doit porter une ligne par chose faite chez le client. Un seul
+/// verdict pour trois écritures serait une décision prise sur un geste qu'elle
+/// ne nomme pas.
+///
+/// # Ce qui reste ouvert quand ça casse au milieu
+///
+/// Un échec au deuxième ou au troisième appel laisse une branche — et
+/// peut-être un fichier — chez le client, et rien en base. C'est assumé et
+/// c'est le sens conservateur : une branche orpheline se supprime d'un clic,
+/// là où un `proposed` écrit sans pull request serait un état que personne ne
+/// peut plus relire. La branche porte l'identifiant du brouillon, donc on sait
+/// toujours de quoi elle est le reste.
+///
+/// ponytail: un fichier qui existe **déjà** à ce chemin sort en
+/// [`ProposeError::Refused`] et pas en écrasement. GitHub veut le `sha` de la
+/// version remplacée, le lire serait un quatrième appel et un quatrième
+/// verdict, et ce que ça achèterait est le droit d'écraser silencieusement un
+/// article déjà fusionné parce qu'un employé a réutilisé un titre. Le jour où
+/// republier un article compte, c'est ce `sha` et un état de plus — pas un
+/// écrasement par défaut.
+pub async fn propose(
+    effects: &Effects,
+    gate: &PolicyGate,
+    repo: &repos::Repo,
+    draft: &drafts::Draft,
+    now: DateTime<Utc>,
+) -> Result<Proposal, ProposeError> {
+    if draft.state != "draft" {
+        return Err(ProposeError::NotADraft(draft.state.clone()));
+    }
+    let (owner, name) = repo.owner_and_name().ok_or(ProposeError::MalformedRepo)?;
+    let server = repo.handle().ok_or(ProposeError::MalformedRepo)?;
+
+    let branch = article_branch(draft.id);
+    let path = format!("{}/{}.md", repo.folder, file_stem(&draft.title, draft.id));
+
+    call(
+        effects,
+        gate,
+        &server,
+        CREATE_BRANCH,
+        &json!({
+            "owner": owner,
+            "repo": name,
+            "branch": branch,
+            "from_branch": repo.branch,
+        }),
+    )
+    .await?;
+
+    call(
+        effects,
+        gate,
+        &server,
+        CREATE_OR_UPDATE_FILE,
+        &json!({
+            "owner": owner,
+            "repo": name,
+            "branch": branch,
+            "path": path,
+            "message": format!("Article : {}", draft.title),
+            "content": article(&draft.title, &draft.body, now),
+        }),
+    )
+    .await?;
+
+    let opened = call(
+        effects,
+        gate,
+        &server,
+        CREATE_PULL_REQUEST,
+        &json!({
+            "owner": owner,
+            "repo": name,
+            "head": branch,
+            "base": repo.branch,
+            "title": draft.title,
+            "body": PULL_REQUEST_BODY,
+        }),
+    )
+    .await?;
+
+    let review_url = review_url(&opened, &repo.repo).ok_or(ProposeError::NoReviewUrl)?;
+    Ok(Proposal {
+        branch,
+        path,
+        review_url,
+    })
+}
+
+/// Ce que la pull request dit d'elle-même, à la personne qui l'ouvre.
+///
+/// Une constante, et pas une phrase composée : tout ce qu'on pourrait y
+/// interpoler — le titre, le brief, l'extrait d'une page de résultats — est
+/// soit déjà dans le diff, soit la prose d'un étranger (`Citation::excerpt`).
+const PULL_REQUEST_BODY: &str = "Cet article a été écrit par un employé de cette entreprise et poussé par son \
+     siège. Rien n'est en ligne tant que cette demande n'est pas fusionnée : la \
+     relecture, c'est celle-ci.";
+
+/// Un appel d'outil, derrière la Gate, et la réponse dépliée.
+///
+/// Le `isError` de MCP est une réponse **réussie** qui dit que l'outil a
+/// échoué : le laisser passer ferait ouvrir une pull request sur une branche qui
+/// n'existe pas, puis chercher une adresse dans un message d'erreur.
+async fn call(
+    effects: &Effects,
+    gate: &PolicyGate,
+    server: &Slug,
+    tool: &'static str,
+    arguments: &Value,
+) -> Result<Value, ProposeError> {
+    let named = McpTool::new(
+        server.clone(),
+        Slug::parse(tool).expect("une constante de ce fichier"),
+    );
+    let token = gate
+        .authorize(effects.principal(), McpCall { tool: named })
+        .await?;
+    // La réponse est la prose d'un étranger. Ce qui en sort ici est un booléen
+    // et, plus bas, un entier — voir [`review_url`].
+    let answered = effects
+        .call_tool(token, arguments)
+        .await?
+        .into_inner_for_rendering();
+    if answered.get("isError").and_then(Value::as_bool) == Some(true) {
+        return Err(ProposeError::Refused(tool));
+    }
+    Ok(answered)
+}
+
+/// La branche d'un article : une par brouillon, nommée par lui.
+///
+/// Pas par le titre : deux brouillons peuvent porter le même, un titre change
+/// entre deux tentatives, et une branche dont le nom dépend d'un texte est une
+/// branche qu'on ne sait plus retrouver quand le troisième appel a échoué.
+fn article_branch(draft: Uuid) -> String {
+    format!("article/{}", draft.simple())
+}
+
+/// Le nom du fichier, tiré du titre.
+///
+/// Les lettres et les chiffres restent, tout le reste devient un tiret, et les
+/// tirets ne se suivent pas. Vide — un titre qui n'est fait que de ponctuation
+/// ou d'emoji — retombe sur l'identifiant du brouillon, qui est toujours un nom
+/// de fichier valide.
+///
+/// ponytail: pas de translittération. « Vérifier » donne `vérifier`, pas
+/// `verifier` : c'est de l'UTF-8 valide, git et l'API de GitHub l'acceptent, et
+/// tous les générateurs visés servent le fichier. Ce que ça coûte est une URL
+/// percent-encodée chez certains hébergeurs. Le jour où ça gêne, c'est une
+/// table de translittération ici et rien d'autre à changer.
+fn file_stem(title: &str, draft: Uuid) -> String {
+    let mut stem = String::new();
+    for ch in title.chars().flat_map(char::to_lowercase) {
+        if ch.is_alphanumeric() {
+            stem.push(ch);
+        } else if !stem.ends_with('-') && !stem.is_empty() {
+            stem.push('-');
+        }
+    }
+    truncate_on_char(&mut stem, FILE_STEM_CAP);
+    let trimmed = stem.trim_end_matches('-');
+    if trimmed.is_empty() {
+        return draft.simple().to_string();
+    }
+    trimmed.to_owned()
+}
+
+/// De quoi lire le titre dans le nom du fichier, et de quoi tenir dans les 255
+/// octets qu'un système de fichiers donne à un segment une fois le dossier et
+/// l'extension retirés.
+const FILE_STEM_CAP: usize = 80;
+
+/// Le fichier Markdown, en-tête compris.
+///
+/// L'en-tête YAML est ce qui fait qu'un dossier d'articles est un blog :
+/// Jekyll, Hugo, Astro et Next lisent tous les mêmes deux clés, `title` et
+/// `date`, et un fichier sans en-tête sort avec le nom du fichier pour titre et
+/// aucune date. C'est deux lignes, et sans elles le chemin A ne rend pas un
+/// article.
+///
+/// ponytail: deux clés, pas un gabarit. Un `layout`, des `tags`, une
+/// `description` — chaque générateur les épelle autrement, et les deviner pour
+/// le compte du client serait écrire dans son dépôt une convention qui n'est pas
+/// la sienne. Le jour où un client en veut, c'est une colonne de plus sur
+/// `content_repos`.
+fn article(title: &str, body: &str, now: DateTime<Utc>) -> String {
+    format!(
+        "---\ntitle: \"{}\"\ndate: {}\n---\n\n{}\n",
+        title.replace('\\', "\\\\").replace('"', "\\\""),
+        now.format("%Y-%m-%d"),
+        body.trim_end()
+    )
+}
+
+/// **L'adresse de la relecture, rebâtie plutôt que recopiée.**
+///
+/// La réponse d'un serveur MCP est la prose d'un étranger, et celle-ci finit
+/// dans une colonne qu'une personne va cliquer. Un `html_url` recopié tel quel
+/// serait un lien qu'un serveur compromis choisit — la pull request est chez
+/// nous, la page où le relecteur se retrouve serait chez lui.
+///
+/// Donc : on cherche, dans la réponse entière rendue en texte, le préfixe que
+/// **nous** avons construit — `https://github.com/<dépôt>/pull/` — et on ne
+/// garde que les chiffres qui le suivent. Ce qui en ressort est un entier, et
+/// l'adresse est recomposée à partir de nos propres chaînes. Pas un octet de
+/// l'étranger ne survit.
+///
+/// ponytail: une recherche de sous-chaîne sur le JSON rendu, pas un parcours de
+/// l'arbre. La réponse de GitHub porte son JSON dans un bloc de texte, donc un
+/// parcours devrait de toute façon reparser les blocs ; et ce qui est cherché
+/// est assez étroit — notre préfixe exact, suivi de chiffres — pour qu'une
+/// correspondance ailleurs dans la réponse désigne la même pull request.
+///
+/// Ce que ça ne couvre pas, nommé : un GitHub Enterprise servi sur un autre
+/// hôte. Ce déploiement ne branche que le serveur distant de github.com
+/// (`catalog::CATALOG`), et le jour où une entrée de catalogue en nomme un
+/// autre, c'est cet hôte qui devient un champ de `content_repos`.
+fn review_url(answer: &Value, repo: &str) -> Option<String> {
+    let prefix = format!("https://github.com/{repo}/pull/");
+    let rendered = answer.to_string();
+    let at = rendered.find(&prefix)? + prefix.len();
+    let number: String = rendered[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .take(PULL_REQUEST_DIGITS)
+        .collect();
+    (!number.is_empty()).then(|| format!("{prefix}{number}"))
+}
+
+/// Le plus grand numéro de pull request qu'on accepte de lire. Le dépôt le plus
+/// actif de GitHub n'a pas atteint le million ; ce qui compte ici est qu'une
+/// suite de chiffres sans fin ne devienne pas une chaîne sans fin.
+const PULL_REQUEST_DIGITS: usize = 9;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1536,6 +2078,559 @@ mod tests {
         tx.commit().await.expect("commit");
 
         drop_tenant(&db, principal.tenant_id).await;
+    }
+
+    // -- la proposition, contre un faux GitHub ------------------------------
+
+    /// Le handle sous lequel les tests d'ici branchent GitHub.
+    const HANDLE: &str = "github";
+
+    /// **Un faux GitHub**, au port plutôt qu'au fil.
+    ///
+    /// `browser_chrome.rs` monte un faux CDP parce que ce qu'il mesure *est* le
+    /// protocole. Ici, le protocole est déjà tenu par un serveur MCP en
+    /// processus dans les tests de `crate::mcp` — celui-là parle HTTP et construit
+    /// ses corps avec les types de `rmcp`. Ce qui n'est tenu nulle part, et que
+    /// ce double mesure, est ce que **nous** envoyons : quels outils, dans quel
+    /// ordre, avec quels arguments, et ce qu'on fait de la réponse.
+    ///
+    /// Il ressemble à GitHub sur les deux points qui décident : un outil qu'il
+    /// ne connaît pas est un `unknown_tool` terminal, et un outil qui échoue
+    /// répond `isError` — une réponse *réussie* qui dit non, ce qui est la
+    /// forme de MCP et le piège que `call` existe pour attraper.
+    struct FauxGithub {
+        seen: std::sync::Mutex<Vec<(String, Value)>>,
+        /// L'adresse que la pull request s'attribue. Une chaîne, pour qu'un test
+        /// puisse en mettre une qui n'est pas dans le dépôt.
+        pull: String,
+        /// L'outil qui répondra `isError`, s'il y en a un.
+        failing: Option<&'static str>,
+    }
+
+    impl FauxGithub {
+        fn new(pull: &str) -> Arc<Self> {
+            Arc::new(Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+                pull: pull.to_owned(),
+                failing: None,
+            })
+        }
+
+        fn refusing(pull: &str, tool: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+                pull: pull.to_owned(),
+                failing: Some(tool),
+            })
+        }
+
+        /// Ce qui a été prononcé, dans l'ordre.
+        fn calls(&self) -> Vec<(String, Value)> {
+            self.seen.lock().expect("pas empoisonné").clone()
+        }
+
+        fn tools(&self) -> Vec<String> {
+            self.calls().into_iter().map(|(tool, _)| tool).collect()
+        }
+
+        /// Les arguments du n-ième appel.
+        fn args(&self, nth: usize) -> Value {
+            self.calls()[nth].1.clone()
+        }
+    }
+
+    /// La forme d'un `CallToolResult` sérialisé : GitHub rend son JSON dans un
+    /// bloc de texte, ce qui est exactement ce que `review_url` doit traverser.
+    fn tool_result(text: String, is_error: bool) -> Value {
+        json!({
+            "content": [{ "type": "text", "text": text }],
+            "isError": is_error,
+        })
+    }
+
+    #[async_trait::async_trait]
+    impl crate::effects::McpCaller for FauxGithub {
+        async fn call(
+            &self,
+            tool: &McpTool,
+            arguments: &Value,
+        ) -> Result<agentos_domain::untrusted::Untrusted<Value>, crate::mocks::ProviderError>
+        {
+            let name = tool.name.as_str().to_owned();
+            self.seen
+                .lock()
+                .expect("pas empoisonné")
+                .push((name.clone(), arguments.clone()));
+
+            if ![CREATE_BRANCH, CREATE_OR_UPDATE_FILE, CREATE_PULL_REQUEST].contains(&name.as_str())
+            {
+                return Err(crate::mocks::ProviderError::Terminal {
+                    code: "unknown_tool",
+                });
+            }
+            if self.failing == Some(name.as_str()) {
+                return Ok(agentos_domain::untrusted::Untrusted::new(tool_result(
+                    "Reference already exists".to_owned(),
+                    true,
+                )));
+            }
+            let said = if name == CREATE_PULL_REQUEST {
+                json!({ "number": 7, "html_url": self.pull, "state": "open" }).to_string()
+            } else {
+                json!({ "ok": true }).to_string()
+            };
+            Ok(agentos_domain::untrusted::Untrusted::new(tool_result(
+                said, false,
+            )))
+        }
+    }
+
+    /// Les ports de ce déploiement, GitHub remplacé par le double.
+    fn ports_calling(github: Arc<FauxGithub>) -> Arc<Ports> {
+        Arc::new(Ports {
+            mcp: github,
+            ..crate::mocks::ports()
+        })
+    }
+
+    /// La politique d'un siège qui a le droit de prononcer ces outils-là, et
+    /// aucun autre. Le désarmement de la Gate est une liste plus courte.
+    async fn install_tool_policy(db: &Db, tenant: TenantId, tools: &[&str]) {
+        let allowed_mcp_tools = tools
+            .iter()
+            .map(|tool| {
+                McpTool::new(
+                    Slug::parse(HANDLE).expect("slug"),
+                    Slug::parse(tool).expect("slug"),
+                )
+            })
+            .collect();
+        agentos_store::policy::install(
+            db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &PolicyLimits {
+                allowed_mcp_tools,
+                max_turns_per_day: 10,
+                ..PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("install policy");
+    }
+
+    /// Un branchement MCP, et le dépôt d'un siège dessus.
+    ///
+    /// L'URL est bidon et personne ne la compose : le `Fleet` du processus n'est
+    /// pas dans cette boucle, c'est [`FauxGithub`] qui répond. Ce que la ligne
+    /// sert ici est la clé étrangère de `0102` — un dépôt ne se pose pas sur un
+    /// branchement qui n'existe pas.
+    async fn seed_repo(db: &Db, principal: &Principal) -> repos::Repo {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        sqlx::query(
+            "INSERT INTO mcp_servers (tenant_id, server, url, reach, connector) \
+             VALUES ($1, $2, 'https://api.githubcopilot.com/mcp/', 'public', 'github')",
+        )
+        .bind(principal.tenant_id.as_uuid())
+        .bind(HANDLE)
+        .execute(&mut **tx)
+        .await
+        .expect("insert binding");
+        let repo = repos::set(
+            &mut tx,
+            principal.employee_id.as_uuid(),
+            HANDLE,
+            "acme/site",
+            "main",
+            "content/blog",
+        )
+        .await
+        .expect("set repo")
+        .expect("le branchement existe");
+        tx.commit().await.expect("commit");
+        repo
+    }
+
+    /// Un brouillon prêt à être proposé.
+    async fn seed_draft(db: &Db, principal: &Principal, title: &str) -> drafts::Draft {
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        let question = questions::add(&mut tx, title, "fr", Source::Founder, 1)
+            .await
+            .expect("add");
+        let draft = drafts::create(&mut tx, question.id, title, "Le corps de l'article.")
+            .await
+            .expect("draft");
+        tx.commit().await.expect("commit");
+        draft
+    }
+
+    // -- le fichier et l'adresse, sans base ni réseau -------------------------
+
+    #[test]
+    fn le_nom_du_fichier_sort_du_titre_et_ne_ment_pas_quand_il_ny_en_a_pas() {
+        let draft = Uuid::now_v7();
+        assert_eq!(
+            file_stem("Vérifier un visa par API : le guide", draft),
+            "vérifier-un-visa-par-api-le-guide"
+        );
+        // Les tirets ne se suivent pas, et il n'y en a ni au début ni à la fin.
+        assert_eq!(file_stem("  ---  A !!! B  ", draft), "a-b");
+        // Un titre sans une seule lettre retombe sur l'identifiant, qui est
+        // toujours un nom de fichier.
+        assert_eq!(file_stem("!!!", draft), draft.simple().to_string());
+        assert_eq!(file_stem("", draft), draft.simple().to_string());
+        // Et il tient dans un segment de chemin.
+        assert!(file_stem(&"a b ".repeat(200), draft).len() <= FILE_STEM_CAP);
+    }
+
+    #[test]
+    fn len_tete_porte_le_titre_et_la_date() {
+        let when = DateTime::parse_from_rfc3339("2026-09-11T10:00:00Z")
+            .expect("date")
+            .with_timezone(&Utc);
+        let rendered = article("Un \"guide\" du visa", "Le corps.\n\n", when);
+        assert_eq!(
+            rendered,
+            "---\ntitle: \"Un \\\"guide\\\" du visa\"\ndate: 2026-09-11\n---\n\nLe corps.\n"
+        );
+    }
+
+    /// **L'adresse de relecture est rebâtie, pas recopiée.**
+    #[test]
+    fn ladresse_de_relecture_ne_suit_pas_un_etranger() {
+        let answer =
+            |url: &str| tool_result(json!({ "number": 7, "html_url": url }).to_string(), false);
+
+        // Le cas ordinaire : l'adresse ressort, et elle est faite de nos
+        // chaînes plus un entier.
+        assert_eq!(
+            review_url(&answer("https://github.com/acme/site/pull/7"), "acme/site"),
+            Some("https://github.com/acme/site/pull/7".to_owned())
+        );
+
+        // **Le désarmement.** Un serveur compromis qui renvoie une adresse
+        // ailleurs n'envoie personne ailleurs : il n'y a rien à rebâtir.
+        assert_eq!(
+            review_url(
+                &answer("https://github.example/acme/site/pull/7"),
+                "acme/site"
+            ),
+            None
+        );
+        // Un autre dépôt, même hôte : non plus.
+        assert_eq!(
+            review_url(&answer("https://github.com/autre/site/pull/7"), "acme/site"),
+            None
+        );
+        // Notre préfixe, suivi de n'importe quoi : ce qui survit est le nombre,
+        // et rien d'autre.
+        assert_eq!(
+            review_url(
+                &answer("https://github.com/acme/site/pull/7/../../evil"),
+                "acme/site"
+            ),
+            Some("https://github.com/acme/site/pull/7".to_owned())
+        );
+        // Notre préfixe sans nombre n'est pas une pull request.
+        assert_eq!(
+            review_url(
+                &answer("https://github.com/acme/site/pull/new"),
+                "acme/site"
+            ),
+            None
+        );
+    }
+
+    // -- de bout en bout, contre le faux GitHub -------------------------------
+
+    /// **Un article devient un fichier Markdown et une pull request** — et le
+    /// brouillon en ressort `proposed`, pas `published`.
+    #[tokio::test]
+    async fn un_article_devient_un_fichier_et_une_pull_request_sans_etre_publie() {
+        let Some(db) = db().await else { return };
+        let (principal, _) = seed(&db).await;
+        install_tool_policy(
+            &db,
+            principal.tenant_id,
+            &[CREATE_BRANCH, CREATE_OR_UPDATE_FILE, CREATE_PULL_REQUEST],
+        )
+        .await;
+        let repo = seed_repo(&db, &principal).await;
+        let draft = seed_draft(&db, &principal, "Vérifier un visa par API").await;
+
+        let github = FauxGithub::new("https://github.com/acme/site/pull/7");
+        let effects = Effects::new(db.clone(), ports_calling(github.clone()), principal.clone());
+        let gate = PolicyGate::new(db.clone());
+        let when = DateTime::parse_from_rfc3339("2026-09-11T10:00:00Z")
+            .expect("date")
+            .with_timezone(&Utc);
+
+        let proposal = propose(&effects, &gate, &repo, &draft, when)
+            .await
+            .expect("la proposition");
+
+        // Trois outils, dans cet ordre : sans branche il n'y a nulle part où
+        // écrire, et sans fichier la pull request serait vide.
+        assert_eq!(
+            github.tools(),
+            [CREATE_BRANCH, CREATE_OR_UPDATE_FILE, CREATE_PULL_REQUEST]
+        );
+
+        // La branche part de celle qui sert le site, et porte le brouillon.
+        let branch = format!("article/{}", draft.id.simple());
+        assert_eq!(github.args(0)["owner"], json!("acme"));
+        assert_eq!(github.args(0)["repo"], json!("site"));
+        assert_eq!(github.args(0)["branch"], json!(branch));
+        assert_eq!(github.args(0)["from_branch"], json!("main"));
+
+        // Le fichier va dans le dossier du dépôt, sur la branche de l'article,
+        // avec son en-tête.
+        let path = "content/blog/vérifier-un-visa-par-api.md";
+        assert_eq!(github.args(1)["path"], json!(path));
+        assert_eq!(github.args(1)["branch"], json!(branch));
+        let written = github.args(1)["content"]
+            .as_str()
+            .expect("du texte")
+            .to_owned();
+        assert!(
+            written.starts_with("---\ntitle: \"Vérifier un visa par API\"\ndate: 2026-09-11\n---"),
+            "{written:?}"
+        );
+        assert!(written.contains("Le corps de l'article."), "{written:?}");
+
+        // La demande va de la branche de l'article vers celle qui sert le site.
+        assert_eq!(github.args(2)["head"], json!(branch));
+        assert_eq!(github.args(2)["base"], json!("main"));
+
+        assert_eq!(proposal.branch, branch);
+        assert_eq!(proposal.path, path);
+        assert_eq!(proposal.review_url, "https://github.com/acme/site/pull/7");
+
+        // **Et ce n'est pas une publication.**
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        let proposed = drafts::propose(&mut tx, draft.id, &proposal.review_url)
+            .await
+            .expect("propose")
+            .expect("le brouillon existe");
+        assert_eq!(proposed.state, "proposed");
+        assert_eq!(
+            proposed.review_url.as_deref(),
+            Some(proposal.review_url.as_str())
+        );
+        assert!(
+            proposed.url.is_none(),
+            "une pull request n'est pas une adresse publique"
+        );
+        assert!(
+            proposed.published_at.is_none(),
+            "ni une date de publication"
+        );
+
+        // Corriger le texte ne le fait pas retomber en brouillon, et ne
+        // republie rien.
+        let corrected = drafts::update(
+            &mut tx,
+            draft.id,
+            &drafts::Revision {
+                title: "Vérifier un visa par API",
+                body: "Le corps, corrigé.",
+                url: None,
+            },
+        )
+        .await
+        .expect("update")
+        .expect("le brouillon existe");
+        assert_eq!(corrected.state, "proposed");
+
+        // Un brouillon déjà proposé ne se repropose pas : ni en base…
+        assert!(
+            drafts::propose(&mut tx, draft.id, "https://github.com/acme/site/pull/8")
+                .await
+                .expect("propose")
+                .is_none()
+        );
+        // …ni en `CHECK` : « proposé » sans adresse de relecture n'existe pas.
+        let refused = sqlx::query("UPDATE content_drafts SET review_url = NULL WHERE id = $1")
+            .bind(draft.id)
+            .execute(&mut **tx)
+            .await;
+        assert!(
+            refused.is_err(),
+            "un `proposed` sans relecture a pu être écrit : le CHECK de 0102 a glissé"
+        );
+        drop(tx);
+
+        // …et pas davantage dans le moteur, qui lit l'état avant de sortir.
+        let err = propose(&effects, &gate, &repo, &corrected, when)
+            .await
+            .expect_err("un brouillon proposé ne se repropose pas");
+        assert!(
+            matches!(err, ProposeError::NotADraft(ref state) if state == "proposed"),
+            "{err}"
+        );
+        assert_eq!(github.tools().len(), 3, "rien n'est reparti");
+
+        drop_tenant(&db, principal.tenant_id).await;
+    }
+
+    /// **La Gate mord, et elle mord avant que quoi que ce soit parte.**
+    ///
+    /// Deux désarmements, parce qu'ils ne disent pas la même chose : sans aucun
+    /// outil, rien ne sort du tout ; avec les deux premiers seulement, la
+    /// branche et le fichier existent chez le client et la demande ne s'ouvre
+    /// pas — ce qui est précisément pourquoi il y a trois verdicts et pas un.
+    #[tokio::test]
+    async fn un_siege_sans_loutil_nouvre_aucune_pull_request() {
+        let Some(db) = db().await else { return };
+        let (principal, _) = seed(&db).await;
+        install_tool_policy(&db, principal.tenant_id, &[]).await;
+        let repo = seed_repo(&db, &principal).await;
+        let draft = seed_draft(&db, &principal, "Un titre").await;
+        let gate = PolicyGate::new(db.clone());
+        let when = Utc::now();
+
+        let github = FauxGithub::new("https://github.com/acme/site/pull/7");
+        let effects = Effects::new(db.clone(), ports_calling(github.clone()), principal.clone());
+        let err = propose(&effects, &gate, &repo, &draft, when)
+            .await
+            .expect_err("sans outil, rien ne part");
+        assert!(matches!(err, ProposeError::Denied(_)), "{err}");
+        assert!(
+            github.calls().is_empty(),
+            "la Gate doit refuser avant le port : {:?}",
+            github.tools()
+        );
+
+        // Armée à moitié : les deux premiers passent, le troisième est refusé.
+        install_tool_policy(
+            &db,
+            principal.tenant_id,
+            &[CREATE_BRANCH, CREATE_OR_UPDATE_FILE],
+        )
+        .await;
+        let github = FauxGithub::new("https://github.com/acme/site/pull/7");
+        let effects = Effects::new(db.clone(), ports_calling(github.clone()), principal.clone());
+        let err = propose(&effects, &gate, &repo, &draft, when)
+            .await
+            .expect_err("sans le troisième outil, la demande ne s'ouvre pas");
+        assert!(matches!(err, ProposeError::Denied(_)), "{err}");
+        assert_eq!(github.tools(), [CREATE_BRANCH, CREATE_OR_UPDATE_FILE]);
+
+        // Le désarmement du désarmement : avec les trois, ça passe.
+        install_tool_policy(
+            &db,
+            principal.tenant_id,
+            &[CREATE_BRANCH, CREATE_OR_UPDATE_FILE, CREATE_PULL_REQUEST],
+        )
+        .await;
+        let github = FauxGithub::new("https://github.com/acme/site/pull/7");
+        let effects = Effects::new(db.clone(), ports_calling(github.clone()), principal.clone());
+        propose(&effects, &gate, &repo, &draft, when)
+            .await
+            .expect("avec les trois outils, la proposition passe");
+
+        drop_tenant(&db, principal.tenant_id).await;
+    }
+
+    /// Un `isError` est une réponse réussie qui dit non : elle arrête la suite
+    /// plutôt que d'ouvrir une demande sur une branche qui n'existe pas.
+    #[tokio::test]
+    async fn un_refus_de_github_arrete_la_suite() {
+        let Some(db) = db().await else { return };
+        let (principal, _) = seed(&db).await;
+        install_tool_policy(
+            &db,
+            principal.tenant_id,
+            &[CREATE_BRANCH, CREATE_OR_UPDATE_FILE, CREATE_PULL_REQUEST],
+        )
+        .await;
+        let repo = seed_repo(&db, &principal).await;
+        let draft = seed_draft(&db, &principal, "Un titre").await;
+        let gate = PolicyGate::new(db.clone());
+
+        let github = FauxGithub::refusing("https://github.com/acme/site/pull/7", CREATE_BRANCH);
+        let effects = Effects::new(db.clone(), ports_calling(github.clone()), principal.clone());
+        let err = propose(&effects, &gate, &repo, &draft, Utc::now())
+            .await
+            .expect_err("la branche n'a pas été créée");
+        assert!(matches!(err, ProposeError::Refused(CREATE_BRANCH)), "{err}");
+        assert_eq!(github.tools(), [CREATE_BRANCH], "rien n'a suivi");
+
+        drop_tenant(&db, principal.tenant_id).await;
+    }
+
+    /// Un dépôt est une ressource **d'un siège**, et un voisin n'en voit rien.
+    #[tokio::test]
+    async fn un_depot_appartient_a_un_siege_et_pas_au_voisin() {
+        let Some(db) = db().await else { return };
+        let (a, _) = seed(&db).await;
+        let (b, _) = seed(&db).await;
+        let mine = seed_repo(&db, &a).await;
+        assert_eq!(mine.repo, "acme/site");
+
+        let mut tx = db.tenant_tx(b.tenant_id).await.expect("tenant tx");
+        assert!(repos::list(&mut tx).await.expect("list").is_empty());
+        assert!(
+            repos::of(&mut tx, a.employee_id.as_uuid())
+                .await
+                .expect("of")
+                .is_none()
+        );
+        // Et il ne peut pas s'en poser un sur le branchement du voisin : rien
+        // n'est branché sous ce handle **chez lui**.
+        assert!(
+            repos::set(
+                &mut tx,
+                b.employee_id.as_uuid(),
+                HANDLE,
+                "autre/site",
+                "main",
+                "content",
+            )
+            .await
+            .expect("set")
+            .is_none()
+        );
+        tx.commit().await.expect("commit");
+
+        // Le désarmement : chez lui, il est là, et il se remplace.
+        let mut tx = db.tenant_tx(a.tenant_id).await.expect("tenant tx");
+        assert_eq!(repos::list(&mut tx).await.expect("list").len(), 1);
+        let moved = repos::set(
+            &mut tx,
+            a.employee_id.as_uuid(),
+            HANDLE,
+            "acme/nouveau-site",
+            "trunk",
+            "src/pages/blog",
+        )
+        .await
+        .expect("set")
+        .expect("le branchement existe");
+        assert_eq!(moved.repo, "acme/nouveau-site");
+        assert_eq!(
+            repos::list(&mut tx).await.expect("list").len(),
+            1,
+            "un siège, un dépôt"
+        );
+        // Et les formes que `0102` refuse sortent en erreur, pas en ligne.
+        assert!(
+            repos::set(
+                &mut tx,
+                a.employee_id.as_uuid(),
+                HANDLE,
+                "acme/site",
+                "main",
+                "../../etc",
+            )
+            .await
+            .is_err(),
+            "un dossier qui remonte a été accepté : le CHECK de 0102 a glissé"
+        );
+        drop(tx);
+
+        drop_tenant(&db, a.tenant_id).await;
+        drop_tenant(&db, b.tenant_id).await;
     }
 
     async fn drop_tenant(db: &Db, tenant: TenantId) {
