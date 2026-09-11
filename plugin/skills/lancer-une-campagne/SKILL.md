@@ -9,7 +9,7 @@ argument-hint: [le fichier CSV, le segment, ou ce qu'on veut lancer]
 Cinq étapes, dans cet ordre. Demandé : « $ARGUMENTS ».
 
 **Garde : n'appelle jamais `sequences_enroll` avant d'avoir lu, dans la réponse de
-`domain_get`, que le domaine d'envoi est vérifié.** Un siège ne peut pas s'asseoir sur un
+`domains_primary_get`, que le domaine d'envoi est vérifié.** Un siège ne peut pas s'asseoir sur un
 domaine non vérifié ; enrôler d'abord produit une campagne qui a l'air lancée et dont pas un
 mail ne part.
 
@@ -18,28 +18,28 @@ mail ne part.
 C'est l'étape qui prend des heures — la propagation DNS — et la seule qu'on ne peut pas
 rattraper après. Elle passe donc en premier, pas en dernier.
 
-1. **`domain_list`**, puis **`domain_get`** sur celui qu'on veut utiliser. S'il n'existe pas,
-   **`domain_register`**.
-2. S'il n'est pas vérifié : **`domain_dns`** rend les enregistrements à poser. Pose-les chez le
-   registrar — ce plugin ne le fait pas et ne peut pas le faire — puis **`domain_verify`**, et
+1. **`domains_list`**, puis **`domains_primary_get`** sur celui qu'on veut utiliser. S'il n'existe pas,
+   **`domains_register`**.
+2. S'il n'est pas vérifié : **`domains_dns_publish`** rend les enregistrements à poser. Pose-les chez le
+   registrar — ce plugin ne le fait pas et ne peut pas le faire — puis **`domains_verify`**, et
    répète-le jusqu'à ce qu'il passe. Quand il passe, les sièges qui attendaient pour écrire
    sont réveillés tout seuls.
-3. **`outreach_health`** sur ce domaine. Les taux sont **en pour mille des envois**. Si les
+3. **`outreach_health_get`** sur ce domaine. Les taux sont **en pour mille des envois**. Si les
    plaintes montent, ne lance pas : une campagne sur un domaine qui se dégrade accélère la
    dégradation, et aucune cadence ne la répare.
-4. Le **plafond journalier** : `domain_get` le rend. **Il s'épuise.** Une fois atteint, les
+4. Le **plafond journalier** : `domains_primary_get` le rend. **Il s'épuise.** Une fois atteint, les
    envois du jour sont refusés et attendent le lendemain — c'est la première explication d'une
    file qui n'avance plus l'après-midi, et c'est ce qu'il faut dire au fondateur avant qu'il le
-   découvre. Pour le changer, **`domain_set_cap`**, et seulement après avoir lu
-   `outreach_health` : monter le plafond sans regarder la santé est la façon habituelle de
-   griller un domaine. Zéro est refusé ; pour ne plus envoyer du tout, c'est `domain_remove`.
+   découvre. Pour le changer, **`domains_cap_set`**, et seulement après avoir lu
+   `outreach_health_get` : monter le plafond sans regarder la santé est la façon habituelle de
+   griller un domaine. Zéro est refusé ; pour ne plus envoyer du tout, c'est `domains_remove`.
 
 Dis au fondateur, à ce stade : le domaine, son état, son plafond, et combien de jours il faut
 au plafond pour absorber la liste qu'on va importer.
 
 ## 2. Le segment, puis l'import à blanc
 
-1. **`prospects_segments`** d'abord, toujours. La liste des segments est **fermée**, et cet
+1. **`prospects_segments_list`** d'abord, toujours. La liste des segments est **fermée**, et cet
    appel est la seule façon de connaître l'orthographe exacte : un segment inventé est refusé
    en 400 `bad_segment` après que tu auras déjà préparé le fichier.
 2. **`prospects_import` avec `dry_run: true`.** Rien n'est écrit, et le rapport **nomme chaque
@@ -55,7 +55,7 @@ au plafond pour absorber la liste qu'on va importer.
 ## 3. La séquence
 
 **`sequences_list`** pour voir ce qui existe déjà et ne pas en définir une deuxième sous un
-nom proche, puis **`sequences_define`**.
+nom proche, puis **`sequences_create`**.
 
 Ce qu'il faut avoir en tête en l'écrivant :
 
@@ -86,6 +86,6 @@ pas de cette entreprise).
 
 ## 5. Vérifier que ça part
 
-**`sequences_runs`** tout de suite : les positions sont-elles posées. Puis, le lendemain,
-**`outreach_summary`** — et s'il ne s'est rien passé, **`health_company`** avant de soupçonner
+**`sequences_runs_list`** tout de suite : les positions sont-elles posées. Puis, le lendemain,
+**`outreach_summary_get`** — et s'il ne s'est rien passé, **`company_health_get`** avant de soupçonner
 la campagne : une société arrêtée ressemble beaucoup à une séquence cassée.

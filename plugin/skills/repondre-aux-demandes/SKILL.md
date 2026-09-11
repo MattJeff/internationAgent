@@ -35,7 +35,7 @@ l'action exacte, celle qu'il faudra recopier.
 Avant de décider, réponds à trois questions pour toi-même, et écris-les au fondateur :
 
 - **Qui demande, et pour quoi faire ?** Si l'objectif du siège ne rend pas la demande évidente,
-  lis `employees_get` puis `initiative_get` : une dépense sensée pour un acheteur ne l'est pas
+  lis `employees_get` puis `initiatives_get` : une dépense sensée pour un acheteur ne l'est pas
   pour un siège de support.
 - **Qu'est-ce qui se passe si on approuve ?** Pour `payment_create`, **l'argent part vraiment**.
   Pour les autres natures, le jeton est frappé, la décision enregistrée et le jeton jeté.
@@ -48,7 +48,7 @@ rendue**, sans reformuler, sans réordonner, sans corriger une faute. L'échec q
 existe pour empêcher n'est pas « on a approuvé la mauvaise chose », c'est « on a approuvé
 *ceci* et *cela* a été exécuté ». Une différence est un `approval_action_mismatch` ; un 502
 signifie approbation dépensée et argent peut-être en vol, et **il n'y a pas de rejeu** —
-n'appelle pas une seconde fois, lis `invoices_list` ou `events_read` pour voir ce qui a eu lieu.
+n'appelle pas une seconde fois, lis `invoices_list` ou `events_list` pour voir ce qui a eu lieu.
 
 **Refuser** — **`approvals_deny`**. Le nonce est brûlé définitivement et l'employé devra
 redéposer. Pas de règle des quatre yeux ici, et une ligne périmée s'accepte sans regarder sa
@@ -66,7 +66,7 @@ la liste.
 **`capability_requests_decide`** enregistre la décision d'un humain. **Cela n'élargit rien**, et
 c'est la moitié honnête de la fonctionnalité : accorder ici n'écrit pas une couche de politique.
 Si tu accordes, dis-le en toutes lettres au fondateur : il reste à installer la couche par
-**`policy_role_put`**, qui exige le document complet et **ne peut que resserrer**. Un accord que
+**`policy_role_set`**, qui exige le document complet et **ne peut que resserrer**. Un accord que
 personne n'installe n'est pas perdu — l'employé continue d'être refusé et la demande revient
 avec son ancienne décision attachée — mais il n'a rien débloqué.
 
@@ -74,7 +74,7 @@ avec son ancienne décision attachée — mais il n'a rien débloqué.
 
 Une décision que l'employé n'apprend pas est une décision qui n'a pas eu lieu : il redéposera.
 
-**`employees_list`** pour le slug du destinataire, puis **`desk_send`**. Trois choses, dans
+**`employees_list`** pour le slug du destinataire, puis **`desk_messages_send`**. Trois choses, dans
 l'ordre où elles mordent :
 
 - **Le siège dans le chemin est l'expéditeur, pas le destinataire.** Il doit être un
@@ -83,7 +83,7 @@ l'ordre où elles mordent :
 - **Le message réveille le destinataire et lui coûte un tour** de son budget du jour, sur le
   modèle et la facture du client. Un budget épuisé est un 409 : n'envoie pas cinq messages là
   où une phrase suffit.
-- `kind: "answer"` exige `answers`, qui porte l'`id` d'un message lu sur **`desk_read`**. Pour
+- `kind: "answer"` exige `answers`, qui porte l'`id` d'un message lu sur **`desk_messages_list`**. Pour
   annoncer une décision que l'employé n'a pas posée comme question au bureau, c'est `order`.
 
 Dis ce qui a été décidé et **pourquoi**. Un refus sans raison revient dans la file la semaine

@@ -8,7 +8,7 @@ argument-hint: [le poste à créer, ex. « un SDR sur le segment agences »]
 
 Demandé : « $ARGUMENTS ».
 
-**Garde : ne passe jamais `policy_role_put` en croyant faire une retouche.** Le corps est un
+**Garde : ne passe jamais `policy_role_set` en croyant faire une retouche.** Le corps est un
 document **entier**, pas un correctif : `{"max_turns_per_day": 30}` a l'air d'une petite
 correction et coûte au siège ses canaux, ses domaines et son modèle. Lis `policy_role_get`
 d'abord, modifie le document rendu, renvoie-le en entier.
@@ -47,9 +47,9 @@ tombé du document reste debout), et il **n'accorde rien** — pas une ligne de 
 
 ## 3. L'asseoir dans l'organigramme
 
-- **`teams_member_add`** l'ajoute et **ne remplace jamais** : un siège déjà sur une équipe est
+- **`teams_members_add`** l'ajoute et **ne remplace jamais** : un siège déjà sur une équipe est
   un 409 qui nomme laquelle. Cette ligne n'écrit ni titre ni `reports_to`.
-- **`teams_member_set`** est le seul verbe qui écrive une **position** (titre, responsable,
+- **`teams_members_set`** est le seul verbe qui écrive une **position** (titre, responsable,
   section) — et **chaque champ omis est effacé, jamais conservé**. Il n'y a pas d'état « garde
   l'ancienne valeur » : lis `teams_members_list` d'abord et renvoie ce que tu veux garder.
 - Le CEO est le siège dont `reports_to` est vide ; ce n'est pas un cas particulier. Une boucle
@@ -62,15 +62,15 @@ Deux écritures, et **ni l'une ni l'autre n'est une limite**.
 - **`teams_mission_set`** — la mission de l'équipe, la seule phrase durable qu'elle possède en
   propre. Sans elle, une recrue de l'équipe croissance connaît sa tâche et rien de la
   croissance. De la prose, 240 caractères au plus, et elle n'ouvre ni ne ferme rien.
-- **`initiative_set`** — l'objectif (*ce pour quoi* le siège est là) et la cadence (*quand* il
+- **`initiatives_set`** — l'objectif (*ce pour quoi* le siège est là) et la cadence (*quand* il
   agit seul), écrits ensemble dans une transaction. C'est un **remplacement** : les deux champs
-  sont obligatoires et l'ancien objectif est perdu, donc lis `initiative_get` avant si tu veux
+  sont obligatoires et l'ancien objectif est perdu, donc lis `initiatives_get` avant si tu veux
   en garder une partie. C'est aussi la route qui **choisit le rôle**, dans une liste fermée, et
   aucun modèle ne fait ce choix à ta place : demande-le au fondateur. La cadence va de 300 s à
   30 jours et **hors bornes est refusé, jamais raboté** ; la poser déplace la prochaine
   échéance à un intervalle d'ici.
 
-Si l'objectif se dit mieux en prose qu'en JSON : **`interview_questionnaire`** pose les
+Si l'objectif se dit mieux en prose qu'en JSON : **`interview_questions_list`** pose les
 questions, **`interview_answer`** les remplit une par une.
 
 ## 5. Ses limites
@@ -80,10 +80,10 @@ Dans cet ordre, parce que l'ordre inverse écrase.
 1. **`policy_role_get`** sur le `role_name` de l'équipe. Un 404 veut dire « rien d'écrit sous ce
    rôle », ce qui est différent de « les limites du plafond » : la couche absente hérite au
    chargement.
-2. **`policy_role_put`** avec le document complet, resserré. Elle ne peut que **rétrécir** — un
+2. **`policy_role_set`** avec le document complet, resserré. Elle ne peut que **rétrécir** — un
    corps qui élargit est un 409 `policy_widens`, refusé et non silencieusement intersecté — et
    elle **ne crée pas** : un rôle sans couche est un 404, la création appartient à
-   `companies_create`, qui connaît l'organigramme.
+   `company_create`, qui connaît l'organigramme.
 3. L'argent : **`spend_caps_get`** puis **`spend_caps_set`**, **par devise**. `caps: null` ne
    veut pas dire « illimité » mais « ne peut pas payer » : sans ligne de plafonds, la Gate
    refuse toute dépense avec `no_spend_policy`. Un siège neuf est dans cet état.
@@ -102,9 +102,9 @@ C'est l'étape qu'on saute et qui fait dire « l'employé ne fait rien » trois 
   (`set_by`), s'il agit de lui-même (`acts_on_its_own`), et ce que le plafond libère
   aujourd'hui une fois la chauffe du domaine passée, avec `contacts_held_back` qui nomme le mur.
   À préférer à `policy_role_get` dès que la question est « qu'est-ce qui l'arrête en premier ».
-- **`employee_turns_get`** — `turns_taken: 0` avec un 200 est la réponse ordinaire d'un siège
+- **`employees_turns_get`** — `turns_taken: 0` avec un 200 est la réponse ordinaire d'un siège
   qui ne s'est pas encore réveillé, pas une panne.
-- Si rien ne bouge : **`health_company`**, puis **`model_status`**. Un 404 sur le modèle veut
+- Si rien ne bouge : **`company_health_get`**, puis **`model_get`**. Un 404 sur le modèle veut
   dire que rien n'est connecté, et alors aucun siège de cette société ne prend de tour — ce
   n'est pas la recrue qui est en cause.
 

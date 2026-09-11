@@ -86,6 +86,67 @@ pub fn tools() -> Vec<ToolDef> {
         // -------------------------------------------------------------------
         // Le registre public : la seule chose que cette société publie d'elle
         // -------------------------------------------------------------------
+        // -------------------------------------------------------------------
+        // Les clés : ce avec quoi un terminal se présente
+        // -------------------------------------------------------------------
+        t(
+            "keys_list",
+            "Les clés de cette société, sans leurs secrets",
+            "Rend les clés d'API que cette entreprise a émises — leur nom, leur identifiant, \
+             leur date — et **jamais leur secret** : il n'est montré qu'une fois, à la création. \
+             Sert à savoir quels terminaux ou services sont branchés avant d'en retirer un. Les \
+             sessions de la console n'y figurent pas : ce ne sont pas des clés qu'on distribue, \
+             et les retirer déconnecterait la personne qui regarde. L'identifiant rendu ici est \
+             celui que `keys_remove` prend.",
+            Method::Get,
+            "/v1/keys",
+            nothing(),
+            &[],
+            Risk::Read,
+        ),
+        t(
+            "keys_create",
+            "Une clé pour brancher un terminal ou un service",
+            "Émet une clé d'API pour cette entreprise et rend son secret — **une seule fois, \
+             ici** : il n'est relisible nulle part ensuite, et une clé perdue se remplace, elle \
+             ne se retrouve pas. Le `label` la nomme (« claude-code », « ci », le nom d'un \
+             service) ; il porte aussi le rôle, et une étiquette qui réclamerait un rôle que \
+             l'appelant ne tient pas est refusée. C'est l'outil qui prépare la commande \
+             d'installation d'un client MCP ; `keys_list` montre ensuite ce qui est branché.",
+            Method::Post,
+            "/v1/keys",
+            json!({
+                "type": "object",
+                "properties": {
+                    "label": {
+                        "type": "string",
+                        "description": "le nom de la clé, par exemple « claude-code »"
+                    }
+                },
+            }),
+            &[],
+            Risk::Write,
+        ),
+        t(
+            "keys_remove",
+            "Retirer une clé, et couper ce qu'elle ouvrait",
+            "Révoque une clé : tout ce qui s'en servait cesse d'entrer à l'instant, sans \
+             préavis et sans retour — le secret n'étant relisible nulle part, une clé retirée \
+             par erreur se remplace par une neuve et se recolle partout. L'identifiant vient de \
+             `keys_list`. À faire quand un terminal est perdu, qu'un service est débranché, ou \
+             qu'une clé a traîné quelque part.",
+            Method::Delete,
+            "/v1/keys/{id}",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "l'identifiant rendu par `keys_list`" }
+                },
+                "required": ["id"],
+            }),
+            &[],
+            Risk::Destructive,
+        ),
         t(
             "company_health_get",
             "Est-ce que cette société travaille encore ?",
@@ -1560,7 +1621,7 @@ mod tests {
     /// une route, sans qu'aucun test ne rougisse. En lisant le source, le test
     /// compare la table à ce qui est **réellement monté**, et un fichier déplacé
     /// ne compile même pas.
-    const ROUTE_SOURCES: [&str; 16] = [
+    const ROUTE_SOURCES: [&str; 17] = [
         include_str!("../../../../apps/server/src/routes/employees.rs"),
         include_str!("../../../../apps/server/src/routes/teams.rs"),
         include_str!("../../../../apps/server/src/routes/companies.rs"),
@@ -1580,6 +1641,7 @@ mod tests {
         // montées et déclarées par personne.
         include_str!("../../../../apps/server/src/routes/public_register.rs"),
         include_str!("../../../../apps/server/src/routes/health.rs"),
+        include_str!("../../../../apps/server/src/routes/keys.rs"),
     ];
 
     /// Tout chemin passé à un `.route(` dans ces sources.

@@ -2,7 +2,7 @@
 
 Le serveur MCP (`docs/MCP_SERVEUR.md`) rend 116 outils. Brancher une URL et une
 clé donne 116 verbes bruts et aucun mode d'emploi : le modèle doit deviner
-qu'on lit `health_company` avant de croire un chiffre, qu'un import se fait à
+qu'on lit `company_health_get` avant de croire un chiffre, qu'un import se fait à
 blanc d'abord, qu'une action d'approbation se recopie octet par octet.
 
 Ce plugin est cette moitié manquante. Une commande d'installation, et le
@@ -65,24 +65,24 @@ phrase de garde.
 | Geste | La question | La garde |
 |---|---|---|
 | **`point-du-jour`** | « où en est ma société ? » | N'approuve, ne refuse, n'enrôle et n'embauche rien : c'est une lecture. |
-| **`lancer-une-campagne`** | de l'import d'une liste au premier envoi | Jamais `sequences_enroll` avant que `domain_get` ait rendu le domaine **vérifié**. |
+| **`lancer-une-campagne`** | de l'import d'une liste au premier envoi | Jamais `sequences_enroll` avant que `domains_primary_get` ait rendu le domaine **vérifié**. |
 | **`repondre-aux-demandes`** | vider la file humaine | Ne jamais reformuler l'action d'une approbation ; ne jamais approuver sa propre demande. |
-| **`embaucher`** | un siège, sa place, sa charte, ses limites | `policy_role_put` est un document entier : un champ manquant est un retrait. |
+| **`embaucher`** | un siège, sa place, sa charte, ses limites | `policy_role_set` est un document entier : un champ manquant est un retrait. |
 
-**`point-du-jour`** — `health_company` **d'abord et toujours** (un `stopped`
-arrête la lecture et renvoie vers `model_status` ; une société au repos rend
+**`point-du-jour`** — `company_health_get` **d'abord et toujours** (un `stopped`
+arrête la lecture et renvoie vers `model_get` ; une société au repos rend
 `working`, pas `degraded`), puis `approvals_list` + `capability_requests_list` +
-`work_board` pour ce qui attend une décision — les lignes de plus de 24 h
+`work_items_list` pour ce qui attend une décision — les lignes de plus de 24 h
 comptées à part, parce que rien ne sort de cette file tout seul —, puis
-`outreach_summary` et `outreach_health` pour la prospection, puis `pnl_read` et
+`outreach_summary_get` et `outreach_health_get` pour la prospection, puis `pnl_get` et
 `invoices_list` pour l'argent. Finit par trois phrases et une question.
 
 **`lancer-une-campagne`** — le domaine en premier parce que c'est la seule étape
-qu'on ne rattrape pas (`domain_list` → `domain_dns` → `domain_verify`), sa
-réputation et son plafond (`outreach_health`, `domain_set_cap`), le segment lu
-depuis `prospects_segments`, l'import **`dry_run: true` d'abord** puis réel, la
-séquence (`sequences_list`, `sequences_define`), l'enrôlement
-(`sequences_enroll`), la vérification (`sequences_runs`). Les trois pièges qu'il
+qu'on ne rattrape pas (`domains_list` → `domains_dns_publish` → `domains_verify`), sa
+réputation et son plafond (`outreach_health_get`, `domains_cap_set`), le segment lu
+depuis `prospects_segments_list`, l'import **`dry_run: true` d'abord** puis réel, la
+séquence (`sequences_list`, `sequences_create`), l'enrôlement
+(`sequences_enroll`), la vérification (`sequences_runs_list`). Les trois pièges qu'il
 nomme : le **plafond journalier par domaine s'épuise** — c'est la première
 explication d'une file qui n'avance plus l'après-midi —, le **mode à blanc est
 obligatoire** parce qu'il est la seule façon de voir un en-tête de travers avant
@@ -94,14 +94,14 @@ ancien** (la tête de file est le travail le plus certainement mort),
 `approvals_get` pour lire l'action exacte, `approvals_approve` avec cette action
 recopiée sans un octet de différence ou `approvals_deny` avec une note, puis les
 `capability_requests_*` — accorder n'élargit rien, il reste à installer la
-couche — et enfin `desk_send` depuis un fauteuil pour dire à l'employé ce qui a
+couche — et enfin `desk_messages_send` depuis un fauteuil pour dire à l'employé ce qui a
 été décidé et pourquoi.
 
 **`embaucher`** — `teams_list` pour savoir sous quel `role_name` ses limites
 seront lues, `employees_create` (202 et non 201 : commandé, pas embauché) ou
-`org_apply` pour plus d'un siège, `teams_member_add` / `teams_member_set` pour
-la position, `teams_mission_set` + `initiative_set` pour la charte — ni l'une ni
-l'autre n'est une limite —, `policy_role_get` puis `policy_role_put` et
+`org_apply` pour plus d'un siège, `teams_members_add` / `teams_members_set` pour
+la position, `teams_mission_set` + `initiatives_set` pour la charte — ni l'une ni
+l'autre n'est une limite —, `policy_role_get` puis `policy_role_set` et
 `spend_caps_set` pour les limites, et enfin `employees_get` + `controls_get`
 pour vérifier qu'il s'est provisionné.
 
@@ -180,7 +180,7 @@ marketplace mène à un manifeste dont le nom correspond.
 La troisième ligne est la seule qui mérite un script plutôt qu'une relecture :
 les 116 lignes du registre sont éditées par d'autres chantiers, et un outil
 renommé rend un geste faux **sans rien casser d'autre**. Le script a été vu
-rougir — renommer `health_company` dans `point-du-jour` le fait échouer — parce
+rougir — renommer `company_health_get` dans `point-du-jour` le fait échouer — parce
 qu'une vérification qui n'a jamais échoué ne prouve rien.
 
 **Non vérifié, et ça ne peut pas l'être depuis un worktree :** l'installation

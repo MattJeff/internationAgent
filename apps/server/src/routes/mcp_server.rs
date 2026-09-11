@@ -115,25 +115,43 @@ const PROTOCOL: &str = "2025-06-18";
 /// reçoit trente outils sans ce texte les essaie dans l'ordre alphabétique.
 const INSTRUCTIONS: &str = "\
 Ce serveur est le panneau de commande d'une société d'employés logiciels : des \
-sièges qui prospectent, écrivent, relancent, facturent et rendent compte, sous \
-une politique qui peut refuser une action et le dire.
+sièges qui prospectent, écrivent, relancent, facturent et rendent compte, chacun \
+sous une politique qui peut refuser une action et le dire. Chaque outil est une \
+route HTTP de ce déploiement, jouée avec votre clé : ce que vous n'avez pas le \
+droit de faire est refusé ici comme depuis la console, avec le même code.
 
-Par où commencer : `tools/list`, puis les outils du domaine « société » — les \
-employés, les équipes, les limites. C'est l'état des lieux. Les outils de \
-« commerce » agissent vers l'extérieur (prospects, séquences, devis, factures) \
-et ceux d'« exploitation » regardent la machine (journal, dépenses, files, \
-approbations).
+Par où commencer : `tools/list` pour la table entière, puis `company_health_get` \
+— il rend `working`, `degraded` ou `stopped` en un appel, et c'est le premier \
+outil à appeler dès que quelque chose semble immobile. Ensuite `employees_list` : \
+presque toutes les autres lignes réclament l'UUID d'un siège, et c'est lui qui \
+les donne.
 
-Trois choses à savoir avant d'agir :
+Les noms se lisent `domaine_objet_verbe`, verbe en dernier : `list` rend \
+plusieurs lignes, `get` une seule, `set` remplace le document entier — un champ \
+omis est effacé, jamais conservé.
 
-1. Chaque outil est une route HTTP de ce déploiement, jouée avec votre clé. Ce \
-que vous n'avez pas le droit de faire est refusé ici comme il le serait depuis \
-la console, avec le même code d'erreur.
-2. Un refus n'est pas une panne. `pending_approval` veut dire qu'un humain doit \
+Quatre enchaînements couvrent presque tout :
+1. Monter la société — `company_create`, `model_connect`, puis `initiatives_set` \
+siège par siège ; sans objectif ni cadence, un employé ne se réveille jamais seul.
+2. Faire partir du courrier — `domains_register`, `domains_dns_publish`, \
+`domains_verify` (un siège ne peut pas s'asseoir sur un domaine non vérifié), \
+puis `prospects_import` en `dry_run` d'abord, `sequences_create`, \
+`sequences_enroll`. Une séquence ne poste rien elle-même : elle réveille le \
+siège, qui écrit et repasse par la politique. Le plafond journalier du domaine \
+s'épuise — l'envoi attend le lendemain.
+3. Encaisser — `quotes_list`, `invoices_list`, `invoices_payment_record`, \
+`pnl_get`. Rien ici n'émet une facture ni un devis : seul un employé le fait, \
+avec un jeton de la Gate.
+4. Reprendre la main — `approvals_list`, puis `approvals_approve` ou \
+`approvals_deny` ; `halt_place` arrête toute la société, `halt_release` la \
+relance.
+
+Un refus n'est pas une panne : `pending_approval` veut dire qu'un humain doit \
 valider, `halted` que la société est à l'arrêt, `daily_limit` qu'un plafond est \
-atteint. Rapportez le code, ne le contournez pas.
-3. Les outils marqués destructifs engagent la société devant un tiers — un \
-envoi, un paiement, une signature. Demandez avant.";
+atteint. Rapportez le code, ne le contournez pas. Un message envoyé par \
+`desk_messages_send` réveille le destinataire et lui coûte un tour de sa journée. \
+Les outils marqués destructifs engagent la société devant un tiers — demandez \
+avant.";
 
 // ---------------------------------------------------------------------------
 // L'état, et le routeur qu'il rejoue

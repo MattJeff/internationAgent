@@ -14,7 +14,7 @@ rapport.
 
 ## 1. La santé, toujours en premier
 
-Appelle **`health_company`** avant tout le reste. Sans lui, chaque chiffre qui suit peut être
+Appelle **`company_health_get`** avant tout le reste. Sans lui, chaque chiffre qui suit peut être
 le chiffre d'hier rendu par une société qui ne tourne plus depuis.
 
 Ce que tu lis dans la réponse, et ce que tu en fais :
@@ -24,7 +24,7 @@ Ce que tu lis dans la réponse, et ce que tu en fais :
 - `degraded` — continue, mais cite `last_failure_detail` dans le rapport : les chiffres du bas
   sont partiels, dis-le.
 - `stopped` — **arrête la lecture ici**. La cause est dans `last_failure_detail`, et c'est
-  presque toujours la connexion au modèle : appelle **`model_status`** (un 404 veut dire que
+  presque toujours la connexion au modèle : appelle **`model_get`** (un 404 veut dire que
   rien n'est connecté, ce qui est une cause et pas une erreur de ta part) et rapporte cette
   seule chose. Lire la prospection d'une société arrêtée produit un rapport rassurant et faux.
 
@@ -39,29 +39,29 @@ Trois files, et elles ne se recouvrent pas.
 - **`capability_requests_list`** — les refus récurrents de la Gate, c'est-à-dire les employés
   qui butent chaque jour sur la même limite. Une ligne ici est un travail bloqué, pas une
   alerte de sécurité.
-- **`work_board`** — le tableau de travail, ouvert et clos ensemble et sans filtre. Ne cite que
+- **`work_items_list`** — le tableau de travail, ouvert et clos ensemble et sans filtre. Ne cite que
   ce qui est ouvert, et signale ce qui n'a personne : un élément sans propriétaire n'avancera
   pas de lui-même.
 
 ## 3. Ce que la prospection a produit
 
-- **`outreach_summary`** sur la fenêtre. **Lis `unmeasured` avant de citer un chiffre** — c'est
+- **`outreach_summary_get`** sur la fenêtre. **Lis `unmeasured` avant de citer un chiffre** — c'est
   la liste de ce que ces nombres ne couvrent pas, et la citer est la différence entre un
   chiffre et une vantardise. `approached` compte des créneaux réservés, **pas** des envois
   partis : ne dis jamais « N mails envoyés » à partir de ce champ.
-- **`outreach_health`** sur les mêmes jours. Les deux taux sont **en pour mille des envois**,
+- **`outreach_health_get`** sur les mêmes jours. Les deux taux sont **en pour mille des envois**,
   l'unité des seuils publics (0,3 % de plaintes = 3 ‰). Un taux de plaintes qui monte est la
   seule ligne de tout ce rapport qui vaille une interruption : un domaine ne se répare pas.
 
 ## 4. L'argent
 
-- **`pnl_read`** sur la fenêtre. Un coût `null` veut dire « aucun tarif déclaré », **jamais**
+- **`pnl_get`** sur la fenêtre. Un coût `null` veut dire « aucun tarif déclaré », **jamais**
   « zéro » : écris `null`, ne l'arrondis pas à 0 €. Les montants ne s'additionnent pas entre
   devises, et `cost_source` dit d'où vient chaque chiffre.
 - **`invoices_list`** — `outstanding_minor` est **par devise**. Il n'y a pas de taux de change
   dans ce produit ; une somme unique serait une invention.
 
-Si le fondateur a demandé pourquoi ça coûte ce que ça coûte, ajoute **`usage_read`** ; sinon,
+Si le fondateur a demandé pourquoi ça coûte ce que ça coûte, ajoute **`usage_get`** ; sinon,
 non : ce geste doit tenir en une poignée d'appels.
 
 ## 5. La sortie
