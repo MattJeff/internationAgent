@@ -113,7 +113,15 @@
 create table if not exists content_repos (
   -- Un siège, un dépôt. La clé primaire est l'employé : c'est lui que la Gate
   -- nomme quand la pull request s'ouvre.
-  employee_id uuid        primary key references employees (id) on delete cascade,
+  --
+  -- La clé étrangère vers `employees` est **composite**, posée plus bas avec
+  -- celle vers `mcp_servers` : Postgres vérifie une clé étrangère **hors de la
+  -- RLS**, donc `references employees (id)` seul accepte l'identifiant d'un
+  -- siège d'en face, et la clé primaire étant l'employé, la ligne squattée
+  -- interdit au vrai propriétaire de poser la sienne. `migrations/0103` porte
+  -- l'argument en entier et referme les trente-sept autres ; celle-ci naît du
+  -- bon côté plutôt que d'être corrigée un fichier plus loin.
+  employee_id uuid        not null primary key,
   tenant_id   uuid        not null references tenants (id) on delete cascade,
 
   -- Le handle sous lequel ce locataire a branché son GitHub, tel que
@@ -146,6 +154,8 @@ create table if not exists content_repos (
   -- La garantie de l'existence du branchement, et du débranchement qui
   -- l'emporte. Voir l'argument en tête.
   foreign key (tenant_id, server) references mcp_servers (tenant_id, server)
+    on delete cascade,
+  foreign key (tenant_id, employee_id) references employees (tenant_id, id)
     on delete cascade
 );
 
