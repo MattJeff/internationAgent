@@ -164,7 +164,7 @@ async fn diary(State(db): State<Db>, principal: Principal) -> Result<Response, A
 async fn book(
     State(db): State<Db>,
     principal: Principal,
-    Json(body): Json<NewAppointment>,
+    crate::error::JsonBody(body): crate::error::JsonBody<NewAppointment>,
 ) -> Result<Response, ApiError> {
     let subject = body.subject.trim();
     if subject.is_empty() {

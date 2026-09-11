@@ -175,7 +175,23 @@ async fn get_role_layer(
     let found = read_layer(&mut tx, &role).await;
     tx.rollback().await?;
 
-    let limits = found?.ok_or_else(ApiError::not_found)?;
+    // **Un 404 nu est un 404 qu'un modèle prend pour sa propre faute.** Mesuré
+    // le 2026-09-11 : c'est la première lecture qu'un terminal tente quand
+    // `POST /v1/companies` lui répond qu'il manque un document de limites
+    // complet, et elle lui rendait `{"code":"not_found"}` et rien d'autre. La
+    // phrase dit les deux choses qu'on ne peut pas déduire d'un 404 : que
+    // l'absence de couche n'est pas l'absence de limites, et qui en écrit une.
+    let limits = found?.ok_or_else(|| {
+        ApiError::not_found().with_detail(format!(
+            "this company has written no limits of its own for the role {role}. That is not \"no \
+             limits\": a role with no layer inherits the one above it at load time, which is why \
+             this route answers 404 rather than rendering what it would inherit. `GET \
+             /v1/controls` shows what actually binds each seat today, and which layer set it. \
+             Writing the first layer for a role is `POST /v1/companies` — replaying it with the \
+             role in its `roles` map adds that layer and leaves the rest of the company alone; \
+             `PUT /v1/policy/roles/{role}` only replaces a layer that already exists."
+        ))
+    })?;
     Ok(Json(LayerView { role, limits }).into_response())
 }
 
@@ -626,6 +642,18 @@ mod tests {
         // before it writes never sees an inherited layer it did not write.
         let (status, missing) = call(&app, "GET", SECRET_A, "salse", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+        // **And it says what to do next.** Walked from a terminal on
+        // 2026-09-11, this is the read a caller tries the moment
+        // `POST /v1/companies` tells it a whole layer document is missing, and
+        // it answered `{"code":"not_found"}` with nothing else — a 404 a model
+        // reads as its own mistake. Both halves of the sentence are asserted:
+        // the absent layer is not an absence of limits, and something else
+        // writes the first one.
+        let detail = missing["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("/v1/controls") && detail.contains("/v1/companies"),
+            "a 404 here must name what binds today and what writes the first layer: {missing}"
+        );
     }
 
     /// **A second console cannot decide from a layer the first one is in the

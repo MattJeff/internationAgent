@@ -157,6 +157,45 @@ impl IntoResponse for ApiError {
 }
 
 // ---------------------------------------------------------------------------
+// Le corps JSON d'une écriture
+// ---------------------------------------------------------------------------
+
+/// `Json<T>`, mais dont le refus est un document de problème.
+///
+/// # Le défaut qu'il ferme
+///
+/// Marché le 2026-09-11 depuis un terminal, par le serveur MCP : un corps que
+/// le type ne sait pas lire — un champ nommé `seconds` là où le schéma dit
+/// `hours` — sortait d'`axum::Json` en **422 avec un corps en texte brut**.
+/// Le client MCP l'affichait `422 : Unprocessable Entity`, sans code, sans nom
+/// de champ, sans rien à corriger, sur un produit dont tous les autres refus
+/// sont un document RFC 9457. Dix-neuf gestionnaires étaient dans ce cas, sur
+/// douze modules : c'était la forme par défaut, pas l'oubli d'un seul.
+///
+/// Le texte d'axum (« unknown field `seconds`, expected one of … ») est
+/// exactement ce qu'il faut dire ; ce qui manquait était l'enveloppe. Donc rien
+/// n'est reformulé, seul le statut et la forme changent : `400 bad_request`
+/// avec ce texte en `detail`, comme partout ailleurs dans ce serveur.
+///
+/// `aucun_gestionnaire_ne_prend_un_corps_json_nu` refuse le vingtième.
+pub struct JsonBody<T>(pub T);
+
+impl<T, S> axum::extract::FromRequest<S> for JsonBody<T>
+where
+    Json<T>: axum::extract::FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        Json::<T>::from_request(req, state)
+            .await
+            .map(|Json(value)| Self(value))
+            .map_err(|err| ApiError::bad_request(err.body_text()))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Mapping
 // ---------------------------------------------------------------------------
 
@@ -439,5 +478,51 @@ mod tests {
         // employee ids exist.
         let (status, _, _) = render(Denied::UnknownEmployee.into()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// **Aucun gestionnaire ne prend un corps JSON nu.**
+    ///
+    /// `axum::Json` en position d'extracteur refuse un corps illisible avec un
+    /// **422 en texte brut** : pas de `code`, pas de `type`, pas de `detail`.
+    /// Vu depuis un terminal le 2026-09-11, ça donne `422 : Unprocessable
+    /// Entity` et rien à corriger, sur un produit dont tous les autres refus
+    /// sont un document RFC 9457. Dix-neuf gestionnaires sur douze modules
+    /// étaient dans ce cas ; [`JsonBody`] est l'enveloppe, et ce test est ce qui
+    /// empêche le vingtième.
+    ///
+    /// Le balayage s'arrête au `#[cfg(test)]` de chaque module : les faux
+    /// serveurs d'API tierces qu'on y monte ne sont pas notre surface et n'ont
+    /// pas à rendre nos documents.
+    #[test]
+    fn aucun_gestionnaire_ne_prend_un_corps_json_nu() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/routes");
+        let mut coupables: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("les modules de routes") {
+            let path = entry.expect("entrée").path();
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("lire un module");
+            let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+            for (line, text) in production.lines().enumerate() {
+                let trimmed = text.trim_start();
+                // La forme d'un extracteur, pas celle d'un type de retour :
+                // `Json(x): Json<T>,` en argument. `Result<Json<T>, …>` et
+                // `-> Json<T>` ne commencent pas ainsi.
+                if trimmed.starts_with("Json(") && trimmed.contains("): Json<") {
+                    coupables.push(format!(
+                        "{}:{}: {trimmed}",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        line + 1
+                    ));
+                }
+            }
+        }
+        assert!(
+            coupables.is_empty(),
+            "ces gestionnaires refusent un corps illisible en 422 texte brut, sans code ni \
+             phrase : remplacez `Json(x): Json<T>` par `crate::error::JsonBody(x): \
+             crate::error::JsonBody<T>`. {coupables:#?}"
+        );
     }
 }

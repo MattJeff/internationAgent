@@ -51,7 +51,7 @@ struct Enrollment {
 async fn define(
     State(db): State<Db>,
     principal: Principal,
-    Json(body): Json<NewSequence>,
+    crate::error::JsonBody(body): crate::error::JsonBody<NewSequence>,
 ) -> Result<Response, ApiError> {
     if body.name.trim().is_empty() || body.name.trim().chars().count() > 200 {
         return Err(ApiError::bad_request("`name` is 1 to 200 characters"));
@@ -103,7 +103,7 @@ async fn enroll(
     State(db): State<Db>,
     principal: Principal,
     Path(id): Path<Uuid>,
-    Json(body): Json<Enrollment>,
+    crate::error::JsonBody(body): crate::error::JsonBody<Enrollment>,
 ) -> Result<Response, ApiError> {
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
     let run = sequence::enroll(

@@ -44,9 +44,17 @@ pub fn router(db: Db) -> Router {
     Router::new()
         .route("/v1/prospects/import", post_route(import))
         .route("/v1/prospects/segments", get_route(segments))
+        .route("/v1/contacts", get_route(contacts))
         .layer(DefaultBodyLimit::max(MAX_CSV_BYTES))
         .with_state(db)
 }
+
+/// Combien de contacts une page rend quand l'appelant ne le dit pas, et au plus.
+///
+/// Les mêmes chiffres que `GET /v1/employees`, parce que c'est la même forme de
+/// pagination et qu'un deuxième couple de bornes serait un deuxième à retenir.
+const DEFAULT_LIMIT: i64 = 50;
+const MAX_LIMIT: i64 = 200;
 
 #[derive(Debug, Deserialize)]
 struct ImportQuery {
@@ -231,6 +239,94 @@ async fn segments(_principal: Principal) -> Json<serde_json::Value> {
     Json(json!({ "segments": SEGMENTS }))
 }
 
+// ---------------------------------------------------------------------------
+// La liste — l'identifiant que l'import ne rendait pas
+// ---------------------------------------------------------------------------
+
+/// Pagination par clé, la même que `GET /v1/employees` : les identifiants sont
+/// des UUIDv7, donc `id > after` veut dire « créé après ».
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Page {
+    #[serde(default)]
+    after: Option<uuid::Uuid>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// Une ligne de la liste.
+///
+/// **Pas de `phone`, et c'est délibéré** : cette lecture existe pour donner à un
+/// terminal l'identifiant qu'il lui manque, pas pour exporter un carnet
+/// d'adresses. L'adresse électronique y est parce qu'elle est la seule façon de
+/// reconnaître une personne dans une liste que l'appelant vient d'importer
+/// lui-même, et c'est déjà la clé d'unicité d'un contact.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+struct ContactRow {
+    id: uuid::Uuid,
+    account_id: uuid::Uuid,
+    full_name: String,
+    email: Option<String>,
+    active: bool,
+    last_contacted_at: Option<chrono::DateTime<Utc>>,
+    next_follow_up_at: Option<chrono::DateTime<Utc>>,
+    created_at: chrono::DateTime<Utc>,
+}
+
+/// `GET /v1/contacts` — les contacts de cette entreprise, du plus ancien au
+/// plus récent.
+///
+/// # Pourquoi cette route existe
+///
+/// Marché le 2026-09-11 depuis un terminal, par le serveur MCP et rien d'autre :
+/// `POST /v1/sequences/{id}/enroll` réclame un `contact_id`, et **aucune route
+/// de ce déploiement n'en rendait un**. `POST /v1/prospects/import` rend des
+/// compteurs ; `POST /v1/employees/{id}/queue/export` rend un CSV dont les dix
+/// colonnes sont celles de Smartlead et ne contiennent aucun identifiant ; il
+/// n'y avait pas de `/v1/contacts`. Le deuxième des quatre gestes du plugin —
+/// « de l'import d'une liste au premier envoi » — était donc impossible à
+/// terminer, et un modèle qui essayait inventait un UUID et lisait un 404 qu'il
+/// prenait pour sa propre faute.
+///
+/// L'import ne pouvait pas rendre ces identifiants lui-même : son premier appel
+/// est un `dry_run` qui annule sa transaction, donc les lignes qu'il décrit
+/// n'existent pas encore, et une liste de cent mille identifiants dans la
+/// réponse d'un import serait une deuxième pagination à inventer.
+///
+/// Pas de `WHERE tenant_id` : la RLS l'ajoute, et l'écrire à la main serait un
+/// deuxième endroit où l'oublier.
+async fn contacts(
+    State(db): State<Db>,
+    principal: Principal,
+    page: Result<Query<Page>, QueryRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Query(page) = page.map_err(|err| ApiError::bad_request(err.body_text()))?;
+    let limit = page.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let rows: Vec<ContactRow> = sqlx::query_as(
+        "SELECT id, account_id, full_name, email, active, last_contacted_at, \
+                next_follow_up_at, created_at \
+           FROM contacts \
+          WHERE ($1::uuid IS NULL OR id > $1) \
+          ORDER BY id \
+          LIMIT $2",
+    )
+    .bind(page.after)
+    .bind(limit)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(agentos_store::db::StoreError::from)?;
+    tx.rollback().await?;
+
+    // Seule une page pleine peut avoir une suite. Une page courte termine la
+    // marche sans coûter un aller-retour de plus.
+    let next_after = (rows.len() as i64 == limit)
+        .then(|| rows.last().map(|last| last.id))
+        .flatten();
+    Ok(Json(json!({ "contacts": rows, "next_after": next_after })))
+}
+
 #[cfg(test)]
 mod tests {
     use agentos_domain::ids::TenantId;
@@ -388,6 +484,65 @@ mod tests {
         assert_eq!(theirs["accounts"]["created"], Value::from(3), "{theirs}");
         assert_eq!(h.contacts(h.b).await, 3);
         assert_eq!(h.contacts(h.a).await, 3);
+
+        h.teardown().await;
+    }
+
+    /// **Le défaut mesuré le 2026-09-11.** `sequences_enroll` réclame un
+    /// `contact_id` et rien de ce déploiement n'en rendait un : l'import rend
+    /// des compteurs, le tirage de file rend les dix colonnes de Smartlead, et
+    /// il n'y avait pas de liste. Un import suivi d'une lecture doit donner
+    /// l'identifiant qu'un enrôlement recopie, et la pagination doit finir.
+    #[tokio::test]
+    async fn un_import_rend_ses_contacts_avec_leur_identifiant() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        h.import("segment=other", SECRET_A, REAL).await;
+
+        let (status, body) = h
+            .send("GET", "/v1/contacts", SECRET_A, "text/plain", "")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows = body["contacts"].as_array().expect("une liste");
+        assert_eq!(rows.len(), 3, "{body}");
+        assert!(
+            rows.iter().all(|row| row["id"]
+                .as_str()
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())),
+            "chaque ligne porte l'UUID que `sequences_enroll` recopie : {body}"
+        );
+        assert!(rows[0]["email"].is_string(), "{body}");
+        assert!(
+            body["next_after"].is_null(),
+            "une page courte finit : {body}"
+        );
+
+        // La pagination, aux deux bornes : une page pleine porte sa suite.
+        let (status, page) = h
+            .send("GET", "/v1/contacts?limit=2", SECRET_A, "text/plain", "")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["contacts"].as_array().expect("liste").len(), 2);
+        let cursor = page["next_after"].as_str().expect("un curseur").to_owned();
+        let (_, suite) = h
+            .send(
+                "GET",
+                &format!("/v1/contacts?limit=2&after={cursor}"),
+                SECRET_A,
+                "text/plain",
+                "",
+            )
+            .await;
+        assert_eq!(suite["contacts"].as_array().expect("liste").len(), 1);
+        assert!(suite["next_after"].is_null(), "{suite}");
+
+        // Et les contacts d'une autre société ne sont pas filtrés, ils sont
+        // invisibles.
+        let (_, voisin) = h
+            .send("GET", "/v1/contacts", SECRET_B, "text/plain", "")
+            .await;
+        assert_eq!(voisin["contacts"], json!([]), "{voisin}");
 
         h.teardown().await;
     }

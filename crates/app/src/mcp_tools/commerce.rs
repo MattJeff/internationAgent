@@ -101,11 +101,50 @@ pub fn tools() -> Vec<ToolDef> {
                  avant tout import de liste : un segment hors de cette liste est refusé avec un \
                  400 `bad_segment`, et c'est la seule façon de connaître l'orthographe exacte \
                  attendue. C'est exactement la valeur qu'attend le champ `segment` de \
-                 `prospects_import`.",
+                 `prospects_import`. **Ce n'est pas la même liste que le `segment` d'un objectif \
+                 `sales-development`** posé par `initiatives_set` : celle-là en admet cinq \
+                 (`airline`, `ota`, `corporate_travel`, `insurer`, `cruise_line`), n'a ni `tmc`, \
+                 ni `relocation`, ni `other`, et épelle la croisière `cruise_line`. Prendre une \
+                 valeur d'ici pour un objectif est un 400 `objective_field`.",
             method: Method::Get,
             path: "/v1/prospects/segments",
             schema: nothing(),
             query: &[],
+            raw_body: None,
+            risk: Risk::Read,
+        },
+        ToolDef {
+            name: "contacts_list",
+            title: "Les personnes importées, et l'identifiant que l'inscription réclame",
+            description: "Rend les contacts de cette entreprise — l'`id`, le compte auquel chacun \
+                 appartient, son nom, son adresse, s'il est encore actif, la date du dernier \
+                 contact et celle de la prochaine relance — page par page, du plus ancien au plus \
+                 récent. **C'est la seule source du `contact_id` que `sequences_enroll` réclame** \
+                 : `prospects_import` ne rend que des compteurs et `prospects_queue_export` un CSV \
+                 sans identifiant, donc un enrôlement commence toujours ici. Pagination par clé : \
+                 `limit` (50 par défaut, 200 au plus) et `after`, le dernier `id` de la page \
+                 précédente ; une page pleine porte `next_after`, une page courte termine la \
+                 marche. Cette lecture ne dit pas si une adresse est sur la liste de suppression \
+                 — un enrôlement refusé en 403 `suppressed` l'apprend à ce moment-là.",
+            method: Method::Get,
+            path: "/v1/contacts",
+            schema: schema(
+                json!({
+                    "after": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Le `next_after` de la page précédente. Absent, on commence au début."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": "Nombre de lignes. 50 par défaut, borné à 200."
+                    }
+                }),
+                &[],
+            ),
+            query: &["after", "limit"],
             raw_body: None,
             risk: Risk::Read,
         },
@@ -119,7 +158,9 @@ pub fn tools() -> Vec<ToolDef> {
                  seule façon de voir un en-tête de travers avant d'avoir importé la moitié d'un \
                  fichier. Le segment doit venir de `prospects_segments_list`. Un second import du \
                  même fichier ne duplique rien : un compte est son domaine, un contact son \
-                 adresse. Corps plafonné à 1 Mio comme toute requête de cette API.",
+                 adresse. Corps plafonné à 1 Mio comme toute requête de cette API. **Le rapport ne \
+                 rend aucun identifiant** : les contacts créés se relisent sur `contacts_list`, \
+                 qui est la seule source du `contact_id` que `sequences_enroll` réclame.",
             method: Method::Post,
             path: "/v1/prospects/import",
             schema: json!({
@@ -317,9 +358,9 @@ pub fn tools() -> Vec<ToolDef> {
                  `suppressed` si l'adresse a demandé qu'on la laisse tranquille, en 409 si le \
                  contact est déjà inscrit, en 404 si la séquence, le contact ou le siège \
                  n'appartiennent pas à cette entreprise. L'`id` vient de `sequences_list`, le \
-                 `contact_id` d'un import fait par `prospects_import`, et l'`employee_id` \
-                 d'`employees_list` ; où en est l'inscrit ensuite se lit sur \
-                 `sequences_runs_list`.",
+                 `contact_id` de `contacts_list` — **et de nulle part ailleurs** : un import rend \
+                 des compteurs, pas des identifiants —, et l'`employee_id` d'`employees_list` ; \
+                 où en est l'inscrit ensuite se lit sur `sequences_runs_list`.",
             method: Method::Post,
             path: "/v1/sequences/{id}/enroll",
             schema: schema(

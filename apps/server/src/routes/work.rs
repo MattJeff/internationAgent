@@ -163,7 +163,7 @@ async fn board(State(db): State<Db>, principal: Principal) -> Result<Response, A
 async fn post(
     State(db): State<Db>,
     principal: Principal,
-    Json(body): Json<NewItem>,
+    crate::error::JsonBody(body): crate::error::JsonBody<NewItem>,
 ) -> Result<Response, ApiError> {
     let title = body.title.trim();
     // Both ends of `work_items_title_shape`, and it has to be both. Refusing
@@ -201,7 +201,7 @@ async fn amend(
     State(db): State<Db>,
     principal: Principal,
     Path(id): Path<Uuid>,
-    Json(body): Json<Amendment>,
+    crate::error::JsonBody(body): crate::error::JsonBody<Amendment>,
 ) -> Result<Response, ApiError> {
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
     let item = backlog::amend(

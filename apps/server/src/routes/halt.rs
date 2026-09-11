@@ -259,7 +259,7 @@ async fn status(State(db): State<Db>, principal: Principal) -> Result<Response, 
 async fn place(
     State(db): State<Db>,
     principal: Principal,
-    Json(body): Json<HaltRequest>,
+    crate::error::JsonBody(body): crate::error::JsonBody<HaltRequest>,
 ) -> Result<Response, ApiError> {
     let reason = body.reason.trim();
     if reason.is_empty() {
@@ -483,7 +483,7 @@ pub(crate) fn must_end_in_the_future(
 async fn set_window(
     State(db): State<Db>,
     principal: Principal,
-    Json(body): Json<WindowRequest>,
+    crate::error::JsonBody(body): crate::error::JsonBody<WindowRequest>,
 ) -> Result<Response, ApiError> {
     let now = Utc::now();
     must_end_in_the_future(body.ends_at, now)?;
