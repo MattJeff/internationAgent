@@ -693,9 +693,16 @@ mod tests {
         let Some(db) = db().await else { return };
         let t = tenant(&db, "roles").await;
         let founder_email = email("fondatrice");
-        let founder = create(&db, Uuid::now_v7(), t, &founder_email, &digest(), Utc::now())
-            .await
-            .expect("la fondatrice");
+        let founder = create(
+            &db,
+            Uuid::now_v7(),
+            t,
+            &founder_email,
+            &digest(),
+            Utc::now(),
+        )
+        .await
+        .expect("la fondatrice");
         assert_eq!(founder.role, ConsoleRole::Owner, "la première personne");
 
         let intern_email = email("stagiaire");
@@ -708,7 +715,10 @@ mod tests {
             "la deuxième personne n'arrive pas propriétaire"
         );
 
-        assert_eq!(role_of(&db, intern.id).await.expect("lu"), Some(ConsoleRole::Member));
+        assert_eq!(
+            role_of(&db, intern.id).await.expect("lu"),
+            Some(ConsoleRole::Member)
+        );
         assert_eq!(role_of(&db, Uuid::now_v7()).await.expect("lu"), None);
 
         // Rétrograder la seule propriétaire fermerait le locataire à clé.
@@ -718,7 +728,10 @@ mod tests {
                 .expect("refus"),
             RoleChange::WouldLeaveNoOwner
         );
-        assert_eq!(role_of(&db, founder.id).await.expect("lu"), Some(ConsoleRole::Owner));
+        assert_eq!(
+            role_of(&db, founder.id).await.expect("lu"),
+            Some(ConsoleRole::Owner)
+        );
 
         // Promue, elle peut l'être : il y a alors deux propriétaires, et la
         // première peut redescendre.
@@ -726,14 +739,20 @@ mod tests {
             .await
             .expect("promotion");
         assert!(matches!(promoted, RoleChange::Changed(ref who) if who.role == ConsoleRole::Owner));
-        assert_eq!(role_of(&db, intern.id).await.expect("lu"), Some(ConsoleRole::Owner));
+        assert_eq!(
+            role_of(&db, intern.id).await.expect("lu"),
+            Some(ConsoleRole::Owner)
+        );
         assert!(matches!(
             set_role(&db, t, &founder_email, ConsoleRole::Member)
                 .await
                 .expect("rétrogradation"),
             RoleChange::Changed(_)
         ));
-        assert_eq!(role_of(&db, founder.id).await.expect("lu"), Some(ConsoleRole::Member));
+        assert_eq!(
+            role_of(&db, founder.id).await.expect("lu"),
+            Some(ConsoleRole::Member)
+        );
 
         // L'adresse est unique sur tout le déploiement : un propriétaire qui
         // nomme celle d'un autre client ne trouve personne, il n'écrit pas

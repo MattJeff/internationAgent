@@ -657,6 +657,13 @@ async fn create_account(
             "tenant_id": account.tenant_id.as_uuid(),
             "email": account.email,
             "created_at": account.created_at,
+            // Rendu, et jamais pris dans le corps : c'est la table qui décide
+            // (`accounts::create`, la première personne d'un locataire est
+            // propriétaire et les suivantes ne le sont pas), et le fournisseur
+            // lit ici ce qu'il vient de créer plutôt que de le supposer. Le
+            // changer est un geste du client, pas du fournisseur :
+            // `PUT /v1/console/accounts/role`.
+            "role": account.role.as_str(),
         })),
     )
         .into_response())

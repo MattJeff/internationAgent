@@ -574,11 +574,7 @@ fn not_the_owner() -> Response {
 /// rétrograder couperait l'intégration de chaque client le jour du déploiement.
 /// C'est le même argument que le `DEFAULT 'owner'` de la migration, une couche
 /// plus haut : une politique se resserre depuis un état qui marche.
-pub async fn require_console_role(
-    State(db): State<Db>,
-    req: Request,
-    next: Next,
-) -> Response {
+pub async fn require_console_role(State(db): State<Db>, req: Request, next: Next) -> Response {
     let matched = req
         .extensions()
         .get::<axum::extract::MatchedPath>()
