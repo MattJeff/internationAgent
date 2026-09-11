@@ -736,6 +736,14 @@ fn app(
     let api = with_api_stack(
         Router::new()
             .route("/v1/whoami", get(whoami))
+            // `with_state` ici et pas en bas de la chaîne : les routeurs qu'on
+            // fusionne ensuite portent déjà le leur, et `merge` exige deux
+            // routeurs du même état. Celui-ci doit donc être refermé avant.
+            .with_state(db.clone())
+            // Donner le rôle de console à quelqu'un. Sur cet étage parce que
+            // c'est un verbe de locataire, et pas dans `platform` parce que
+            // c'est au client de répartir ses humains, pas au fournisseur.
+            .merge(routes::accounts::console_router(db.clone()))
             // La clé que le locataire émet pour lui-même, et la seule chose de
             // cet étage qui rende un secret. Dans `with_api_stack` et pas à
             // côté de `platform` : le locataire vient du credential, donc il
@@ -2785,12 +2793,19 @@ fn with_outer_stack(router: Router) -> Router {
     )
 }
 
-/// auth → rate limit → idempotency. Everything that needs to know who is
+/// auth → rôle → rate limit → idempotency. Everything that needs to know who is
 /// calling, in the order it can know it.
+///
+/// Le rôle juste sous l'authentification, et avant les deux autres, pour deux
+/// raisons : il ne peut pas être au-dessus (il lit le [`auth::Principal`] que la
+/// couche du dessus pose), et un geste refusé ne doit consommer ni un jeton du
+/// seau de débit ni une clé d'idempotence — sans quoi rejouer la même clé après
+/// avoir obtenu le rôle rendrait le refus mis en cache.
 fn with_api_stack(router: Router, db: Db, keys: Keyring) -> Router {
     router.layer(
         ServiceBuilder::new()
             .layer(from_fn_with_state(keys, auth::require_api_key))
+            .layer(from_fn_with_state(db.clone(), auth::require_console_role))
             .layer(from_fn_with_state(RateLimiter::default(), rate_limit))
             .layer(from_fn_with_state(db, replay_idempotent)),
     )
@@ -2812,11 +2827,27 @@ fn with_platform_stack(router: Router, keys: auth::PlatformKeys) -> Router {
 /// operator confirms a newly issued key works, and it is the assertion that
 /// the tenant a caller acts as comes from the credential — nothing in the
 /// request can change this answer.
-async fn whoami(principal: Principal) -> Json<Value> {
-    Json(json!({
+///
+/// `console_role` est la troisième ligne depuis le 2026-09-11, et elle a une
+/// raison précise : c'est la seule façon pour la console de savoir ce qu'elle
+/// doit griser. Sans elle, un membre découvre son rôle en cliquant sur « arrêter
+/// l'entreprise » et en lisant un 403 — le refus explique, mais un bouton qu'on
+/// n'aurait jamais dû pouvoir presser est une mauvaise façon d'apprendre une
+/// règle. Lue à chaque appel plutôt que rendue à la connexion : un rôle donné
+/// se voit au prochain rafraîchissement, pas à la prochaine ouverture de
+/// session.
+///
+/// `null` pour un credential qui n'est pas une session de console — une clé
+/// d'intégration, une clé de l'environnement. Ce n'est pas « aucun droit »,
+/// c'est « la question ne se pose pas » : `auth::require_console_role` les
+/// laisse toutes passer.
+async fn whoami(State(db): State<Db>, principal: Principal) -> Result<Json<Value>, ApiError> {
+    let role = auth::console_role_of(&db, &principal).await?;
+    Ok(Json(json!({
         "tenant_id": principal.tenant_id.as_uuid().to_string(),
         "actor": principal.actor.label(),
-    }))
+        "console_role": role.map(agentos_store::accounts::ConsoleRole::as_str),
+    })))
 }
 
 // ---------------------------------------------------------------------------

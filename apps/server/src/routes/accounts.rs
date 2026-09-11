@@ -134,6 +134,7 @@
 //! qui, une adresse à la fois.
 
 use agentos_store::accounts;
+use agentos_store::accounts::ConsoleRole;
 use agentos_store::api_keys::{SESSION_LABEL_PREFIX, session_label};
 use agentos_store::audit::AuditActor;
 use agentos_store::db::Db;
@@ -142,13 +143,13 @@ use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{post, put};
 use axum::{Router, response::Result as AxumResult};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::auth::{normalise_email, verify_password_off_thread};
+use crate::auth::{Principal, normalise_email, verify_password_off_thread};
 use crate::error::ApiError;
 
 // ---------------------------------------------------------------------------
@@ -183,6 +184,27 @@ pub fn public_router(db: Db, hasher: agentos_app::api_keys::Hasher) -> Router {
             post(open_session).delete(close_session),
         )
         .with_state(AccountState { db, hasher })
+}
+
+/// Le geste qui donne un rôle, monté **dans `with_api_stack`**, lui.
+///
+/// Les trois verbes de ce fichier ne sont pas sur le même étage et c'est ce qui
+/// se lit le mieux ici : ouvrir et fermer une session sont les deux choses
+/// qu'on fait sans credential, donner un rôle est la seule qu'on ne fait qu'en
+/// en ayant un — et pas n'importe lequel. Aucune vérification de rôle n'est
+/// écrite dans ce module : `PUT` n'est pas dans `auth::MEMBER_WRITES`, donc la
+/// couche du dessus a déjà refusé tout ce qui n'est pas un propriétaire quand
+/// le gestionnaire ci-dessous démarre. C'est exactement ce que « un seul
+/// endroit décide » veut dire.
+///
+/// `/v1/console/…` plutôt que `/v1/accounts/…` : le second préfixe est
+/// l'étage public, et `mcp_tools` le range dans `NOT_A_TENANT_VERB` — « des
+/// identifiants, pas un verbe ». Celui-ci est un verbe de locataire, il a un
+/// outil, et il est là où le test de couverture sait le trouver.
+pub fn console_router(db: Db) -> Router {
+    Router::new()
+        .route("/v1/console/accounts/role", put(set_role))
+        .with_state(db)
 }
 
 /// Le seul refus que cette route sait prononcer sur un credential.
@@ -371,6 +393,96 @@ async fn close_session(
         Json(json!({ "key_id": principal.key_id, "closed": true })),
     )
         .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Donner le rôle
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetRoleRequest {
+    /// L'adresse avec laquelle la personne ouvre la console. Pas son `id` :
+    /// aucune route ne liste les personnes d'un locataire, donc un `id` serait
+    /// un paramètre que l'appelant ne peut pas se procurer. Voir
+    /// `accounts::set_role`.
+    email: String,
+    /// `owner` ou `member`, et rien d'autre.
+    role: String,
+}
+
+/// `PUT /v1/console/accounts/role` — un propriétaire donne ou retire le rôle.
+///
+/// **Un rôle qu'on ne peut pas attribuer est un rôle inutile**, et c'est la
+/// moitié de ce chantier qui n'est pas un refus. Le locataire vient du
+/// credential, jamais du corps (`auth`, première phrase), donc ceci ne peut
+/// écrire que chez soi.
+///
+/// ponytail : pas de ligne d'`audit_log`. La trace est celle de `tracing`
+/// ci-dessous — qui a changé quoi, chez qui. Le plafond est connu : un client
+/// qui demandera « qui m'a rétrogradé, et quand » ne le trouvera pas dans
+/// `GET /v1/events`, et la montée est une variante d'`AuditKind` plus un
+/// `append` dans `accounts::set_role`, dans la transaction qui écrit déjà.
+async fn set_role(
+    State(db): State<Db>,
+    principal: Principal,
+    body: Result<Json<SetRoleRequest>, JsonRejection>,
+) -> AxumResult<Response, ApiError> {
+    let Json(request) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
+
+    let Some(role) = ConsoleRole::parse(request.role.trim()) else {
+        return Err(ApiError::bad_request(format!(
+            "role: {:?} n'est pas un rôle. Les deux sont `owner` — tout, y compris donner ce \
+             rôle — et `member`, tout ce qui n'engage ni l'argent ni l'existence de la société.",
+            request.role
+        )));
+    };
+
+    // Ici un 400 est juste, là où `open_session` en refuse un : cette route
+    // parle à quelqu'un qui est déjà authentifié et qui nomme l'adresse d'un
+    // tiers. Lui dire que ce qu'il a tapé n'est pas une adresse n'apprend rien
+    // à personne d'autre que lui.
+    let Some(email) = normalise_email(&request.email) else {
+        return Err(ApiError::bad_request(
+            "email: ce n'est pas une adresse de courriel",
+        ));
+    };
+
+    match accounts::set_role(&db, principal.tenant_id, &email, role).await? {
+        accounts::RoleChange::Changed(who) => {
+            tracing::info!(
+                tenant_id = %principal.tenant_id.as_uuid(),
+                account_id = %who.id,
+                role = role.as_str(),
+                by = %principal.actor.label(),
+                "console role set"
+            );
+            Ok((
+                StatusCode::OK,
+                // L'id et le rôle ; l'adresse est déjà celle que l'appelant a
+                // envoyée, et un corps qui la répète est un corps que la
+                // console recopie dans un journal.
+                Json(json!({ "account_id": who.id, "role": role.as_str() })),
+            )
+                .into_response())
+        }
+        accounts::RoleChange::NoSuchPerson => Err(ApiError::not_found().with_detail(
+            "Personne de cette adresse n'ouvre la console de ce locataire. Les comptes sont \
+             créés par le fournisseur (`POST /v1/platform/accounts`) : demandez-lui le compte \
+             avant de lui donner un rôle.",
+        )),
+        accounts::RoleChange::WouldLeaveNoOwner => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "last_owner",
+            "this tenant would be left with no owner",
+        )
+        .with_detail(
+            "C'est le dernier compte `owner` actif de ce locataire. Le rétrograder fermerait la \
+             société à clé de l'intérieur : plus personne pour arrêter l'entreprise, émettre une \
+             clé, ni rendre ce rôle — puisque le rendre demande de l'avoir. Donnez `owner` à \
+             quelqu'un d'autre d'abord.",
+        )),
+    }
 }
 
 #[cfg(test)]
