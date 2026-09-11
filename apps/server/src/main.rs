@@ -815,6 +815,12 @@ fn app(
             // was it stopped from doing"; this one answers the question nobody
             // had a route for on 2026-09-06 — "is it doing anything at all".
             .merge(routes::health::router(db.clone()))
+            // Et à côté de `health`, qui dit si l'entreprise pense : celle-ci
+            // dit si elle **avance**. Sept étapes tirées de sept tables, leurs
+            // taux de passage, la recette, le coût du modèle, et la cible que
+            // le fondateur a posée — la seule lecture qui réponde à « est-ce
+            // que j'y arrive ».
+            .merge(routes::growth::router(db.clone()))
             .merge(routes::accounting::router(db.clone()))
             .merge(routes::teams::router(hiring.clone()))
             .merge(routes::companies::router(hiring.clone()))
