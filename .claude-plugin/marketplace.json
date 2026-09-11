@@ -1,0 +1,16 @@
+{
+  "name": "siglair",
+  "owner": {
+    "name": "Siglair",
+    "url": "https://siglair.com"
+  },
+  "plugins": [
+    {
+      "name": "siglair",
+      "displayName": "Siglair — piloter sa société depuis le terminal",
+      "description": "Branche le serveur MCP de siglair.com et ajoute quatre gestes de fondateur : le point du jour, lancer une campagne, répondre aux demandes, embaucher.",
+      "source": "./plugin",
+      "tags": ["siglair", "mcp", "operations", "outreach"]
+    }
+  ]
+}
