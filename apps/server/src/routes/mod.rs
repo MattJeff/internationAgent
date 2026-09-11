@@ -21,6 +21,11 @@ pub mod browser;
 // The employee's half is `agentos_app::calendar` and `loops::initiative`.
 pub mod calendar;
 pub mod companies; // a whole company, standing, from one call
+// la boucle de citation : les questions qu'on veut gagner, ce qu'un moteur y
+// répond aujourd'hui, le brief qui en sort, et ce qu'on écrit pour y répondre.
+// Le seul verbe du produit qui sorte sur le web pour *mesurer* plutôt que pour
+// vendre — d'où l'`employee_id` dans le corps de la mesure.
+pub mod content;
 pub mod controls; // tâche K: ce qui borne chaque siège et le bouton d'arrêt, en une lecture
 // le fil: the person reads what landed on a seat's desk and writes back from it.
 // No table and no port — `0028`'s internal channel already is the thread; see
@@ -44,6 +49,7 @@ pub mod forecast;
 pub mod events;
 // la santé de la société : est-ce que ses employés pensent encore. Née du
 // 2026-09-06, quatre jours pendant lesquels tout le reste répondait vert.
+pub mod growth; // l'entonnoir de bout en bout, la cible chiffrée, et le verdict
 pub mod halt; // wave J: stop the whole company, and let it go again
 pub mod health;
 pub mod initiative;

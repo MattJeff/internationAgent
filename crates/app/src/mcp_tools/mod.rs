@@ -282,6 +282,8 @@ mod tests {
         "register",
         "publish",
         "record",
+        // aller constater dehors ce qu'on ne peut pas déduire de ses propres tables
+        "measure",
         "connect",
         "start",
         "resume",

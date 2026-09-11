@@ -15,6 +15,7 @@ pub mod browser_profile; // la langue, le fuseau et l'écran d'un employé, lus 
 pub mod browser_proxy; // l'adresse par laquelle les onglets d'un locataire sortent, scellée sous browser://<locataire>/proxy
 pub mod calendar; // le calendrier: the port a seat's diary is reached through, ours or the customer's
 pub mod catalog; // the connectors we wrote down, so a customer clicks instead of typing
+pub mod content; // la boucle de citation : les questions qu'on veut gagner, ce qu'un moteur répond aujourd'hui, et ce qu'il manque pour y être
 pub mod cookie_jar; // le pot de cookies d'un employé, scellé sous browser://<locataire>/<employé>
 pub mod deliverability; // la délivrabilité du contenu : un mail qui ressemble à du spam ne part pas
 pub mod effects; // U21

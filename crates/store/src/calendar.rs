@@ -579,6 +579,31 @@ mod tests {
     use super::*;
     use crate::db::Db;
 
+    /// Comme [`fixture`], mais **dans une base que ce test est seul à ouvrir**.
+    ///
+    /// Pour les deux tests qui appellent [`claim_due`], et pour eux seuls. Ce
+    /// sonneur-là ignore l'isolation — c'est son office, une seule boucle sonne
+    /// pour toutes les entreprises — et ne rend qu'**une ligne par entreprise,
+    /// huit au total**, les plus anciennes d'abord. Dans la base commune, deux
+    /// choses en découlent et aucune ne parle du produit : la ligne du test peut
+    /// tomber au-delà de la huitième si assez d'autres entreprises attendent au
+    /// même instant, et un test voisin qui sonne au même moment peut sonner
+    /// celle-ci à sa place. C'est ce qui a rendu
+    /// `a_follow_up_names_its_thread_and_a_reply_on_that_thread_settles_it`
+    /// rouge sur la suite entière et vert lancé seul, le 2026-09-11.
+    ///
+    /// Un suffixe **par test** et non un pour les deux : ils sonneraient
+    /// l'un pour l'autre, ce qui est précisément ce qu'on retire. La forme est
+    /// celle de `contention_db` vingt lignes plus bas, qui a été écrite pour la
+    /// même raison ; `calcontention` n'est pas réutilisable parce que ses deux
+    /// tests vident la base entre eux.
+    async fn fixture_alone(suffix: &str) -> Option<(Db, TenantId, TenantId)> {
+        let db = crate::db::private_db(suffix).await?;
+        let a = seed_tenant(&db).await;
+        let b = seed_tenant(&db).await;
+        Some((db, a, b))
+    }
+
     async fn fixture() -> Option<(Db, TenantId, TenantId)> {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!("SKIP: DATABASE_URL is unset; the diary needs a database");
@@ -908,7 +933,7 @@ mod tests {
     /// statement aborts the one it is in.
     #[tokio::test]
     async fn a_rung_promise_says_what_became_of_it_and_a_cancelled_one_cannot_be_dressed_as_kept() {
-        let Some((db, tenant, _)) = fixture().await else {
+        let Some((db, tenant, _)) = fixture_alone("caloutcome").await else {
             return;
         };
         let now = Utc::now().trunc_subsecs(6);
@@ -1574,7 +1599,7 @@ mod tests {
     /// it is chasing.
     #[tokio::test]
     async fn a_follow_up_names_its_thread_and_a_reply_on_that_thread_settles_it() {
-        let Some((db, tenant, other)) = fixture().await else {
+        let Some((db, tenant, other)) = fixture_alone("calringer").await else {
             return;
         };
         let ada = seed_employee(&db, tenant, "ada-chase").await;
