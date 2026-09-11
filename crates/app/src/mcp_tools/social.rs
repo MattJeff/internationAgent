@@ -22,7 +22,7 @@
 //!    publier au nom de l'entreprise n'est pas une chose qu'on branche par
 //!    accident.
 //!
-//! Puis `social_account_connect_url` par compte, une fois, et un humain ouvre
+//! Puis `social_connect_url_get` par compte, une fois, et un humain ouvre
 //! l'URL. Les comptes développeur, eux, restent au fondateur — `docs/SOCIAL.md`,
 //! § « Les revues d'app ».
 //!
@@ -146,7 +146,7 @@ pub fn tools() -> Vec<ToolDef> {
             json!({
                 "type": "array",
                 "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-                "description": "Les empreintes rendues par `social_post_preview`. Le service \
+                "description": "Les empreintes rendues par `social_post_preview_get`. Le service \
                                 compare terme à terme les octets qu'il vient de télécharger à \
                                 ceux contresignés et refuse (`media_change`) AVANT de \
                                 consommer la clé d'idempotence — c'est ce qui empêche de \
@@ -168,7 +168,7 @@ pub fn tools() -> Vec<ToolDef> {
                           plateforme, handle, état — et le seul endroit d'où sort l'\
                           `account_id` que les trois outils suivants demandent. Premier appel \
                           de tout ce domaine : une liste vide veut dire qu'aucun compte n'a \
-                          encore été autorisé, et `social_account_connect_url` est l'étape \
+                          encore été autorisé, et `social_connect_url_get` est l'étape \
                           d'après. Un 404 `no_social_binding` veut dire autre chose — que \
                           l'agrégateur lui-même n'est pas branché, ce qui se répare avec \
                           `integrations_connect` et non ici.",
@@ -180,7 +180,7 @@ pub fn tools() -> Vec<ToolDef> {
             risk: Risk::Read,
         },
         ToolDef {
-            name: "social_account_connect_url",
+            name: "social_connect_url_get",
             title: "L'URL d'autorisation d'un compte social",
             description: "Rend l'URL OAuth qu'un HUMAIN doit ouvrir pour autoriser un compte \
                           sur une plateforme ; le retour se fait tout seul sur le callback du \
@@ -210,7 +210,7 @@ pub fn tools() -> Vec<ToolDef> {
             risk: Risk::Write,
         },
         ToolDef {
-            name: "social_post_preview",
+            name: "social_post_preview_get",
             title: "Ce qui partirait, au caractère et à l'octet près",
             description: "Le contenu EXACT qui serait publié — texte rendu, médias téléchargés \
                           avec l'empreinte SHA-256 de leurs octets, verdict des limites de la \
@@ -242,7 +242,7 @@ pub fn tools() -> Vec<ToolDef> {
             description: "Publie sur le compte nommé. `idempotency_key` est OBLIGATOIRE et \
                           rejouer la même clé rend le même post sans republier — un tour \
                           retenté ne double-poste pas. Passer les `expected_media_digests` \
-                          d'un `social_post_preview` refuse (`media_change`) si les octets ne \
+                          d'un `social_post_preview_get` refuse (`media_change`) si les octets ne \
                           sont plus ceux qui ont été contresignés, avant de consommer la clé. \
                           Ce qui part est public et engage l'entreprise : c'est le seul outil \
                           de ce domaine qu'on ne rejoue pas pour voir.",

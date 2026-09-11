@@ -462,8 +462,8 @@ la dernière ligne** :
 | 2 | Brancher l'agrégateur sous le handle **`social`** | `integrations_connect` (`connector: "custom"`, l'URL du service, le jeton) |
 | 3 | Lire sa table et ses empreintes | `integrations_discover` |
 | 4 | Épingler chaque outil au digest lu | `integrations_declare_tool` (`risk: "write"`) |
-| 5 | Autoriser un compte de plateforme | `social_account_connect_url`, puis un humain ouvre l'URL |
-| 6 | Publier | `social_post_preview` → `social_post_publish` |
+| 5 | Autoriser un compte de plateforme | `social_connect_url_get`, puis un humain ouvre l'URL |
+| 6 | Publier | `social_post_preview_get` → `social_post_publish` |
 
 Les étapes 2 à 4 sont la machinerie MCP du produit, telle quelle : la
 vérification d'adresse au bind, le credential scellé, le pin SHA-256 par outil,
@@ -479,8 +479,8 @@ route (`docs/OPERATIONS.md` § 1.4i) :
 | Outil | Route | Risque |
 |---|---|---|
 | `social_accounts_list` | `GET /v1/social/accounts` | `read` |
-| `social_account_connect_url` | `POST /v1/social/accounts/connect` | `write` |
-| `social_post_preview` | `POST /v1/social/preview` | `read` |
+| `social_connect_url_get` | `POST /v1/social/accounts/connect` | `write` |
+| `social_post_preview_get` | `POST /v1/social/preview` | `read` |
 | `social_post_publish` | `POST /v1/social/posts` | `destructive` |
 | `social_posts_list` | `GET /v1/social/posts` | `read` |
 
