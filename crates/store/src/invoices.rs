@@ -464,26 +464,56 @@ pub async fn declare_paid(
 /// opposite order to the numbers they were given. The run is the order the
 /// customer's copies are in, and it needs no tie-break because it is unique.
 ///
-/// ponytail: no pagination, no window, and no `outstanding()` beside it. A
-/// register is a thing a human reads; add the filter the day one has enough rows
-/// for the scan to show up in a plan — `invoices_outstanding_idx` is already
-/// there for it.
-pub async fn register(tx: &mut TenantTx<'_>) -> Result<Vec<Invoice>, StoreError> {
+/// # The window, and why it stopped being optional
+///
+/// This returned the whole table until 2026-09-11, under a `ponytail:` note
+/// saying to add the window the day somebody had enough rows for the scan to
+/// show up in a plan. The day arrived from the other end: `GET /v1/invoices` is
+/// an MCP tool, so an unwindowed register is poured into a model's context *in
+/// full, on every call* — a year of documents and their lines, re-read at every
+/// turn. The cost that forced this is tokens, not the scan.
+///
+/// The cursor is the **number** and not the id, because the number is the order:
+/// it is unique, gap-free and already the tie-break-free `ORDER BY` above.
+/// [`outstanding`] is beside this rather than summed from a page, because a
+/// total computed over one page would be a wrong number wearing the right name.
+pub async fn register(
+    tx: &mut TenantTx<'_>,
+    state: Option<State>,
+    after: Option<i64>,
+    limit: i64,
+) -> Result<Vec<Invoice>, StoreError> {
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM invoices ORDER BY number ASC"
+        // A `CASE` over a bound parameter rather than a WHERE built per filter:
+        // the statement stays one compile-time constant, so nothing a caller
+        // sends reaches the SQL text.
+        "SELECT {COLUMNS} FROM invoices \
+          WHERE CASE $1::text \
+                  WHEN 'outstanding' THEN paid_at IS NULL AND corrects_invoice_id IS NULL \
+                  WHEN 'paid'        THEN paid_at IS NOT NULL \
+                  ELSE TRUE \
+                END \
+            AND ($2::bigint IS NULL OR number > $2) \
+          ORDER BY number ASC \
+          LIMIT $3"
     )))
+    .bind(state.map(State::as_str))
+    .bind(after)
+    .bind(limit)
     .fetch_all(&mut ***tx)
     .await?;
 
-    // Every line of every document this company holds, in one statement rather
-    // than one per invoice: RLS already scopes it to the tenant, and the
-    // register is read whole or not at all.
+    // The lines of *this page's* documents, in one statement rather than one per
+    // invoice. `= ANY($1)` and not the whole table: RLS scopes it to the tenant
+    // either way, but a page of fifty invoices has no use for a year of lines.
+    let ids: Vec<uuid::Uuid> = rows.iter().map(|row| row.get("id")).collect();
     let mut lines: std::collections::HashMap<uuid::Uuid, Vec<Line>> =
         std::collections::HashMap::new();
     for row in sqlx::query(
         "SELECT invoice_id, description, amount_minor, tax_rate_bp \
-           FROM invoice_lines ORDER BY invoice_id, position",
+           FROM invoice_lines WHERE invoice_id = ANY($1) ORDER BY invoice_id, position",
     )
+    .bind(&ids)
     .fetch_all(&mut ***tx)
     .await?
     .iter()
@@ -500,6 +530,128 @@ pub async fn register(tx: &mut TenantTx<'_>) -> Result<Vec<Invoice>, StoreError>
             row_of(row, lines.remove(&id).unwrap_or_default())
         })
         .collect()
+}
+
+/// Which slice of the register [`register`] hands back.
+///
+/// Two values and not four, because two is what the register is read for: what
+/// is still owed, and what came in. A credit note is neither — it is the
+/// *correction* of one of the two — so it appears under no filter and only in
+/// the unfiltered register, which is the one place that can show it beside the
+/// document it withdraws from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    /// Issued, unsettled, and not itself a credit note: the rows [`outstanding`]
+    /// sums. **Gross**, not net of its credit notes — the total is the place
+    /// that nets, and a list that hid a partly-credited invoice would hide the
+    /// document somebody has to chase.
+    Outstanding,
+    /// Somebody declared the money arrived.
+    Paid,
+}
+
+impl State {
+    /// The wire spelling, and the one [`register`] binds.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            State::Outstanding => "outstanding",
+            State::Paid => "paid",
+        }
+    }
+
+    /// The wire spelling back, so a route does not keep a second copy of the two
+    /// words that is free to drift from this one.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        [State::Outstanding, State::Paid]
+            .into_iter()
+            .find(|state| state.as_str() == text)
+    }
+}
+
+/// What this company is still owed, **per currency and over the whole
+/// register** — never over a page.
+///
+/// A sum per currency and not one number, because there is no exchange rate in
+/// this workspace and there must not be one: the same refusal `SpendLimits`
+/// makes by rejecting mixed currencies outright.
+///
+/// It reads the money columns of every invoice and none of the lines, which is
+/// what lets it stay whole-register while [`register`] pages: the expensive half
+/// of a document is its lines and its memo, and this needs neither.
+///
+/// The netting lives here rather than in the route that renders it, because
+/// there is exactly one rule about which figure is owed and it should have
+/// exactly one home. Three things are left out of both sides, each for its own
+/// reason: a credit note is owed by nobody, a settled invoice is owed no more,
+/// and a credit note against an invoice that was **already paid** is a refund
+/// this company owes its customer — which this register does not track and does
+/// not pretend to.
+///
+/// ponytail: a full scan of the money columns per call. The upgrade, the day a
+/// tenant's register is long enough for it to show in a plan, is a materialised
+/// per-currency total maintained by the issuing transaction —
+/// `invoices_outstanding_idx` is already there for the scan in between.
+pub async fn outstanding(
+    tx: &mut TenantTx<'_>,
+) -> Result<std::collections::BTreeMap<&'static str, u64>, StoreError> {
+    /// One invoice's money columns, in [`outstanding`]'s select order: the id,
+    /// the document this one corrects, the currency, the amount, and whether it
+    /// has been settled. `routes::employees::SummaryRow`'s idiom — the tuple is
+    /// spelled once so the `SELECT` and the loop cannot disagree about it.
+    type Owed = (
+        uuid::Uuid,
+        Option<uuid::Uuid>,
+        String,
+        i64,
+        Option<DateTime<Utc>>,
+    );
+
+    let rows: Vec<Owed> = sqlx::query_as(
+        "SELECT id, corrects_invoice_id, currency, amount_minor, paid_at FROM invoices",
+    )
+    .fetch_all(&mut ***tx)
+    .await?;
+
+    // What each invoice has been credited. A credit note is a positive figure
+    // pointing at the invoice it withdraws from — see
+    // `migrations/0071_an_invoice_needs_a_number.sql` — and this is the one
+    // place in the product that applies the sign.
+    let mut credited: std::collections::HashMap<uuid::Uuid, u64> = std::collections::HashMap::new();
+    for (_, corrects, _, minor, _) in &rows {
+        if let Some(corrected) = corrects {
+            let entry = credited.entry(*corrected).or_default();
+            *entry = entry.saturating_add(minor.unsigned_abs());
+        }
+    }
+
+    let mut owed: std::collections::BTreeMap<&'static str, u64> = std::collections::BTreeMap::new();
+    for (id, corrects, code, minor, paid_at) in &rows {
+        if corrects.is_some() || paid_at.is_some() {
+            continue;
+        }
+        let left = minor
+            .unsigned_abs()
+            .saturating_sub(credited.get(id).copied().unwrap_or_default());
+        if left == 0 {
+            continue;
+        }
+        // `row_of`'s refusal, and for its reason: the CHECK admits any three
+        // capitals and `Currency` is a closed enum, so a row written from a
+        // psql prompt in a currency this build has never heard of is a
+        // conflict rather than a total quietly filed under the wrong code.
+        let currency: Currency = code.parse().map_err(|_| {
+            StoreError::conflict(format!("invoice currency {code:?} is not one of ours"))
+        })?;
+        // Saturating, and it is not laziness: the alternative is a 500 on a
+        // read, and a register that refuses to display itself because the total
+        // overflowed a u64 is worse than a total that is visibly wrong. Nothing
+        // branches on this number.
+        let entry = owed.entry(currency.code()).or_default();
+        *entry = entry.saturating_add(left);
+    }
+    Ok(owed)
 }
 
 /// One document by id, with its lines. `None` is RLS's usual silence for "not
@@ -932,7 +1084,9 @@ mod tests {
         assert_eq!(issued.paid_at, None, "a fresh invoice is outstanding");
 
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let register = register(&mut tx).await.expect("read the register");
+        let register = register(&mut tx, None, None, 200)
+            .await
+            .expect("read the register");
         tx.rollback().await.expect("rollback");
         assert_eq!(register, vec![issued]);
     }
@@ -989,7 +1143,7 @@ mod tests {
                 .expect("declare again"),
             "a settlement is not re-dated"
         );
-        let register = register(&mut tx).await.expect("read");
+        let register = register(&mut tx, None, None, 200).await.expect("read");
         tx.rollback().await.expect("rollback");
         assert_eq!(
             register[0].paid_at.map(|at| at.timestamp_micros()),
@@ -1323,7 +1477,7 @@ mod tests {
         assert_eq!(issued.lines, lines);
 
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let register = register(&mut tx).await.expect("read");
+        let register = register(&mut tx, None, None, 200).await.expect("read");
         tx.rollback().await.expect("rollback");
         assert_eq!(
             register[0].lines, lines,
@@ -1436,7 +1590,7 @@ mod tests {
         );
 
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let register = register(&mut tx).await.expect("read");
+        let register = register(&mut tx, None, None, 200).await.expect("read");
         assert_eq!(
             register.len(),
             2,

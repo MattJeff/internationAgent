@@ -107,6 +107,14 @@ use crate::routes::webhooks::Webhooks;
 
 /// Largest request body we will read. Bigger than any control-plane payload
 /// and smaller than anything that could exhaust memory.
+///
+/// Three surfaces have complained about it in writing — the CSV import, the
+/// file deposit and desk attachments — so the answer is written down once,
+/// where an operator meets it: `docs/OPERATIONS.md` §1.4e³ says what the
+/// megabyte is worth through base64 (≈ 760 KiB of real file) and why it is not
+/// raised route by route. The short version is that [`with_outer_stack`] sits
+/// *outside* [`with_api_stack`], so this ceiling is what an **unauthenticated**
+/// caller can make this process allocate per connection.
 pub(crate) const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Wall clock a handler gets before the client is answered 408.

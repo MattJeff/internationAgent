@@ -550,16 +550,41 @@ pub fn tools() -> Vec<ToolDef> {
         ToolDef {
             name: "quotes_list",
             title: "Les devis proposés",
-            description: "Rend tous les devis de l'entreprise, le plus récent d'abord, versions \
-                 remplacées comprises (`supersedes_quote_id` reconstitue les chaînes), avec le \
-                 montant en unités mineures, la validité et la réponse du client. Il n'y a \
-                 volontairement aucun total : un devis n'est dû par personne, le carnet de \
-                 créances se lit sur `invoices_list` ; `expired` est calculé à la lecture, un \
-                 devis périmé ne peut plus être accepté.",
+            description: "Rend une page de devis, le plus récent d'abord, versions remplacées \
+                 comprises (`supersedes_quote_id` reconstitue les chaînes), avec le montant en \
+                 unités mineures, la validité et la réponse du client. **Filtre d'abord** : \
+                 `state` partitionne le registre en quatre — `open` (sans réponse et encore \
+                 acceptable), `lapsed` (sans réponse, validité écoulée : à réémettre, jamais à \
+                 antidater), `accepted`, `declined` — et sans `state` la page mélange les \
+                 quatre. La marche se fait avec `after` = le `next_after` rendu ; `next_after` \
+                 nul veut dire que la page était la dernière. Il n'y a volontairement aucun \
+                 total : un devis n'est dû par personne, le carnet de créances se lit sur \
+                 `invoices_list` ; `expired` sur une ligne est une question distincte de \
+                 `state`, un devis accepté à temps peut avoir expiré depuis.",
             method: Method::Get,
             path: "/v1/quotes",
-            schema: nothing(),
-            query: &[],
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "state": {
+                        "type": "string",
+                        "enum": ["open", "lapsed", "accepted", "declined"],
+                        "description": "La coupe. Absent : les quatre ensemble.",
+                    },
+                    "after": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Le `next_after` de la page précédente.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": "Défaut 50, maximum 200.",
+                    },
+                },
+            }),
+            query: &["state", "after", "limit"],
             raw_body: None,
             risk: Risk::Read,
         },
@@ -610,16 +635,41 @@ pub fn tools() -> Vec<ToolDef> {
         ToolDef {
             name: "invoices_list",
             title: "Le registre des factures",
-            description: "Rend toutes les factures et tous les avoirs de l'entreprise, la plus ancienne \
-                 d'abord, réglées et impayées ensemble, avec `outstanding_minor` **par devise** \
-                 (il n'y a pas de taux de change dans ce produit, et il ne doit pas y en avoir). \
-                 C'est la seule lecture du registre ; il n'existe aucun outil pour *émettre* une \
-                 facture, parce que seule une décision d'employé passée par la Policy Gate en \
-                 crée une.",
+            description: "Rend une page du registre, la plus ancienne d'abord, réglées et impayées \
+                 ensemble par défaut, avec `outstanding_minor` **par devise** (il n'y a pas de \
+                 taux de change dans ce produit, et il ne doit pas y en avoir). **Ce total est \
+                 celui du registre entier, jamais celui de la page** : il ne rétrécit pas quand \
+                 on pagine. `state=outstanding` répond à « qui relancer » (les factures \
+                 impayées, avoirs exclus, montant brut), `state=paid` à « qu'est-ce qui est \
+                 rentré » ; sans `state`, les deux et les avoirs avec elles — c'est la seule vue \
+                 qui montre un avoir à côté du document qu'il corrige. La marche se fait avec \
+                 `after` = le `next_after` rendu, qui est un **numéro de facture** et non un \
+                 UUID, parce que le numéro est l'ordre. C'est la seule lecture du registre ; il \
+                 n'existe aucun outil pour *émettre* une facture, parce que seule une décision \
+                 d'employé passée par la Policy Gate en crée une.",
             method: Method::Get,
             path: "/v1/invoices",
-            schema: nothing(),
-            query: &[],
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "state": {
+                        "type": "string",
+                        "enum": ["outstanding", "paid"],
+                        "description": "La coupe. Absent : tout le registre, avoirs compris.",
+                    },
+                    "after": {
+                        "type": "integer",
+                        "description": "Le `next_after` de la page précédente — un numéro de facture.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": "Défaut 50, maximum 200.",
+                    },
+                },
+            }),
+            query: &["state", "after", "limit"],
             raw_body: None,
             risk: Risk::Read,
         },
@@ -1301,6 +1351,11 @@ mod tests {
             "outreach_health",
             "billing_read",
             "forecast_read",
+            // Arrivés ici le 2026-09-11, depuis la liste des lectures sans
+            // entrée d'en dessous : sans fenêtre, ces deux-là versaient un
+            // registre entier dans le contexte d'un modèle à chaque appel.
+            "quotes_list",
+            "invoices_list",
         ] {
             let tool = find(name);
             assert_eq!(tool.method, Method::Get, "{name}");
@@ -1333,8 +1388,6 @@ mod tests {
             "sequences_list",
             "domain_get",
             "domain_list",
-            "quotes_list",
-            "invoices_list",
             "invoices_issuer_get",
         ] {
             let tool = find(name);

@@ -5571,7 +5571,7 @@ mod tests {
             .expect("a won deal is invoiceable");
 
         let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
-        let register = agentos_store::invoices::register(&mut tx)
+        let register = agentos_store::invoices::register(&mut tx, None, None, 200)
             .await
             .expect("read the register");
         tx.rollback().await.expect("rollback");
@@ -5826,7 +5826,7 @@ mod tests {
         assert_eq!(err.code(), ISSUER_MENTIONS_MISSING);
 
         let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
-        let register = agentos_store::invoices::register(&mut tx)
+        let register = agentos_store::invoices::register(&mut tx, None, None, 200)
             .await
             .expect("read the register");
         tx.rollback().await.expect("rollback");
@@ -5859,7 +5859,7 @@ mod tests {
         assert_eq!(err.code(), NO_WON_DEAL);
 
         let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
-        let register = agentos_store::invoices::register(&mut tx)
+        let register = agentos_store::invoices::register(&mut tx, None, None, 200)
             .await
             .expect("read the register");
         tx.rollback().await.expect("rollback");

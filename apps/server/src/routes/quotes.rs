@@ -55,12 +55,13 @@ use agentos_domain::revenue::QuoteId;
 use agentos_store::audit::{self, AuditEvent, AuditKind};
 use agentos_store::db::Db;
 use agentos_store::quotes;
-use axum::extract::{Path, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -151,32 +152,102 @@ impl QuoteView {
     }
 }
 
-/// `GET /v1/quotes` — tout ce que cette entreprise a proposé, le plus récent
-/// d'abord.
+/// La taille d'une page quand l'appelant n'en demande pas. Le chiffre de
+/// `routes::employees`, et son argument : ce qu'on fait défiler une fois.
+const DEFAULT_LIMIT: i64 = 50;
+
+/// La plus grande page qu'on construise, quel que soit le `limit` demandé.
 ///
-/// Les versions remplacées comprises, et sans filtre, pour la raison de
-/// `GET /v1/invoices` : la question qu'on ouvre ceci pour poser n'est pas « quel
-/// est le prix » — c'est « qu'est-ce qu'on leur a proposé, et qu'est-ce qu'ils
-/// ont dit ». Une liste qui cacherait les versions mortes répondrait à la
-/// première question deux fois et à la seconde pas du tout ;
+/// Deux cents, et le plafond n'est pas celui de la base : le premier lecteur de
+/// cette route est un outil MCP, donc une page est un contexte de modèle. Un
+/// devis et ses lignes coûtent quelques centaines de jetons, et deux cents
+/// devis sont déjà l'essentiel de ce qu'un tour peut dépenser sur un appel.
+const MAX_LIMIT: i64 = 200;
+
+/// La fenêtre et la coupe. `deny_unknown_fields` parce qu'un `state` mal
+/// orthographié ne doit pas passer pour « pas de filtre » : la mauvaise réponse
+/// serait une liste **plus longue** qui a l'air juste.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Page {
+    /// `open`, `lapsed`, `accepted` ou `declined` — voir `quotes::State`, qui
+    /// possède les quatre mots et argumente pourquoi ils partitionnent.
+    #[serde(default)]
+    state: Option<String>,
+    /// Le dernier `id` de la page précédente.
+    #[serde(default)]
+    after: Option<Uuid>,
+    /// Combien de devis rendre, plafonné à [`MAX_LIMIT`].
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// `GET /v1/quotes` — une page de ce que cette entreprise a proposé, le plus
+/// récent d'abord.
+///
+/// Les versions remplacées comprises, et sans filtre **par défaut**, pour la
+/// raison de `GET /v1/invoices` : la question qu'on ouvre ceci pour poser n'est
+/// pas « quel est le prix » — c'est « qu'est-ce qu'on leur a proposé, et
+/// qu'est-ce qu'ils ont dit ». Une liste qui cacherait les versions mortes
+/// répondrait à la première question deux fois et à la seconde pas du tout ;
 /// `supersedes_quote_id` est là pour que le lecteur reconstitue les chaînes.
+/// `state` est le choix de l'appelant, pas l'avis de cette route.
 ///
 /// `outstanding_minor` n'existe pas ici, et c'est délibéré : un devis n'est dû
 /// par personne. Additionner des offres donnerait un chiffre qui ressemble à un
 /// carnet de commandes et qui n'en est pas un — une offre non acceptée n'est pas
 /// une créance, et une acceptée n'en est pas une non plus tant qu'elle n'est pas
-/// facturée. `GET /v1/invoices` est l'endroit où ce total a un sens.
-async fn register(State(db): State<Db>, principal: Principal) -> Result<Response, ApiError> {
+/// facturée. `GET /v1/invoices` est l'endroit où ce total a un sens. **Et c'est
+/// aussi pourquoi la pagination est sans danger ici** : il n'y a aucun total à
+/// rétrécir avec la page.
+///
+/// `limit` est ramené dans les bornes plutôt que refusé, le choix de
+/// `routes::employees` : une demande trop grande reçoit quand même une page et
+/// un `next_after`, donc rien n'est perdu. Un `limit` qui n'est pas un nombre
+/// reste un 400 — celui de serde, et c'est le refus utile.
+async fn register(
+    State(db): State<Db>,
+    principal: Principal,
+    page: Result<Query<Page>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(page) = page.map_err(|err| ApiError::bad_request(err.body_text()))?;
+    let state = match page.state.as_deref() {
+        None => None,
+        Some(text) => Some(quotes::State::parse(text).ok_or_else(|| {
+            ApiError::bad_request(
+                "state: one of \"open\", \"lapsed\", \"accepted\", \"declined\", or absent for all",
+            )
+        })?),
+    };
+    let limit = page.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+
+    // Une seule horloge pour la page : celle qui décide `lapsed` en SQL est
+    // celle qui calcule `expired` ci-dessous, sinon une ligne rendue par le
+    // filtre pourrait se faire contredire par son propre champ.
     let now = Utc::now();
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
-    let all = quotes::register(&mut tx).await?;
+    let all = quotes::register(
+        &mut tx,
+        state,
+        page.after.map(QuoteId::from_uuid),
+        limit,
+        now,
+    )
+    .await?;
     tx.rollback().await?;
+
+    // Seule une page pleine peut avoir une suite. Une page courte termine la
+    // marche sans coûter un aller-retour de plus pour l'apprendre.
+    let next_after = (all.len() as i64 == limit)
+        .then(|| all.last().map(|last| last.id.as_uuid()))
+        .flatten();
 
     Ok(Json(json!({
         "quotes": all
             .into_iter()
             .map(|quote| QuoteView::of(quote, now))
             .collect::<Vec<_>>(),
+        "next_after": next_after,
     }))
     .into_response())
 }

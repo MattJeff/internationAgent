@@ -326,6 +326,36 @@ What to know:
   another company's file reads identically. Six names is a 400. The message
   is not written in either case.
 
+### 1.4e³ The body limit, said once
+
+**Every route of `/v1` refuses a request body over 1 MiB with a `413`.** One
+number, one layer (`RequestBodyLimitLayer` in `apps/server/src/main.rs`), no
+per-route exception — including the three surfaces above that push hardest
+against it:
+
+| Surface | What 1 MiB is worth there |
+|---|---|
+| `POST /v1/prospects/import` | raw CSV, so the full megabyte. The largest list on file is 141 KB |
+| `POST /v1/files` | the content is **base64 inside JSON**, so ≈ **760 KiB** of real file — base64 costs a third, and the JSON envelope and the escaping take the rest |
+| `POST /v1/employees/{chair}/desk` | attachments are names, not bytes, so the limit here is the *deposit* above and never the message |
+
+**Why it is not raised route by route**, which is the request that keeps
+arriving: the limit is not about what Postgres can hold, it is about what a
+request may cost before anybody has been authenticated. The layer sits *above*
+the key check — it has to, or a body has already been read into memory by the
+time we know who sent it — so every byte of the ceiling is a byte an anonymous
+caller can make this process allocate, on every concurrent connection. A limit
+raised for one route is raised for that route's unauthenticated traffic too,
+and "10 MiB, but only for the CSV" is not a thing a tower layer can say without
+becoming a second place where the number lives.
+
+So the answer to "my file is too big" is not a bigger number. It is the upload
+this API does not have yet and would need for a real one: a presigned deposit
+straight to object storage, with the API carrying the *handle* rather than the
+bytes — which is the same shape `desk` already uses for attachments, one layer
+down. Until somebody needs it, splitting a 3 MB list into three is cheaper than
+building it.
+
 ### 1.4f The sending domains — the tenant's, verified before a seat writes, each under a daily cap
 
 Every employee address is `slug@domain`, and a domain is a row of the
@@ -658,6 +688,46 @@ no connection.
 
 Honour `PGHOST` / `PGPORT` / `PGUSER` / `PGPASSWORD`; it defaults to
 `localhost:5442` with `postgres`/`postgres`.
+
+#### When a test is red here and green in CI, look at the derived databases first
+
+A handful of tests need a database **nobody else is in**, because what they
+arrange is a row there is only one of per deployment — the platform policy
+ceiling (`tenant_id IS NULL`), or a schema function they drop on purpose. They
+take one by deriving a name from `DATABASE_URL`: `<db>_gateceiling`,
+`<db>_no_suppression_fn`, `<db>_outbox`, `<db>_platformpolicy`, and a dozen
+more. **`scripts/test.sh` collects only the ones under its own `ci_…_<run id>`
+prefix**, so a database derived from a hand-set `DATABASE_URL` survives the run,
+the day, and the checkout — and CI, which starts from an empty container, never
+sees what it accumulated.
+
+So a test that is red here and green there is asking about its derived database
+before it is asking about the code. The two questions worth one round trip each:
+
+```bash
+DB=agent_catalogue   # whatever the last path segment of DATABASE_URL is
+
+# Did a run die between a DROP and its restore? A missing function here is a
+# database that will fail its own arrangement for good, run after run.
+psql -d "${DB}_no_suppression_fn" -tAc \
+  "SELECT count(*) FROM pg_proc WHERE proname = 'revenue_suppression_of'"   # want 1
+
+# How far behind is it? A derived database is migrated on use, never rebuilt.
+psql -d "${DB}_gateceiling" -tAc "SELECT count(*) FROM _sqlx_migrations"
+```
+
+`DROP DATABASE … WITH (FORCE)` on the derived name is always safe: the next run
+recreates and migrates it.
+
+**Measured on 2026-09-11** against the two tests that were reported as
+diverging, `gate::tests::a_deployment_with_no_platform_layer_refuses_everything`
+and `gate::tests::a_suppression_list_that_will_not_answer_refuses_the_send`:
+both pass on Homebrew **PostgreSQL 17.11** (port 5432) on a virgin database, on
+a stale shared one twenty-two migrations behind, run alone and run beside their
+38 module neighbours; and all 40 pairs of derived databases on this machine
+were found intact (function present, one ceiling row). The divergence
+did not reproduce, so nothing was changed for it; the checks above are what to
+run before anybody spends another afternoon on it.
 
 ---
 
