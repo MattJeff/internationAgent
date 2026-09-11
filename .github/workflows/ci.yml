@@ -84,10 +84,45 @@ jobs:
 
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # `scripts/test.sh` refuses une suite qui imprime « ok » après s'être
+      # esquivée, et la suite Chromium de `crates/providers` s'esquive sans
+      # navigateur à qui parler. L'image du runner en embarque un : il manquait
+      # seulement de tourner avant les tests. C'est ce qui tenait `main` rouge
+      # depuis le 2026-09-10, sur quatre fusions d'affilée.
+      #
+      # `127.0.0.1` et surtout pas `localhost` ni un nom : Chromium refuse une
+      # requête CDP dont l'en-tête `Host` n'est ni une adresse IP ni
+      # `localhost`, il répond 500 sans rien expliquer, et il recopie ce qu'il a
+      # accepté dans le `webSocketDebuggerUrl` qu'il rend.
+      #
+      # `--no-sandbox` parce que le bac à sable de Chromium demande des espaces
+      # de noms utilisateur qu'un runner ne donne pas, et il n'y a rien à
+      # isoler ici : la page lue est un serveur que le test vient d'ouvrir.
+      #
+      # La règle de résolution est ce dont la lecture de bout en bout
+      # d'`effects.rs` a besoin — `Domain::parse` refuse une IP littérale, donc
+      # cette suite-là atteint son faux site par son nom.
+      - name: un vrai Chromium, pour la suite navigateur
+        run: |
+          google-chrome --headless=new --remote-debugging-port=9222 \
+            --user-data-dir="$(mktemp -d)" --no-sandbox \
+            --host-resolver-rules="MAP portal.example.com 127.0.0.1" \
+            about:blank &
+          # Attendre qu'il écoute plutôt que dormir : un `sleep` trop court rend
+          # un rouge qui ne parle pas du code, et un `sleep` trop long se paie à
+          # chaque exécution. Le dernier appel est l'assertion.
+          for _ in $(seq 30); do
+            curl -sf http://127.0.0.1:9222/json/version >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:9222/json/version
+
       # One database per package, serialised inside a package. See scripts/test.sh
       # for why a plain `cargo test --workspace` is flaky against a real Postgres,
       # and why the script refuses to run without one.
       - name: test suite
+        env:
+          BROWSER_CDP_URL: http://127.0.0.1:9222
         run: ./scripts/test.sh
 
       # A migration that only applies to a database already holding the previous
