@@ -2794,6 +2794,13 @@ mod tests {
                 // stranger's text must not be able to produce a demand for money
                 // in this company's name. See `Action::risk`.
                 ActionKind::InvoiceIssue,
+                // High for the same reason one line up, one step earlier in the
+                // sale: a stranger's text must not be able to put a price and a
+                // delivery promise in this company's name. No pack proposes it
+                // yet — see `turn::UNSERVED` — so every row in the table below
+                // is unchanged, which is exactly what a new high-risk kind
+                // should cost until somebody decides who may hold it.
+                ActionKind::QuoteIssue,
                 ActionKind::ContractSign,
                 ActionKind::CredentialChange,
                 ActionKind::DataDelete,
@@ -2904,6 +2911,9 @@ mod tests {
                 payee: "acct-supplier".to_owned(),
             },
             ActionKind::InvoiceIssue => Action::InvoiceIssue {
+                amount: usd_major(1),
+            },
+            ActionKind::QuoteIssue => Action::QuoteIssue {
                 amount: usd_major(1),
             },
             ActionKind::ContractSign => Action::ContractSign {

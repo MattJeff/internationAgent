@@ -546,6 +546,7 @@ pub enum ActionKind {
     A2aSend,
     PaymentCreate,
     InvoiceIssue,
+    QuoteIssue,
     ContractSign,
     CredentialChange,
     DataDelete,
@@ -556,7 +557,7 @@ pub enum ActionKind {
 
 impl ActionKind {
     /// Every discriminant. Iterate this to prove a rule covers the whole space.
-    pub const ALL: [ActionKind; 17] = [
+    pub const ALL: [ActionKind; 18] = [
         ActionKind::EmailSend,
         ActionKind::SmsSend,
         ActionKind::WhatsappSend,
@@ -568,6 +569,7 @@ impl ActionKind {
         ActionKind::A2aSend,
         ActionKind::PaymentCreate,
         ActionKind::InvoiceIssue,
+        ActionKind::QuoteIssue,
         ActionKind::ContractSign,
         ActionKind::CredentialChange,
         ActionKind::DataDelete,
@@ -590,6 +592,7 @@ impl ActionKind {
             ActionKind::A2aSend => "a2a_send",
             ActionKind::PaymentCreate => "payment_create",
             ActionKind::InvoiceIssue => "invoice_issue",
+            ActionKind::QuoteIssue => "quote_issue",
             ActionKind::ContractSign => "contract_sign",
             ActionKind::CredentialChange => "credential_change",
             ActionKind::DataDelete => "data_delete",
@@ -743,6 +746,34 @@ pub enum Action {
     InvoiceIssue {
         amount: Money,
     },
+    /// Put a price in front of a prospect: what the company offers, and what it
+    /// stands behind until the offer runs out.
+    ///
+    /// **The verb before [`Action::InvoiceIssue`], and deliberately not the
+    /// same one.** An invoice asks a customer to pay for something already
+    /// agreed; a quote is where the agreement is *made* — it is the document a
+    /// prospect signs — and the two are held by different functions. Every pack
+    /// in this workspace says so already: `rolepack_sales` refuses
+    /// `InvoiceIssue` in as many words because "this pack stops before
+    /// commercial terms exist", and a seller that had to borrow the billing
+    /// verb to name a price would be the one seat able to agree a price *and*
+    /// demand payment for it. Reusing the discriminant would have made that
+    /// segregation unrepresentable, which is the whole reason this is its own
+    /// kind rather than a field.
+    ///
+    /// The subject is the **amount**, and nothing else — [`Action::InvoiceIssue`]
+    /// carries that argument in full and it holds here unchanged. Which deal is
+    /// priced, how long the offer stands and which version it supersedes live on
+    /// the body (`app::effects::QuoteDraft`), where `agentos_store::quotes`
+    /// refuses an opportunity that is not this company's and `0090`'s
+    /// `sales_quotes_validity_is_a_future` refuses an offer born dead.
+    ///
+    /// See `migrations/0090_un_devis_est_un_document_revisable.sql` for the
+    /// document, and `apps/server/src/routes/quotes.rs` for why no operator
+    /// route may write one.
+    QuoteIssue {
+        amount: Money,
+    },
     /// `title` is display-only — see [`Action::risk`] and the evaluator: the
     /// contract branch has no condition to bypass.
     ContractSign {
@@ -826,7 +857,7 @@ pub enum Action {
 impl Action {
     /// Alias for [`ActionKind::ALL`], so `Action::ALL_DISCRIMINANTS` reads at
     /// the call site.
-    pub const ALL_DISCRIMINANTS: [ActionKind; 17] = ActionKind::ALL;
+    pub const ALL_DISCRIMINANTS: [ActionKind; 18] = ActionKind::ALL;
 
     /// Which discriminant this is. Exhaustive by construction — no `_` arm.
     pub const fn kind(&self) -> ActionKind {
@@ -842,6 +873,7 @@ impl Action {
             Action::A2aSend { .. } => ActionKind::A2aSend,
             Action::PaymentCreate { .. } => ActionKind::PaymentCreate,
             Action::InvoiceIssue { .. } => ActionKind::InvoiceIssue,
+            Action::QuoteIssue { .. } => ActionKind::QuoteIssue,
             Action::ContractSign { .. } => ActionKind::ContractSign,
             Action::CredentialChange { .. } => ActionKind::CredentialChange,
             Action::DataDelete { .. } => ActionKind::DataDelete,
@@ -913,6 +945,14 @@ impl Action {
             // rules answered, so `High` here means the same thing it means
             // everywhere else on this list.
             | Action::InvoiceIssue { .. }
+            // High, and it is `InvoiceIssue`'s entry rather than a new
+            // argument: a stranger's text saying "quote us €50,000 and hold
+            // the price for a year" must not produce a priced offer in this
+            // company's name. What a quote binds is not money moving, it is a
+            // price and a delivery promise the company stands behind until
+            // `valid_until` — cheaper than an invoice to withdraw, and just as
+            // impossible to un-send once the PDF is with the prospect.
+            | Action::QuoteIssue { .. }
             | Action::ContractSign { .. }
             | Action::CredentialChange { .. }
             | Action::DataDelete { .. }
@@ -1181,10 +1221,10 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), ActionKind::ALL.len(), "duplicate discriminant");
-        assert_eq!(Action::ALL_DISCRIMINANTS.len(), 17);
+        assert_eq!(Action::ALL_DISCRIMINANTS.len(), 18);
     }
 
-    /// Fourteen of the seventeen actions leave the company. The three that do
+    /// Fifteen of the eighteen actions leave the company. The three that do
     /// not are `CharterSet`, the internal channel and `AppointmentBook`; the
     /// latter two are deliberately `Low`, see the paragraph on
     /// [`Action::risk`].
@@ -1193,7 +1233,9 @@ mod tests {
     // `AppointmentBook` — and the count in this sentence is the only place the
     // collision was not a compile error. That is why it is a sentence about a
     // partition and not a number on its own: `ALL.len()` is checked below, and
-    // whoever adds an eighteenth has to decide which side it falls on.
+    // whoever adds a nineteenth has to decide which side it falls on.
+    // The eighteenth was `QuoteIssue`, and it falls on the outbound side: a
+    // priced offer is a document a prospect keeps.
     #[test]
     fn talking_to_a_colleague_is_low_risk_and_has_no_counterparty() {
         let internal = Action::InternalSend {

@@ -49,6 +49,7 @@ use std::sync::Arc;
 use agentos_domain::action::{Action, Domain, E164, EmailAddress, McpTool};
 use agentos_domain::ids::{AppointmentId, DecisionId, IdempotencyKey, InvoiceId, Slug, WorkItemId};
 use agentos_domain::money::Money;
+use agentos_domain::revenue::QuoteId;
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
 use agentos_providers::browser::{BrowserOutcome, BrowserProvider, BrowserSession, BrowserStep};
 use agentos_providers::email::{
@@ -64,6 +65,7 @@ use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::invoices;
 use agentos_store::org;
 use agentos_store::provisioning;
+use agentos_store::quotes;
 use agentos_store::revenue::RevenueError;
 use agentos_store::spend;
 use async_trait::async_trait;
@@ -265,6 +267,38 @@ pub const ISSUER_MENTIONS_MISSING: &str = "issuer_mentions_missing";
 /// [`Effects::send_invoice`]: an email ruling says the seat may write there,
 /// not that this document is that address's business.
 pub const NOT_THE_ACCOUNTS_CONTACT: &str = "not_the_accounts_contact";
+
+/// What [`Effects::propose_quote`] answers when the deal it was handed is not
+/// this company's.
+///
+/// [`NO_WON_DEAL`]'s silence with one conjunct fewer, and the missing conjunct
+/// is the whole difference between the two documents: `agentos_store::quotes::
+/// propose` has **no stage clause**, because a quote is what happens before a
+/// deal is won and demanding `closed_won` would make the document unwritable at
+/// the only moment it is useful. So this fires for one reason — RLS did not see
+/// the row — and it is deliberately the same answer for "not yours" and "does
+/// not exist", so a refused quote is not an existence oracle for another
+/// company's opportunity ids.
+pub const NO_SUCH_DEAL: &str = "no_such_deal";
+
+/// What [`Effects::propose_quote`] answers when the version it was told to
+/// supersede cannot be superseded.
+///
+/// Four reasons and one answer, [`NO_SUCH_DEAL`]'s reasoning: the quote is not
+/// this company's, it does not exist, **somebody already accepted it** — you do
+/// not re-price what a customer agreed to, that is a new negotiation — or it has
+/// already been revised once, which `sales_quotes_one_revision_per_quote_idx`
+/// refuses so that the chain stays linear and "the live quote" keeps having an
+/// answer. See `agentos_store::quotes::revise`.
+pub const NOT_REVISABLE: &str = "not_revisable";
+
+/// `sales_quotes_one_revision_per_quote_idx`, as Postgres names it back.
+///
+/// A constant rather than a literal in the match below, for the reason
+/// `0090` gives the index: it is the mechanism that keeps a revision chain
+/// linear, so the day it is renamed the rename has one place to land instead of
+/// silently turning a named refusal into an `Unavailable`.
+const ONE_REVISION_PER_QUOTE: &str = "sales_quotes_one_revision_per_quote_idx";
 
 /// The filed document no longer matches its own digest. Not sent; the same
 /// refusal [`crate::files::FilesError::Corrupt`] makes on the read side.
@@ -524,6 +558,18 @@ subject!(
     /// argument in full. `Money` and not an integer, because a figure whose
     /// currency was implied is a figure the customer reads in theirs.
     InvoiceIssue { amount: Money } => InvoiceIssue
+);
+subject!(
+    /// Offer a prospect a price: [`InvoiceIssue`] one step earlier in the sale.
+    ///
+    /// The subject is the amount and nothing else, for [`InvoiceIssue`]'s
+    /// reason exactly — which deal is priced, until when the offer stands and
+    /// which version it replaces ride on [`QuoteDraft`], where the store and
+    /// `0090` refuse them. `Action::QuoteIssue` argues why this is a
+    /// discriminant of its own and not `InvoiceIssue` reused: the packs that
+    /// may name a price and the packs that may demand payment are deliberately
+    /// not the same packs.
+    QuoteIssue { amount: Money } => QuoteIssue
 );
 subject!(
     /// Say something to one peer's agent.
@@ -809,6 +855,55 @@ pub struct InvoiceDraft {
     /// A line can carry a tax rate and nothing in this workspace supplies one:
     /// see [`agentos_store::invoices::Line::tax_rate_bp`], which is where that
     /// question is left open for the founder.
+    pub lines: Vec<invoices::Line>,
+}
+
+/// Which deal is being priced, for how long, and — on a revision — which
+/// version this replaces. The amount is on the token.
+///
+/// [`InvoiceDraft`]'s shape, and the three places it differs are the three
+/// differences `migrations/0090` argues, one field each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuoteDraft {
+    /// The deal this prices. **Not required to be won**, which is the one field
+    /// here that reads the same as [`InvoiceDraft::opportunity_id`] and means
+    /// something weaker: `quotes::propose` has no stage clause, so the ceiling
+    /// is RLS alone and [`NO_SUCH_DEAL`] is its silence.
+    ///
+    /// **Ignored on a revision**, and that is `quotes::revise`'s doing rather
+    /// than an oversight here: the new row takes its deal from the row it
+    /// supersedes, in the same statement, so a chain cannot be made to jump to
+    /// another opportunity halfway through. Left on the struct rather than
+    /// moved into the `None` arm because one draft type reads better than two
+    /// that differ by a field — and because the field is *right* on a revision,
+    /// it is simply not the thing consulted.
+    pub opportunity_id: Uuid,
+    /// What is being offered, in one line; ends up on the PDF and in the audit
+    /// row.
+    pub memo: String,
+    /// **How long the offer stands, and there is no default.** The field
+    /// [`InvoiceDraft::due_at`] is `Option` and this one is not, because `0090`
+    /// makes `valid_until` NOT NULL on purpose: a quote with no expiry is an
+    /// open-ended commitment nobody took deliberately. Thirty days is a
+    /// convention of one country's habit rather than a fact about software, so
+    /// inventing it here would be this crate taking a commercial decision on a
+    /// company's behalf.
+    pub valid_until: DateTime<Utc>,
+    /// The version this replaces. `None` writes an original at version 1; `Some`
+    /// writes a **new row** linked to that one — nothing overwrites what already
+    /// went out, because the prospect is holding a PDF of it.
+    ///
+    /// A field rather than a second effect method: the gate's question is the
+    /// same one either way (*may this seat name a price?*), the audit row is the
+    /// same row, and a `propose_quote` / `revise_quote` pair would be two places
+    /// for one ruling to drift. What the two paths do differ in is the refusal,
+    /// and that is [`NO_SUCH_DEAL`] against [`NOT_REVISABLE`].
+    pub supersedes: Option<QuoteId>,
+    /// What the document is made of, totalling the amount on the token —
+    /// refused by the store and refused again by the database at commit.
+    /// `invoices::Line` and not a twin: `sales_quote_lines` has
+    /// `invoice_lines`' columns so that the total of an accepted quote is *the
+    /// same computation* as the invoice that bills it.
     pub lines: Vec<invoices::Line>,
 }
 
@@ -2911,6 +3006,163 @@ impl Effects {
         }
     }
 
+    /// Put a price in front of a prospect: one row of the quote register, and
+    /// the document that goes with it.
+    ///
+    /// # It is [`Effects::issue_invoice`], and the copying is deliberate
+    ///
+    /// No provider, for that method's reason with the network removed entirely:
+    /// what a quote *is* at this stage is a row saying what we offered and a
+    /// PDF the prospect can open. **Nothing is sent.** Putting the offer in
+    /// front of them is a separate `EmailSend` the employee writes itself,
+    /// exactly as an issued invoice is — a quote recorded and not sent is a
+    /// mistake somebody can see, and one sent and not recorded is not.
+    ///
+    /// Two transactions, not one: the write commits with its document, then
+    /// [`Self::record`] writes the audit row on its own. Folding them together
+    /// would let an unrecordable audit row roll back a quote the prospect has
+    /// already been shown.
+    ///
+    /// The bound is `Authorized<QuoteIssue>` and not `A: Subject<Of = …>`, so a
+    /// token minted from a tainted turn does not typecheck here at all —
+    /// `issue_invoice` argues that at length, including what the bound saves
+    /// (the effect) and what it does not (the filing), and every word of it
+    /// applies.
+    ///
+    /// # The four places a quote is not an invoice
+    ///
+    /// 1. **No number is claimed.** `0071` makes the invoice counter gapless
+    ///    because a hole in a tax authority's sequence reads as a deletion, and
+    ///    the price of that is per-company serialisation on issue. `0090`
+    ///    refuses to pay it for a document that enters no book: the reference a
+    ///    human cites is `(id, version)`. So there is no "say no upstream of the
+    ///    counter" ordering problem here — there is no counter — and
+    ///    [`ISSUER_MENTIONS_MISSING`] has no twin either, because
+    ///    `missing_mentions` is the list a **facture** owes and a quote owes
+    ///    none of it (see `crate::quote_document`, which deliberately carries no
+    ///    non-conformity banner).
+    /// 2. **It expires**, and the expiry is not this method's business beyond
+    ///    carrying it: `QuoteDraft::valid_until` has no default, `0090`'s
+    ///    `sales_quotes_validity_is_a_future` refuses one already past, and the
+    ///    guard that matters is in the SQL of `quotes::accept`, where no
+    ///    snapshot can go stale between reading a validity and acting on it.
+    /// 3. **It is revised rather than corrected.** A wrong invoice is undone by
+    ///    a second document that retracts it; a refused quote is replayed. So
+    ///    `draft.supersedes` picks `quotes::revise` over `quotes::propose`, and
+    ///    what that writes is a **new row** — the version the prospect is
+    ///    holding keeps its amount, its lines and its answer.
+    /// 4. **The deal need not be won.** `invoices::issue` demands `closed_won`
+    ///    and that foreign key is most of the invoice's ceiling; a quote is what
+    ///    happens *before* the close, so the ceiling here is the gate's ruling
+    ///    and RLS, and nothing else.
+    ///
+    /// # What the audit row carries
+    ///
+    /// `issue_invoice`'s five fields, plus the two an invoice has no word for:
+    /// `valid_until`, because "we offered 12 000 €" and "we offered 12 000 €
+    /// until Friday" are different commitments and only one of them is in the
+    /// amount; and `supersedes_quote_id`, because a reader following the trail
+    /// must be able to tell a second offer from a second *deal*. `version` comes
+    /// back off the written row rather than being computed here — `revise`
+    /// increments it in the same statement that inserts, which is what stops two
+    /// revisions claiming the same number.
+    pub async fn propose_quote(
+        &self,
+        ok: Authorized<QuoteIssue>,
+        draft: &QuoteDraft,
+    ) -> Result<QuoteId, EffectError> {
+        let amount = ok.action().subject().amount;
+        let id = QuoteId::new_v7(Utc::now());
+
+        let proposed = self
+            .write_quote(id, amount, draft)
+            .await
+            .map_err(|err| match err {
+                // The store's silence, and which silence it is depends on which
+                // row it could not see. A closed code either way rather than the
+                // store error: both are handed back to a caller as a failure and
+                // neither may become an existence oracle for another company's
+                // ids.
+                StoreError::NotFound if draft.supersedes.is_some() => {
+                    EffectError::Refused(NOT_REVISABLE)
+                }
+                StoreError::NotFound => EffectError::Refused(NO_SUCH_DEAL),
+                // A second revision of the same version. Matched **by
+                // constraint name** rather than on `Conflict` at large, because
+                // `quotes::lines_total` makes one of its own for arithmetic that
+                // does not add up — and that is a caller's mistake of a
+                // different kind, which stays `Unavailable` exactly as the
+                // invoice's does. A decision and not a fault: somebody re-priced
+                // the same document twice, and the index is what keeps the chain
+                // linear so that "the live quote" still has an answer.
+                StoreError::Conflict(ref constraint) if constraint == ONE_REVISION_PER_QUOTE => {
+                    EffectError::Refused(NOT_REVISABLE)
+                }
+                other => EffectError::Unavailable(other),
+            });
+
+        let detail = Some(json!({
+            "opportunity_id": draft.opportunity_id.to_string(),
+            "memo": draft.memo,
+            "minor": amount.minor(),
+            "currency": amount.currency().code(),
+            "valid_until": draft.valid_until,
+            "supersedes_quote_id": draft.supersedes.map(|id| id.to_string()),
+            "quote_id": proposed.as_ref().ok().map(|quote: &quotes::Quote| quote.id.to_string()),
+            "version": proposed.as_ref().ok().map(|quote: &quotes::Quote| quote.version),
+        }));
+        self.record(&ok, detail, proposed)
+            .await
+            .map(|quote| quote.id)
+    }
+
+    /// The write, in its own transaction, so [`Effects::propose_quote`] reads
+    /// like its siblings — [`Effects::write_invoice`]'s split and its argument.
+    ///
+    /// The whole of it commits or none of it does: the register row, its lines
+    /// and the PDF. A row with no document, or a document whose row was rolled
+    /// back, are the two halves of one lie, and this is where they are made
+    /// unrepresentable. See `crate::quote_document`.
+    async fn write_quote(
+        &self,
+        id: QuoteId,
+        amount: Money,
+        draft: &QuoteDraft,
+    ) -> Result<quotes::Quote, StoreError> {
+        let mut tx = self.db.tenant_tx(self.principal.tenant_id).await?;
+        let row = quotes::Draft {
+            id,
+            opportunity_id: draft.opportunity_id,
+            issued_by: self.principal.employee_id,
+            amount,
+            memo: &draft.memo,
+            valid_until: draft.valid_until,
+            lines: &draft.lines,
+        };
+        let written = match draft.supersedes {
+            Some(previous) => quotes::revise(&mut tx, previous, row).await,
+            None => quotes::propose(&mut tx, row).await,
+        };
+        let filed = match written {
+            Ok(quote) => crate::quote_document::file(&mut tx, &quote)
+                .await
+                .map(|_| quote),
+            Err(err) => Err(err),
+        };
+        match filed {
+            Ok(quote) => {
+                tx.commit().await?;
+                Ok(quote)
+            }
+            Err(err) => {
+                // Rolled back rather than dropped: nothing was written and a
+                // pooled connection goes back deliberately.
+                let _ = tx.rollback().await;
+                Err(err)
+            }
+        }
+    }
+
     /// Say something to the colleague named on the token, and wake them.
     ///
     /// # Where the message's trust label comes from
@@ -4265,6 +4517,25 @@ mod tests {
             opportunity_id,
             memo: "March".to_owned(),
             due_at: None,
+            lines: Vec::new(),
+        }
+    }
+
+    fn quoted(minor: u64) -> QuoteIssue {
+        QuoteIssue {
+            amount: Money::new(minor, Currency::Eur).expect("nonzero"),
+        }
+    }
+
+    /// Un devis original, sans ligne. `valid_until` est un argument et non une
+    /// valeur d'ici : c'est la mention que `0090` rend obligatoire, et une
+    /// fixture qui la choisirait rendrait la péremption intestable.
+    fn quote_draft(opportunity_id: Uuid, valid_until: DateTime<Utc>) -> QuoteDraft {
+        QuoteDraft {
+            opportunity_id,
+            memo: "Trois mois de veille".to_owned(),
+            valid_until,
+            supersedes: None,
             lines: Vec::new(),
         }
     }
@@ -5906,6 +6177,319 @@ mod tests {
                 .expect("count approvals");
         tx.rollback().await.expect("rollback");
         assert_eq!(pending, 0, "no approval was filed by a stranger");
+    }
+
+    /// **Un devis est statué, écrit, documenté et au journal**, et la ligne
+    /// qu'il écrit porte le siège qui l'a proposé.
+    ///
+    /// Le jumeau d'`an_invoice_is_ruled_on_recorded_and_written_to_the_register`,
+    /// avec les trois différences de `0090` affirmées plutôt que commentées :
+    /// l'affaire n'est **pas gagnée** (`open_deal`), la ligne porte une
+    /// validité, et elle ne porte aucun numéro — sa référence est `(id,
+    /// version)`.
+    #[tokio::test]
+    async fn un_devis_est_statue_ecrit_et_au_journal() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        // En négociation, exprès : c'est le seul moment où un devis sert, et
+        // `issue_invoice` refuserait cette même affaire.
+        let opportunity = open_deal(&db, &principal).await;
+        let effects = Effects::new(
+            db.clone(),
+            ports(MockEmailProvider::new(), MockPayments::healthy()),
+            principal.clone(),
+        );
+
+        let token = gate(&db)
+            .authorize(&principal, quoted(120_000))
+            .await
+            .expect("la politique du locataire ouvre Channel::Email");
+        let decision_id = token.decision_id();
+        assert!(
+            token.reservation().is_none(),
+            "proposer un prix ne prélève aucune enveloppe : l'argent va dans l'autre sens"
+        );
+
+        let valid_until = Utc::now() + TimeDelta::days(30);
+        let id = effects
+            .propose_quote(token, &quote_draft(opportunity, valid_until))
+            .await
+            .expect("une affaire en négociation est chiffrable");
+
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let quote = agentos_store::quotes::find(&mut tx, id)
+            .await
+            .expect("lire")
+            .expect("au registre");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(quote.amount, Money::new(120_000, Currency::Eur).unwrap());
+        assert_eq!(quote.issued_by, principal.employee_id);
+        assert_eq!(quote.version, 1, "un original");
+        assert_eq!(quote.supersedes_quote_id, None);
+        assert_eq!(quote.accepted_at, None);
+        assert_eq!(quote.declined_at, None);
+        assert!(
+            !quote.is_expired_at(Utc::now()),
+            "l'offre tient encore : `valid_until` est dans trente jours"
+        );
+
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, Some(decision_id.as_uuid()), "liée à la décision");
+        assert_eq!(rows[0].1["effect"], json!("quote_issue"));
+        assert_eq!(rows[0].1["outcome"], json!("ok"));
+        assert_eq!(rows[0].1["detail"]["currency"], json!("EUR"));
+        assert_eq!(rows[0].1["detail"]["minor"], json!(120_000));
+        assert_eq!(rows[0].1["detail"]["memo"], json!("Trois mois de veille"));
+        assert_eq!(
+            rows[0].1["detail"]["opportunity_id"],
+            json!(opportunity.to_string())
+        );
+        assert_eq!(rows[0].1["detail"]["quote_id"], json!(id.to_string()));
+        assert_eq!(rows[0].1["detail"]["version"], json!(1));
+        assert_eq!(rows[0].1["detail"]["supersedes_quote_id"], Value::Null);
+        // La mention qu'une facture n'a pas, et la raison pour laquelle elle est
+        // au journal : « on a offert 1 200 € » et « on a offert 1 200 € jusqu'à
+        // vendredi » ne sont pas le même engagement.
+        assert!(
+            rows[0].1["detail"]["valid_until"].is_string(),
+            "la validité est au journal : {}",
+            rows[0].1
+        );
+    }
+
+    /// **Le document part avec la ligne, ou ni l'un ni l'autre.** Déposé sous
+    /// `quote-<id>-v<version>.pdf`, sans numéro de séquence — `0090` refuse de
+    /// payer le prix de `0071` pour une pièce qui n'entre dans aucun livre.
+    #[tokio::test]
+    async fn un_devis_propose_est_depose_en_pdf_sous_son_couple_id_version() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let opportunity = open_deal(&db, &principal).await;
+        let effects = Effects::new(
+            db.clone(),
+            ports(MockEmailProvider::new(), MockPayments::healthy()),
+            principal.clone(),
+        );
+        let token = gate(&db)
+            .authorize(&principal, quoted(120_000))
+            .await
+            .expect("autorisé");
+        let id = effects
+            .propose_quote(
+                token,
+                &quote_draft(opportunity, Utc::now() + TimeDelta::days(30)),
+            )
+            .await
+            .expect("proposé");
+
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let quote = agentos_store::quotes::find(&mut tx, id)
+            .await
+            .expect("lire")
+            .expect("au registre");
+        let name = crate::quote_document::file_name(&quote);
+        let held = agentos_store::files::fetch(&mut tx, &name)
+            .await
+            .expect("le document est au classeur");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(name, format!("quote-{id}-v1.pdf"));
+        assert_eq!(held.content_type, "application/pdf");
+        assert!(held.content.starts_with(b"%PDF-"));
+    }
+
+    /// **Une révision est une nouvelle ligne, et l'ancienne ne bouge pas.**
+    ///
+    /// C'est la troisième différence de `0090`, et la seule qui n'a pas
+    /// d'équivalent sur une facture : une facture fausse est retirée par un
+    /// avoir, un devis refusé est rejoué. Le test affirme les deux moitiés — la
+    /// v2 nomme la v1, et la v1 porte toujours son montant.
+    #[tokio::test]
+    async fn une_revision_ecrit_une_seconde_ligne_et_laisse_la_premiere_intacte() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let opportunity = open_deal(&db, &principal).await;
+        let effects = Effects::new(
+            db.clone(),
+            ports(MockEmailProvider::new(), MockPayments::healthy()),
+            principal.clone(),
+        );
+        let valid_until = Utc::now() + TimeDelta::days(30);
+
+        let first = effects
+            .propose_quote(
+                gate(&db)
+                    .authorize(&principal, quoted(120_000))
+                    .await
+                    .expect("autorisé"),
+                &quote_draft(opportunity, valid_until),
+            )
+            .await
+            .expect("la v1");
+
+        let mut revised = quote_draft(opportunity, valid_until);
+        revised.supersedes = Some(first);
+        let second = effects
+            .propose_quote(
+                gate(&db)
+                    .authorize(&principal, quoted(90_000))
+                    .await
+                    .expect("autorisé"),
+                &revised,
+            )
+            .await
+            .expect("la v2");
+
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let v1 = agentos_store::quotes::find(&mut tx, first)
+            .await
+            .expect("lire")
+            .expect("la v1 est toujours là");
+        let v2 = agentos_store::quotes::find(&mut tx, second)
+            .await
+            .expect("lire")
+            .expect("la v2");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(v1.version, 1);
+        assert_eq!(
+            v1.amount,
+            Money::new(120_000, Currency::Eur).unwrap(),
+            "ce qui a été proposé lundi reste lisible vendredi"
+        );
+        assert_eq!(v2.version, 2);
+        assert_eq!(v2.supersedes_quote_id, Some(first));
+        assert_eq!(v2.amount, Money::new(90_000, Currency::Eur).unwrap());
+
+        // Et la seconde révision de la même version est refusée, pour que
+        // « le devis en cours » garde une réponse.
+        let mut again = quote_draft(opportunity, valid_until);
+        again.supersedes = Some(first);
+        let err = effects
+            .propose_quote(
+                gate(&db)
+                    .authorize(&principal, quoted(80_000))
+                    .await
+                    .expect("autorisé"),
+                &again,
+            )
+            .await
+            .expect_err("une chaîne de devis est linéaire");
+        assert_eq!(err.code(), NOT_REVISABLE);
+    }
+
+    /// L'affaire n'est pas celle de cette entreprise : le silence de RLS, et il
+    /// ne devient pas un oracle d'existence.
+    #[tokio::test]
+    async fn un_siege_autorise_ne_chiffre_pas_laffaire_dune_autre_entreprise() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let ailleurs = seed(&db).await;
+        let opportunity = open_deal(&db, &ailleurs).await;
+        let effects = Effects::new(
+            db.clone(),
+            ports(MockEmailProvider::new(), MockPayments::healthy()),
+            principal.clone(),
+        );
+
+        let token = gate(&db)
+            .authorize(&principal, quoted(120_000))
+            .await
+            .expect("la gate permet le verbe");
+        let err = effects
+            .propose_quote(
+                token,
+                &quote_draft(opportunity, Utc::now() + TimeDelta::days(30)),
+            )
+            .await
+            .expect_err("l'affaire d'une autre société n'est pas chiffrable");
+        assert_eq!(err.code(), NO_SUCH_DEAL);
+
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 1, "le refus est au journal");
+        assert_eq!(rows[0].1["effect"], json!("quote_issue"));
+        assert_eq!(rows[0].1["outcome"], json!("error"));
+        assert_eq!(rows[0].1["error"], json!(NO_SUCH_DEAL));
+    }
+
+    /// **Un siège qui n'a pas le droit de proposer un prix n'en propose pas.**
+    ///
+    /// La gate statue pour un siège nommé, et c'est la moitié de ce chantier qui
+    /// ne peut pas être affirmée depuis le store : la couche de l'employé ferme
+    /// `Channel::Email`, les couches ne font que rétrécir, et
+    /// `always_denies(QuoteIssue)` lit ce canal-là — donc aucun jeton n'est
+    /// frappé et il n'y a rien à dépenser.
+    ///
+    /// Le registre est lu ensuite, parce qu'un refus qui laisserait quand même
+    /// une ligne serait exactement le trou que ce test existe pour fermer.
+    #[tokio::test]
+    async fn un_siege_sans_le_droit_de_proposer_un_prix_nen_propose_aucun() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let _opportunity = open_deal(&db, &principal).await;
+
+        // La couche de l'employé, qui ne donne que le web. L'intersection avec
+        // le locataire retire `Channel::Email` à ce siège et à lui seul.
+        agentos_store::policy::install(
+            &db,
+            principal.tenant_id,
+            agentos_store::policy::Scope::Employee(principal.employee_id),
+            &PolicyLimits {
+                allowed_channels: BTreeSet::from([Channel::Web]),
+                ..PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("installer la couche de l'employé");
+
+        let denied = gate(&db)
+            .authorize(&principal, quoted(120_000))
+            .await
+            .expect_err("ce siège ne peut pas nommer un prix");
+        assert!(
+            matches!(denied, Denied::Policy(DenyReason::ChannelNotAllowed)),
+            "attendu un refus de canal, reçu {denied:?}"
+        );
+
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let register = agentos_store::quotes::register(&mut tx, None, None, 200, Utc::now())
+            .await
+            .expect("lire le registre");
+        tx.rollback().await.expect("rollback");
+        assert!(register.is_empty(), "rien n'a été proposé");
+    }
+
+    /// **Le texte d'un inconnu ne met pas un prix au nom de cette société**, et
+    /// il ne fabrique pas non plus une question pour un humain.
+    ///
+    /// `Action::QuoteIssue` est `Risk::High` et son bras répond `Allow`, donc le
+    /// fil anti-contamination d'`evaluate` refuse net. C'est
+    /// `a_tainted_turn_cannot_invoice_anybody` mot pour mot, une étape plus tôt
+    /// dans la vente : « votre client a écrit qu'il voulait un devis à 50 000 € »
+    /// est la phrase à laquelle ce refus répond.
+    #[tokio::test]
+    async fn un_tour_contamine_ne_propose_de_prix_a_personne() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+
+        let denied = gate(&db)
+            .authorize(&principal, Untrusted::new(quoted(120_000)))
+            .await
+            .expect_err("un devis contaminé est refusé");
+        assert!(
+            matches!(denied, Denied::Policy(DenyReason::UntrustedInput)),
+            "attendu l'arrêt de contamination, reçu {denied:?}"
+        );
+
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let pending: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM approvals WHERE state = 'pending'")
+                .fetch_one(&mut **tx)
+                .await
+                .expect("compter les approbations");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(pending, 0, "aucun inconnu n'a déposé de question");
     }
 
     /// **A read ruling cannot buy a keystroke on somebody's page.**
