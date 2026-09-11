@@ -224,7 +224,8 @@ pub fn tools() -> Vec<ToolDef> {
                  taux de plaintes monte ne se répare pas par une cadence, et cette lecture est la \
                  seule qui le voie venir. Le plafond, lui, se change avec `domains_cap_set` — et \
                  il ne répare rien : un taux de plaintes qui monte ne se traite pas par une \
-                 cadence.",
+                 cadence. Les deux taux valent **`null` quand rien n'est parti** : zéro plainte \
+                 sur zéro envoi n'est pas une bonne réputation, c'est l'absence de mesure.",
             method: Method::Get,
             path: "/v1/outreach/health",
             schema: schema(
