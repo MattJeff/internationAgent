@@ -1260,7 +1260,7 @@ mod tests {
             objective: rolepack_sales::Objective {
                 segment: Segment::Airline,
                 market: Some(rolepack::CountryCode::parse("de").expect("de")),
-                target_accounts: vec!["Lufthansa".to_owned()],
+                target_accounts: vec!["Luftlinie".to_owned()],
             },
         };
         assert!(charter.open_questions().is_empty());
@@ -1308,7 +1308,7 @@ mod tests {
                     objective.market.map(|c| c.to_string()),
                     Some("FR".to_owned())
                 );
-                assert_eq!(objective.target_accounts, vec!["Lufthansa".to_owned()]);
+                assert_eq!(objective.target_accounts, vec!["Luftlinie".to_owned()]);
             }
             other => panic!("the role is ours, not the model's: {other:?}"),
         }
@@ -1342,7 +1342,7 @@ mod tests {
         let (built, refused) = apply(
             charter.role(),
             &base,
-            json!({"market": "Germanie", "target_accounts": ["Lufthansa"]})
+            json!({"market": "Germanie", "target_accounts": ["Luftlinie"]})
                 .as_object()
                 .expect("an object")
                 .clone(),
@@ -1368,7 +1368,7 @@ mod tests {
         let (built, refused) = apply(
             charter.role(),
             &base,
-            json!({"market": "de", "target_accounts": ["Lufthansa"]})
+            json!({"market": "de", "target_accounts": ["Luftlinie"]})
                 .as_object()
                 .expect("an object")
                 .clone(),
@@ -1574,7 +1574,7 @@ mod tests {
             objective: rolepack_sales::Objective {
                 segment: Segment::Airline,
                 market: Some(rolepack::CountryCode::parse("de").expect("de")),
-                target_accounts: vec!["Lufthansa".to_owned()],
+                target_accounts: vec!["Luftlinie".to_owned()],
             },
         };
 
@@ -1613,7 +1613,7 @@ mod tests {
             objective: rolepack_sales::Objective {
                 segment: Segment::Airline,
                 market: Some(rolepack::CountryCode::parse("de").expect("de")),
-                target_accounts: vec!["Lufthansa".to_owned()],
+                target_accounts: vec!["Luftlinie".to_owned()],
             },
         };
         assert!(charter.open_questions().is_empty());
@@ -1973,9 +1973,9 @@ mod tests {
     async fn a_founder_is_asked_answers_in_prose_and_the_constructors_decide() {
         let Some(h) = Harness::new(vec![
             // 1. the model hears Germany and writes Germanie.
-            r#"{"market": "Germanie", "target_accounts": ["Lufthansa"]}"#,
+            r#"{"market": "Germanie", "target_accounts": ["Luftlinie"]}"#,
             // 2. the founder says it again; this time it writes a code.
-            "```json\n{\"market\": \"de\", \"target_accounts\": [\"Lufthansa\", \"Condor\"]}\n```",
+            "```json\n{\"market\": \"de\", \"target_accounts\": [\"Luftlinie\", \"Condor\"]}\n```",
         ])
         .await
         else {
@@ -2040,7 +2040,7 @@ mod tests {
                 "POST",
                 &uri,
                 SECRET_A,
-                Some(json!({"answer": "We're going after German carriers — Lufthansa first."})),
+                Some(json!({"answer": "We're going after German carriers — Luftlinie first."})),
             )
             .await;
         // A refused proposal is a 200, exactly as a refused key is on
@@ -2078,7 +2078,7 @@ mod tests {
                 "POST",
                 &uri,
                 SECRET_A,
-                Some(json!({"answer": "Germany — DE. Lufthansa and Condor."})),
+                Some(json!({"answer": "Germany — DE. Luftlinie and Condor."})),
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{done}");
@@ -2090,7 +2090,7 @@ mod tests {
             json!({
                 "segment": "airline",
                 "market": "DE",
-                "target_accounts": ["Lufthansa", "Condor"]
+                "target_accounts": ["Luftlinie", "Condor"]
             }),
             "the segment survived and the country came back normalised"
         );
@@ -2167,7 +2167,7 @@ mod tests {
                 "POST",
                 &uri,
                 SECRET_A,
-                Some(json!({"answer": "Lufthansa and Condor.", "question": "target_accounts"})),
+                Some(json!({"answer": "Luftlinie and Condor.", "question": "target_accounts"})),
             )
             .await;
         assert_eq!(status, StatusCode::OK);

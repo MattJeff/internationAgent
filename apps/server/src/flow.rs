@@ -788,9 +788,9 @@ mod tests {
     fn proposal() -> revenue::FlowProposal {
         revenue::FlowProposal {
             account_id: Uuid::nil(),
-            prospect: "Deutsche Lufthansa AG".to_owned(),
-            domain: "lufthansa.com".to_owned(),
-            entry_url: "https://book.lufthansa.com/entry".to_owned(),
+            prospect: "Luftlinie Verkehr AG".to_owned(),
+            domain: "luftlinie.com".to_owned(),
+            entry_url: "https://book.luftlinie.com/entry".to_owned(),
             passport_field: Some("#pp".to_owned()),
             destination_field: Some("#dest".to_owned()),
             date_field: None,
@@ -887,10 +887,10 @@ mod tests {
     fn a_review_shows_the_page_and_every_selector_on_it() {
         let shown = render(&proposal());
         assert!(
-            shown.contains("https://book.lufthansa.com/entry"),
+            shown.contains("https://book.luftlinie.com/entry"),
             "{shown}"
         );
-        assert!(shown.contains("Deutsche Lufthansa AG"), "{shown}");
+        assert!(shown.contains("Luftlinie Verkehr AG"), "{shown}");
         for selector in ["#pp", "#dest", "#visa-result"] {
             assert!(shown.contains(selector), "{selector} missing from {shown}");
         }
