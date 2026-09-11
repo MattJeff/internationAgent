@@ -975,14 +975,23 @@ mod tests {
     /// `api`, où cette route n'est pas.
     #[test]
     fn no_tool_can_call_the_mcp_server_back() {
+        // `starts_with` seul est **faux**, et la table pleine l'a montré le
+        // 2026-09-11 : `/v1/mcp/servers` — la liste des serveurs qu'un
+        // locataire a branchés, côté client — commence par `/v1/mcp/server`.
+        // La garde accusait un outil parfaitement légitime. Ce qui est une
+        // boucle, c'est cette route exactement, ou quelque chose dessous.
+        let under = format!("{PATH}/");
         for line in registry() {
             assert!(
-                !line.path.starts_with(PATH),
+                line.path != PATH && !line.path.starts_with(&under),
                 "{} rappelle le serveur MCP : {}",
                 line.name,
                 line.path
             );
         }
+        // Et la preuve que la garde n'est pas devenue aveugle en se resserrant :
+        // le voisin d'une lettre passe, la route elle-même ne passerait pas.
+        assert!(registry().iter().any(|line| line.path == "/v1/mcp/servers"));
         // Le désarmement, parce que le registre est vide sur cette branche et
         // qu'une boucle `for` sur zéro ligne n'affirme rien.
         let loop_tool = tool(
@@ -1147,11 +1156,24 @@ mod tests {
         // clé, on n'apprend même pas ça : le refus précède la table.
         assert_eq!(answer["error"], Value::Null, "{answer}");
 
-        // Le désarmement : la même requête avec la clé atteint bien la table, et
-        // le refus qui suit est celui d'un nom inconnu, pas d'une clé.
-        let (status, answer) = harness.rpc(call, Some(SECRET)).await;
+        // Le désarmement : la même requête avec la clé atteint bien la table.
+        //
+        // Elle demandait `employees_list` et attendait `-32602`, ce qui ne
+        // tenait que tant que la table était vide — l'outil existe depuis le
+        // 2026-09-11 et l'appel réussit. Un désarmement qui repose sur
+        // l'absence d'une ligne est un désarmement qui expire ; celui-ci
+        // nomme un outil qui n'existera jamais.
+        let absent = json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                            "params": {"name": "aucun_outil_ne_porte_ce_nom", "arguments": {}}});
+        let (status, answer) = harness.rpc(absent, Some(SECRET)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(answer["error"]["code"], json!(-32602), "{answer}");
+
+        // Et le vrai outil, sous la même clé, répond : c'est ce qui prouve que
+        // le refus d'au-dessus venait de la clé absente et de rien d'autre.
+        let (status, answer) = harness.rpc(call, Some(SECRET)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(answer["error"], Value::Null, "{answer}");
     }
 
     /// Toute autre méthode que les trois : `-32601`, et pas un 404 HTTP.
