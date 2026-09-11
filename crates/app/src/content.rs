@@ -1,0 +1,1550 @@
+//! **La boucle de citation** : les questions qu'on veut gagner, ce qu'un moteur
+//! répond aujourd'hui, et ce qu'il manque à notre contenu pour y être.
+//!
+//! `docs/ROADMAP_CROISSANCE.md` § 2.1 et `docs/CONTENU.md`. La thèse, en une
+//! phrase : quand un développeur demande à un modèle *« comment vérifier par
+//! API si un passeport permet d'entrer quelque part »*, la réponse cite deux ou
+//! trois produits, et y être vaut plus qu'une campagne. C'est le seul canal où
+//! un petit acteur bat un gros à budget égal — et personne ne sait encore
+//! l'acheter, donc la seule chose qui le rend gouvernable est **une mesure**.
+//!
+//! # Ce que ce module mesure, et ce qu'il refuse de mesurer
+//!
+//! Ce qui suit est la partie la plus importante du fichier, parce que la
+//! tentation est d'écrire « on mesure si ChatGPT nous cite » et de livrer
+//! quelque chose qui ne le fait pas.
+//!
+//! ## Mesurable aujourd'hui, et mesuré
+//!
+//! **Une page de résultats servie publiquement, sans compte.** Un moteur qui
+//! rend ses résultats en HTML à un simple `GET` est lisible par
+//! [`Effects::read_page`], comme n'importe quelle page publique, avec le même
+//! jeton, le même contrôle de portée et la même ligne d'audit qu'une lecture de
+//! site de prospect. On y lit : sommes-nous cités, à quel rang, et qui l'est à
+//! notre place.
+//!
+//! [`Engine::DuckDuckGoLite`] est le seul moteur livré, et le choix est
+//! **daté et vérifié le 2026-09-11** : `lite.duckduckgo.com/robots.txt` et
+//! `html.duckduckgo.com/robots.txt` répondent tous deux `User-agent: *` /
+//! `Allow: /`, là où `duckduckgo.com/robots.txt` interdit `/lite` et `/html`
+//! sur son propre hôte. On lit l'hôte qui l'autorise, et pas l'autre.
+//!
+//! ## Non mesurable, et pourquoi — un par un
+//!
+//! | moteur | pourquoi pas |
+//! |---|---|
+//! | **ChatGPT, Claude, Gemini (l'interface de chat)** | La réponse n'existe que derrière un compte. La lire demanderait de se connecter avec des identifiants et d'automatiser une session — ce que les conditions d'utilisation de chacun interdisent explicitement. Ce module ne le fait pas et n'expose aucun moyen de le faire. |
+//! | **Google, Bing, Brave, Mojeek, Startpage** | Pas de compte à franchir, mais leur `robots.txt` refuse `/search` (vérifié le 2026-09-11 sur les cinq). Un refus écrit par le site est un refus, même quand rien ne l'applique techniquement. |
+//! | **Les API de recherche payantes** (Serper, SerpAPI, Brave Search API) | Elles rendraient Google et Bing mesurables pour quelques dizaines de dollars par mois. C'est **le chemin d'extension évident** le jour où le fondateur décide de dépenser ; il n'est pas codé ici parce que rien dans ce dépôt n'appelle un service payant sans qu'on l'ait décidé. |
+//!
+//! Ce qui reste donc, et qui est réel : **un moteur**. Une mesure sur un moteur
+//! n'est pas la citation par un modèle — c'est son meilleur indicateur
+//! disponible gratuitement, parce que ce que les modèles citent sort en grande
+//! partie de ce que les moteurs classent. Le dire autrement serait vendre une
+//! mesure qu'on ne fait pas.
+//!
+//! # Où est la Gate
+//!
+//! [`measure`] ne lit rien lui-même : il fait émettre un jeton
+//! [`BrowserRead`] par la [`PolicyGate`] pour le principal que l'`Effects`
+//! porte, puis passe par [`Effects::read_page`]. Un siège sans `Channel::Web`
+//! ne mesure pas, et le refus est une ligne d'audit comme les autres — c'est la
+//! forme que `proof_of_need::Browse` a déjà.
+//!
+//! # Le texte d'un étranger
+//!
+//! [`Citation::excerpt`] porte **les mots de la page de résultats** : les titres
+//! et résumés que le moteur affiche. Ce ne sont pas les nôtres. Le scan est fait
+//! en Rust ici et rien de ce qui remonte à un modèle n'est de la prose
+//! recopiée — sauf `excerpt`, qui l'est par construction, et que toute surface
+//! qui le rend doit traiter comme tel. C'est la même frontière que
+//! [`Effects::read_page`] pose avec `Untrusted`.
+//!
+//! # Pas de génération de texte
+//!
+//! [`brief`] rend une **structure** : ce que les pages citées couvrent, ce
+//! qu'elles ne couvrent pas, qui dépasser, et l'angle — un enum à trois
+//! valeurs, choisi par une règle sur le rang. Le texte est écrit par un
+//! employé, avec son modèle, et atterrit dans `content_drafts`. Rien ici
+//! n'écrit une phrase à publier.
+
+use agentos_domain::action::Domain;
+use agentos_store::db::{StoreError, TenantTx};
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use url::Url;
+use uuid::Uuid;
+
+use crate::effects::{BrowserRead, EffectError, Effects};
+use crate::gate::{Denied, PolicyGate};
+use crate::turn::WHOLE_PAGE;
+
+// ---------------------------------------------------------------------------
+// Le vocabulaire
+// ---------------------------------------------------------------------------
+
+/// D'où vient une question.
+///
+/// Une liste fermée en Rust et pas un `CHECK` en base — `0100` argumente — mais
+/// une liste quand même : sans elle la colonne accepte n'importe quoi et cesse
+/// de dire quoi que ce soit. `Customer` vaut dix `Founder` : c'est une question
+/// que quelqu'un a réellement posée.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// Le fondateur l'a écrite.
+    Founder,
+    /// Relevée dans les suggestions d'un moteur.
+    SearchSuggest,
+    /// Un client l'a posée.
+    Customer,
+}
+
+impl Source {
+    /// Ce qui est écrit en base.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Founder => "founder",
+            Self::SearchSuggest => "search_suggest",
+            Self::Customer => "customer",
+        }
+    }
+
+    /// L'inverse. `None` pour tout le reste — une provenance inventée est
+    /// refusée à la porte plutôt qu'écrite et découverte six mois plus tard.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        [Self::Founder, Self::SearchSuggest, Self::Customer]
+            .into_iter()
+            .find(|source| source.as_str() == raw)
+    }
+}
+
+/// Un moteur dont la page de résultats est lisible sans compte.
+///
+/// **Une seule variante, et c'est un fait mesuré, pas un début.** Les docs du
+/// module nomment les autres candidats et la raison de chacun. Un enum plutôt
+/// qu'une chaîne parce que [`measure`] doit savoir construire une URL et lire
+/// une mise en page, et ces deux choses sont propres au moteur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    /// `lite.duckduckgo.com/lite/` — la page de résultats sans script, dix
+    /// résultats, chacun rendu comme trois lignes de tableau : le rang et le
+    /// titre, le résumé, puis l'hôte affiché.
+    ///
+    /// Autorisé par son `robots.txt` (vérifié le 2026-09-11, voir les docs du
+    /// module), servi en HTML pur — donc lisible même par `HttpBrowser`, ce qui
+    /// rend la mesure possible sur un déploiement sans Chromium.
+    DuckDuckGoLite,
+}
+
+impl Engine {
+    /// Tous les moteurs mesurables de ce déploiement.
+    pub const ALL: &'static [Self] = &[Self::DuckDuckGoLite];
+
+    /// Ce qui est écrit dans `content_citations.engine`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DuckDuckGoLite => "duckduckgo_lite",
+        }
+    }
+
+    /// L'inverse d'[`Self::as_str`].
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|e| e.as_str() == raw)
+    }
+
+    /// L'hôte à lire. C'est aussi le domaine que la Gate doit autoriser.
+    #[must_use]
+    pub const fn host(self) -> &'static str {
+        match self {
+            Self::DuckDuckGoLite => "lite.duckduckgo.com",
+        }
+    }
+
+    /// Le domaine du jeton.
+    ///
+    /// `expect` parce que [`Self::host`] est une constante de ce fichier :
+    /// une variante dont l'hôte ne passe pas `Domain::parse` est un bug de
+    /// compilation qu'on n'a pas su exprimer, pas une erreur d'exécution.
+    #[must_use]
+    pub fn domain(self) -> Domain {
+        Domain::parse(self.host()).expect("l'hôte d'un moteur est un domaine")
+    }
+
+    /// La page de résultats pour cette question.
+    ///
+    /// `Url::parse_with_params` fait l'encodage : une question porte des
+    /// espaces, des accents et des points d'interrogation, et un `format!`
+    /// aurait produit une URL fausse au premier « comment vérifier ? ».
+    #[must_use]
+    pub fn results_url(self, question: &str) -> Url {
+        match self {
+            Self::DuckDuckGoLite => {
+                Url::parse_with_params("https://lite.duckduckgo.com/lite/", &[("q", question)])
+                    .expect("une base constante et un paramètre encodé")
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// La mesure
+// ---------------------------------------------------------------------------
+
+/// Ce qu'un moteur répondait à un instant donné.
+///
+/// Une ligne de `content_citations`, avant qu'elle soit une ligne.
+#[derive(Debug, Clone, Serialize)]
+pub struct Citation {
+    /// [`Engine::as_str`]. Une `String` et pas un `&'static str` pour une seule
+    /// raison : une mesure relue en base est aussi une `Citation` — c'est ce qui
+    /// permet à [`brief`] de travailler sur une ligne déjà écrite plutôt que sur
+    /// une lecture fraîche.
+    pub engine: String,
+    pub checked_at: DateTime<Utc>,
+    /// Un de nos domaines apparaît-il dans les résultats.
+    pub cited: bool,
+    /// À partir de 1. `None` quand on n'y est pas — jamais 0.
+    pub rank: Option<i32>,
+    /// Les hôtes rendus par le moteur, dans son ordre, le nôtre compris.
+    pub competitors: Vec<String>,
+    /// **Les mots de la page de résultats** : titres et résumés, dans l'ordre,
+    /// plafonnés. La prose d'un étranger — voir les docs du module.
+    pub excerpt: String,
+}
+
+/// Assez pour les dix résultats d'une page avec leurs résumés ; assez peu pour
+/// qu'une année de mesures quotidiennes sur cent questions tienne dans quelques
+/// dizaines de mégaoctets.
+const EXCERPT_CAP: usize = 2_000;
+
+/// Ce qui peut empêcher une mesure.
+#[derive(Debug, thiserror::Error)]
+pub enum MeasureError {
+    /// Ce locataire n'a aucun domaine enregistré, donc la question « sommes-nous
+    /// cités » n'a pas de sujet.
+    ///
+    /// Refusé plutôt que répondu `cited: false`, qui serait une mesure fausse
+    /// écrite dans une table en ajout seul — et donc un point du graphe qu'on
+    /// ne peut plus retirer.
+    #[error("ce locataire n'a aucun domaine : rien à chercher dans les résultats")]
+    NoDomainOfOurs,
+    #[error(transparent)]
+    Denied(#[from] Denied),
+    #[error(transparent)]
+    Effect(#[from] EffectError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+impl MeasureError {
+    /// Le vocabulaire fermé qu'une route rend en `code`.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoDomainOfOurs => "no_domain_of_ours",
+            Self::Denied(_) => "denied",
+            Self::Effect(err) => err.code(),
+            Self::Store(_) => "store_unavailable",
+        }
+    }
+}
+
+/// **La mesure.** Poser la question au moteur, et lire ce qu'il rend.
+///
+/// Le jeton est émis ici, pour le principal que l'`Effects` porte — et pas reçu
+/// en argument : un appelant qui apparie un jeton et un principal est un
+/// appelant qui peut les apparier mal (`Effects::new` le dit en toutes
+/// lettres). Le seul domaine qu'un jeton d'ici nomme est celui du moteur.
+///
+/// `ours` est un argument et pas une lecture faite ici, parce qu'`Effects` ne
+/// prête pas sa base : la transaction appartient à l'appelant, qui l'a déjà
+/// ouverte pour retrouver la question. [`our_domains`] est la lecture à lui
+/// donner.
+pub async fn measure(
+    effects: &Effects,
+    gate: &PolicyGate,
+    ours: &[String],
+    question: &str,
+    engine: Engine,
+) -> Result<Citation, MeasureError> {
+    measure_page(effects, gate, ours, &engine.results_url(question), engine).await
+}
+
+/// [`measure`], l'URL déjà construite.
+///
+/// Séparée pour une seule raison, et elle est bonne : un faux moteur servi sur
+/// le port qu'un test a obtenu du système ne peut pas être atteint par
+/// [`Engine::results_url`], qui ne connaît pas de port. Le test de bout en bout
+/// entre par ici, et [`Engine::results_url`] a le sien.
+async fn measure_page(
+    effects: &Effects,
+    gate: &PolicyGate,
+    ours: &[String],
+    url: &Url,
+    engine: Engine,
+) -> Result<Citation, MeasureError> {
+    if ours.is_empty() {
+        return Err(MeasureError::NoDomainOfOurs);
+    }
+
+    let token = gate
+        .authorize(
+            effects.principal(),
+            BrowserRead {
+                domain: engine.domain(),
+            },
+        )
+        .await?;
+    let page = effects.read_page(token, url, WHOLE_PAGE).await?;
+
+    // Le texte sort de son enveloppe ici et nulle part ailleurs : ce qui en
+    // ressort est un `Citation` fait de nos compteurs et d'un extrait plafonné.
+    Ok(read_results(
+        &page.into_inner_for_rendering(),
+        ours,
+        engine,
+        Utc::now(),
+    ))
+}
+
+/// Les domaines de ce locataire — ce que « nous » veut dire dans une mesure.
+///
+/// C'est `tenant_domains`, la table des domaines d'envoi, et c'est un raccourci
+/// assumé : le jour où le site d'un client vit sur un domaine que ses courriels
+/// n'utilisent pas, c'est cette table qu'il faudra dédoubler, pas cette
+/// fonction. Une deuxième liste de domaines « pour le web » serait une deuxième
+/// vérité à tenir à jour dès le premier client.
+pub async fn our_domains(tx: &mut TenantTx<'_>) -> Result<Vec<String>, StoreError> {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT domain FROM tenant_domains")
+        .fetch_all(&mut ***tx)
+        .await?;
+    Ok(rows.into_iter().map(|(domain,)| domain).collect())
+}
+
+/// Un résultat, tel que la page l'a rendu.
+#[derive(Debug)]
+struct Hit {
+    host: String,
+    /// Titre puis résumé, sur une ligne.
+    blurb: String,
+}
+
+/// **Le scan, en Rust, de la page de résultats.**
+///
+/// Pur : c'est ce qui rend la mesure testable sans réseau, et c'est aussi ce qui
+/// fait qu'aucun modèle n'a jamais à lire une page de résultats pour en tirer un
+/// rang.
+///
+/// # La mise en page, et le plafond de cette lecture
+///
+/// `lite.duckduckgo.com` rend chaque résultat comme trois `<tr>`, que
+/// l'extracteur de texte de `browser_http` sépare en trois lignes :
+///
+/// ```text
+/// 2. Visa Requirements API — 47 362 paires, 15 langues | Orizn
+/// REST API for visa requirements: 47,362 pairs, 199 passports…
+/// visa.orizn.app
+/// ```
+///
+/// Donc : une ligne qui commence par `N.` ouvre un résultat, une ligne qui est
+/// un hôte seul le referme, et ce qu'il y a entre les deux est le résumé.
+///
+/// **Le plafond est nommé** : un résumé dont le premier caractère est le rang
+/// suivant suivi d'un point ouvrirait un faux résultat. C'est pour ça que les
+/// rangs doivent se suivre — `N` n'est accepté que s'il vaut le nombre de
+/// résultats déjà lus plus un. Ce qui reste possible est un résumé commençant
+/// exactement par le rang attendu ; on n'en a pas vu, et le jour où ça arrive
+/// la mesure de cette question-là est basse d'un cran, pas fausse ailleurs.
+fn read_results(
+    text: &str,
+    ours: &[String],
+    engine: Engine,
+    checked_at: DateTime<Utc>,
+) -> Citation {
+    let mut hits: Vec<Hit> = Vec::new();
+    let mut open: Option<Hit> = None;
+
+    for line in text.lines() {
+        if let Some(title) = numbered(line, hits.len() + usize::from(open.is_some()) + 1) {
+            if let Some(previous) = open.take() {
+                hits.push(previous);
+            }
+            open = Some(Hit {
+                host: String::new(),
+                blurb: title.to_owned(),
+            });
+            continue;
+        }
+        let Some(hit) = open.as_mut() else { continue };
+        if let Some(host) = display_host(line) {
+            hit.host = host;
+            hits.push(open.take().expect("on vient de l'emprunter"));
+        } else if hit.blurb.len() < EXCERPT_CAP {
+            hit.blurb.push(' ');
+            hit.blurb.push_str(line);
+        }
+    }
+    // `open` est abandonné ici : un dernier résultat sans ligne d'hôte n'est pas
+    // un résultat, parce qu'on ne sait pas qui est cité — et c'est la seule
+    // chose que cette fonction mesure.
+
+    let rank = hits
+        .iter()
+        .position(|hit| ours.iter().any(|mine| covers(&hit.host, mine)))
+        .map(|index| i32::try_from(index).unwrap_or(i32::MAX).saturating_add(1));
+
+    let mut excerpt = String::new();
+    for hit in &hits {
+        if excerpt.len() >= EXCERPT_CAP {
+            break;
+        }
+        excerpt.push_str(&hit.blurb);
+        excerpt.push('\n');
+    }
+    truncate_on_char(&mut excerpt, EXCERPT_CAP);
+
+    Citation {
+        engine: engine.as_str().to_owned(),
+        checked_at,
+        cited: rank.is_some(),
+        rank,
+        competitors: hits.into_iter().map(|hit| hit.host).collect(),
+        excerpt,
+    }
+}
+
+/// `"2. Un titre"` → `Some("Un titre")`, mais seulement si `2` est le rang
+/// attendu. Voir le plafond nommé dans [`read_results`].
+fn numbered(line: &str, expected: usize) -> Option<&str> {
+    let (number, rest) = line.split_once('.')?;
+    (number.parse::<usize>().ok()? == expected).then(|| rest.trim_start())
+}
+
+/// `"visa.orizn.app/docs"` → `Some("visa.orizn.app")`, `"REST API for visas"` →
+/// `None`.
+///
+/// La règle : aucun blanc, au moins deux étiquettes, un TLD alphabétique d'au
+/// moins deux lettres. C'est, mot pour mot, la forme que
+/// `tenant_domains_domain_shape` impose en base — donc ce qui est reconnu ici
+/// est ce qui peut être à nous.
+fn display_host(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() || line.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let lowered = line.split('/').next()?.to_ascii_lowercase();
+    let host = lowered.strip_prefix("www.").unwrap_or(lowered.as_str());
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() < 2 {
+        return None;
+    }
+    if !labels.iter().all(|label| {
+        !label.is_empty()
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }) {
+        return None;
+    }
+    let tld = labels.last()?;
+    (tld.len() >= 2 && tld.bytes().all(|b| b.is_ascii_alphabetic())).then(|| host.to_owned())
+}
+
+/// Un hôte est-il à nous : lui-même, ou n'importe quoi en dessous. La règle de
+/// `allowed_domains` (`crates/domain/src/policy.rs`), pour que « notre
+/// domaine » veuille dire la même chose ici et dans la Gate.
+fn covers(host: &str, ours: &str) -> bool {
+    host == ours || host.ends_with(&format!(".{ours}"))
+}
+
+/// Tronque sur une frontière de caractère. `String::truncate` panique au milieu
+/// d'un `—`, et une page de résultats en porte.
+fn truncate_on_char(text: &mut String, max: usize) {
+    if let Some((cut, _)) = text.char_indices().nth(max) {
+        text.truncate(cut);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Le brief
+// ---------------------------------------------------------------------------
+
+/// Les facettes qu'un développeur vérifie avant d'écrire une ligne contre une
+/// API, et les mots par lesquels une page les couvre.
+///
+/// **Une liste fermée, courte, et c'est le sujet du brief.** L'alternative
+/// aurait été de demander à un modèle « que couvrent ces pages » — ce qui est
+/// exactement ce que `Effects::discover_prospects` refuse de faire avec une
+/// page d'étranger, et pour la même raison : la page choisirait les critères.
+///
+/// Les mots sont en anglais parce que les pages citées le sont ; le nom de la
+/// facette est en français parce que c'est un employé qui le lit.
+const FACETS: &[(&str, &[&str])] = &[
+    (
+        "prix",
+        &["pricing", "price", "free tier", "gratuit", "tarif"],
+    ),
+    (
+        "couverture",
+        &["passport", "destination", "countries", "pairs", "coverage"],
+    ),
+    (
+        "fraîcheur",
+        &["updated", "daily", "real-time", "realtime", "last update"],
+    ),
+    ("authentification", &["api key", "token", "oauth", "auth"]),
+    (
+        "limites",
+        &["rate limit", "quota", "requests per", "throttl"],
+    ),
+    ("exemple", &["curl", "example", "sdk", "sample", "snippet"]),
+    ("langues", &["language", "languages", "i18n", "locale"]),
+    ("fiabilité", &["sla", "uptime", "status page", "support"]),
+];
+
+/// L'angle que le brief donne, choisi par le rang et par rien d'autre.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Angle {
+    /// Pas cités. Le chemin le moins cher est ce que personne ne couvre.
+    Uncovered,
+    /// Cités, mais pas en tête. Approfondir ce que ceux du dessus survolent.
+    Outrank,
+    /// En tête. Tenir, et ne pas réécrire ce qui marche.
+    Hold,
+}
+
+/// Ce qu'un employé doit couvrir pour répondre mieux que ce qui est cité.
+///
+/// **Une structure, pas un texte.** C'est l'employé qui écrit, avec son modèle,
+/// et ce qu'il écrit atterrit dans `content_drafts`.
+#[derive(Debug, Clone, Serialize)]
+pub struct Brief {
+    pub question: String,
+    pub angle: Angle,
+    /// Les facettes que les pages citées couvrent déjà. Les répéter ne gagne
+    /// rien.
+    pub covered: Vec<&'static str>,
+    /// Celles qu'aucune ne couvre. C'est là qu'est la place.
+    pub missing: Vec<&'static str>,
+    /// Les hôtes à dépasser : ceux qui sont devant nous, ou les trois premiers
+    /// quand nous ne sommes nulle part.
+    pub outrank: Vec<String>,
+}
+
+/// Ce que le brief promet de nommer quand nous ne sommes pas cités.
+const OUTRANK_WHEN_ABSENT: usize = 3;
+
+/// Le brief d'une question, à la lumière d'une mesure.
+///
+/// Pure, et sans base : un brief se recalcule à partir d'une ligne de
+/// `content_citations` déjà écrite, ce qui est la raison pour laquelle il n'a
+/// pas de table (`migrations/0100` le dit).
+///
+/// # Ce que cette fonction voit, et ce qu'elle ne voit pas
+///
+/// Elle lit `excerpt` — les titres et résumés que le moteur affiche — et **pas
+/// les pages citées elles-mêmes**. Un résumé de deux lignes sous-estime ce
+/// qu'une page couvre, donc `missing` est optimiste : il nomme ce qui n'est pas
+/// *mis en avant*, ce qui est une information différente de « absent », et
+/// souvent la plus utile des deux pour écrire un titre. L'extension évidente —
+/// un `read_page` par page citée — est un appel réseau par concurrent et par
+/// mesure ; elle attend qu'on ait une raison de la payer.
+#[must_use]
+pub fn brief(question: &str, citation: &Citation) -> Brief {
+    let haystack = citation.excerpt.to_lowercase();
+    let (covered, missing): (Vec<_>, Vec<_>) = FACETS
+        .iter()
+        .partition(|(_, needles)| needles.iter().any(|needle| haystack.contains(needle)));
+
+    let angle = match citation.rank {
+        None => Angle::Uncovered,
+        Some(1) => Angle::Hold,
+        Some(_) => Angle::Outrank,
+    };
+    let ahead = match citation.rank {
+        // Le rang est à partir de 1 et l'index à partir de 0 : ceux devant nous
+        // sont les `rank - 1` premiers.
+        Some(rank) => usize::try_from(rank).unwrap_or(0).saturating_sub(1),
+        None => OUTRANK_WHEN_ABSENT,
+    };
+
+    Brief {
+        question: question.to_owned(),
+        angle,
+        covered: covered.iter().map(|(name, _)| *name).collect(),
+        missing: missing.iter().map(|(name, _)| *name).collect(),
+        outrank: citation.competitors.iter().take(ahead).cloned().collect(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Les questions
+// ---------------------------------------------------------------------------
+
+/// Les questions qu'on veut gagner.
+pub mod questions {
+    use super::{DateTime, Serialize, Source, StoreError, TenantTx, Utc, Uuid};
+
+    /// Une ligne de `content_questions`.
+    #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+    pub struct Question {
+        pub id: Uuid,
+        pub question: String,
+        pub locale: String,
+        pub source: String,
+        pub weight: i32,
+        pub created_at: DateTime<Utc>,
+    }
+
+    /// Ajouter une question. Idempotent sur `(question, locale)` : rejouer
+    /// l'ajout rend la ligne existante plutôt que d'en faire une deuxième, pour
+    /// que la série de mesures reste accrochée à une seule.
+    ///
+    /// **`DO NOTHING` et pas `DO UPDATE`, et ce n'est pas un détail de SQL.**
+    /// Un `ON CONFLICT DO UPDATE` réclame le droit d'`UPDATE` sur la table, que
+    /// `0100` ne donne pas — délibérément : une question ne se modifie pas sous
+    /// la série qui pend dessous. Le coût est réel et nommé : rejouer l'ajout
+    /// avec un autre `weight` ou une autre `source` **ne les change pas**.
+    /// Personne n'en a eu besoin ; le jour où ça arrive, c'est une route de
+    /// repondération et un grant d'`UPDATE` sur ces deux colonnes, pas un
+    /// upsert qui ouvre la table entière.
+    pub async fn add(
+        tx: &mut TenantTx<'_>,
+        question: &str,
+        locale: &str,
+        source: Source,
+        weight: i32,
+    ) -> Result<Question, StoreError> {
+        let tenant = tx.tenant_id();
+        let inserted: Option<Question> = sqlx::query_as(
+            "INSERT INTO content_questions \
+                 (id, tenant_id, question, locale, source, weight, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (tenant_id, question, locale) DO NOTHING \
+             RETURNING id, question, locale, source, weight, created_at",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant.as_uuid())
+        .bind(question)
+        .bind(locale)
+        .bind(source.as_str())
+        .bind(weight)
+        .bind(Utc::now())
+        .fetch_optional(&mut ***tx)
+        .await?;
+        if let Some(row) = inserted {
+            return Ok(row);
+        }
+        // Le conflit : la ligne existe déjà, et c'est elle la réponse. Le
+        // `WHERE` n'a pas besoin du locataire — la policy RLS le pose.
+        let row = sqlx::query_as(
+            "SELECT id, question, locale, source, weight, created_at \
+               FROM content_questions WHERE question = $1 AND locale = $2",
+        )
+        .bind(question)
+        .bind(locale)
+        .fetch_one(&mut ***tx)
+        .await?;
+        Ok(row)
+    }
+
+    /// Les questions de ce locataire, les plus lourdes d'abord.
+    pub async fn list(tx: &mut TenantTx<'_>) -> Result<Vec<Question>, StoreError> {
+        let rows = sqlx::query_as(
+            "SELECT id, question, locale, source, weight, created_at \
+               FROM content_questions \
+              ORDER BY weight DESC, created_at ASC",
+        )
+        .fetch_all(&mut ***tx)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Retirer une question, et avec elle ses mesures et ses brouillons — la
+    /// cascade est dans `0100`. `false` quand ce locataire n'en a pas.
+    pub async fn remove(tx: &mut TenantTx<'_>, id: Uuid) -> Result<bool, StoreError> {
+        let gone: Option<(Uuid,)> =
+            sqlx::query_as("DELETE FROM content_questions WHERE id = $1 RETURNING id")
+                .bind(id)
+                .fetch_optional(&mut ***tx)
+                .await?;
+        Ok(gone.is_some())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Les mesures, une fois écrites
+// ---------------------------------------------------------------------------
+
+/// La série dans le temps. En ajout seul, comme la table.
+pub mod citations {
+    use super::{Citation, DateTime, Serialize, StoreError, TenantTx, Utc, Uuid};
+
+    /// Une ligne de `content_citations`, telle qu'on la relit.
+    #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+    pub struct Measured {
+        pub id: Uuid,
+        pub question_id: Uuid,
+        pub checked_at: DateTime<Utc>,
+        pub engine: String,
+        pub cited: bool,
+        pub rank: Option<i32>,
+        pub competitors: serde_json::Value,
+        pub excerpt: String,
+    }
+
+    /// Une mesure relue est une mesure, et [`super::brief`] ne fait pas la
+    /// différence : c'est ce qui rend un brief recalculable des mois après la
+    /// lecture, et c'est pourquoi le brief n'a pas de table.
+    ///
+    /// `competitors` est du `jsonb` qu'on a écrit nous-mêmes comme un tableau de
+    /// chaînes ; une ligne dont ce ne serait pas le cas rend une liste vide
+    /// plutôt que de faire tomber la lecture — le rang, lui, est une colonne à
+    /// part et reste juste.
+    impl From<Measured> for Citation {
+        fn from(row: Measured) -> Self {
+            Self {
+                engine: row.engine,
+                checked_at: row.checked_at,
+                cited: row.cited,
+                rank: row.rank,
+                competitors: serde_json::from_value(row.competitors).unwrap_or_default(),
+                excerpt: row.excerpt,
+            }
+        }
+    }
+
+    /// Classer une mesure. Il n'y a pas de verbe pour la reprendre : `0100` ne
+    /// donne à `app_role` ni `update` ni `delete` sur cette table.
+    pub async fn record(
+        tx: &mut TenantTx<'_>,
+        question_id: Uuid,
+        citation: &Citation,
+    ) -> Result<Uuid, StoreError> {
+        let tenant = tx.tenant_id();
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO content_citations \
+                 (id, tenant_id, question_id, checked_at, engine, cited, rank, competitors, excerpt) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(id)
+        .bind(tenant.as_uuid())
+        .bind(question_id)
+        .bind(citation.checked_at)
+        .bind(&citation.engine)
+        .bind(citation.cited)
+        .bind(citation.rank)
+        .bind(serde_json::json!(citation.competitors))
+        .bind(&citation.excerpt)
+        .execute(&mut ***tx)
+        .await?;
+        Ok(id)
+    }
+
+    /// La série d'une question sur une fenêtre, du plus récent au plus ancien.
+    pub async fn list(
+        tx: &mut TenantTx<'_>,
+        question_id: Uuid,
+        days: i64,
+    ) -> Result<Vec<Measured>, StoreError> {
+        let since = Utc::now() - chrono::Duration::days(days);
+        let rows = sqlx::query_as(
+            "SELECT id, question_id, checked_at, engine, cited, rank, competitors, excerpt \
+               FROM content_citations \
+              WHERE question_id = $1 AND checked_at >= $2 \
+              ORDER BY checked_at DESC",
+        )
+        .bind(question_id)
+        .bind(since)
+        .fetch_all(&mut ***tx)
+        .await?;
+        Ok(rows)
+    }
+
+    /// La dernière mesure d'une question, tous moteurs confondus. Ce que
+    /// `content_briefs_get` lit pour bâtir un brief.
+    pub async fn latest(
+        tx: &mut TenantTx<'_>,
+        question_id: Uuid,
+    ) -> Result<Option<Measured>, StoreError> {
+        let row = sqlx::query_as(
+            "SELECT id, question_id, checked_at, engine, cited, rank, competitors, excerpt \
+               FROM content_citations \
+              WHERE question_id = $1 \
+              ORDER BY checked_at DESC LIMIT 1",
+        )
+        .bind(question_id)
+        .fetch_optional(&mut ***tx)
+        .await?;
+        Ok(row)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Les brouillons
+// ---------------------------------------------------------------------------
+
+/// Ce qu'on écrit pour répondre.
+pub mod drafts {
+    use super::{DateTime, Serialize, StoreError, TenantTx, Utc, Uuid};
+
+    /// Une ligne de `content_drafts`.
+    #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+    pub struct Draft {
+        pub id: Uuid,
+        pub question_id: Uuid,
+        pub title: String,
+        pub body: String,
+        pub state: String,
+        pub url: Option<String>,
+        pub created_at: DateTime<Utc>,
+        pub published_at: Option<DateTime<Utc>>,
+    }
+
+    /// Les colonnes qu'une révision réécrit. `url` présent veut dire publié —
+    /// c'est le seul chemin vers `state = 'published'`, parce que `0100` refuse
+    /// un publié sans adresse ni date.
+    #[derive(Debug, Clone)]
+    pub struct Revision<'a> {
+        pub title: &'a str,
+        pub body: &'a str,
+        /// L'adresse **constatée**. Rien dans ce dépôt ne publie ; c'est la
+        /// personne qui a publié qui l'écrit. `docs/CONTENU.md` § « ce qui
+        /// manque ».
+        pub url: Option<&'a str>,
+    }
+
+    /// Ouvrir un brouillon sur une question.
+    pub async fn create(
+        tx: &mut TenantTx<'_>,
+        question_id: Uuid,
+        title: &str,
+        body: &str,
+    ) -> Result<Draft, StoreError> {
+        let tenant = tx.tenant_id();
+        let row = sqlx::query_as(
+            "INSERT INTO content_drafts \
+                 (id, tenant_id, question_id, title, body, state, created_at) \
+             VALUES ($1, $2, $3, $4, $5, 'draft', $6) \
+             RETURNING id, question_id, title, body, state, url, created_at, published_at",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant.as_uuid())
+        .bind(question_id)
+        .bind(title)
+        .bind(body)
+        .bind(Utc::now())
+        .fetch_one(&mut ***tx)
+        .await?;
+        Ok(row)
+    }
+
+    /// Tous les brouillons de ce locataire, du plus récent au plus ancien.
+    pub async fn list(tx: &mut TenantTx<'_>) -> Result<Vec<Draft>, StoreError> {
+        let rows = sqlx::query_as(
+            "SELECT id, question_id, title, body, state, url, created_at, published_at \
+               FROM content_drafts ORDER BY created_at DESC",
+        )
+        .fetch_all(&mut ***tx)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Réécrire un brouillon, et éventuellement constater qu'il est publié.
+    ///
+    /// `published_at` est posé la première fois qu'une adresse arrive et ne
+    /// bouge plus : la date de publication d'un article est celle de sa
+    /// publication, pas celle de sa dernière correction de typo.
+    pub async fn update(
+        tx: &mut TenantTx<'_>,
+        id: Uuid,
+        revision: &Revision<'_>,
+    ) -> Result<Option<Draft>, StoreError> {
+        let row = sqlx::query_as(
+            "UPDATE content_drafts \
+                SET title = $2, \
+                    body = $3, \
+                    url = $4, \
+                    state = CASE WHEN $4::text IS NULL THEN 'draft' ELSE 'published' END, \
+                    published_at = CASE \
+                        WHEN $4::text IS NULL THEN NULL \
+                        ELSE coalesce(published_at, $5) END \
+              WHERE id = $1 \
+             RETURNING id, question_id, title, body, state, url, created_at, published_at",
+        )
+        .bind(id)
+        .bind(revision.title)
+        .bind(revision.body)
+        .bind(revision.url)
+        .bind(Utc::now())
+        .fetch_optional(&mut ***tx)
+        .await?;
+        Ok(row)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use agentos_domain::action::Channel;
+    use agentos_domain::ids::{EmployeeId, TenantId};
+    use agentos_domain::policy::PolicyLimits;
+    use agentos_providers::browser::BrowserProvider;
+    use agentos_providers::browser_http::{HttpBrowser, PinnedHost};
+    use agentos_store::db::Db;
+    use tokio::io::AsyncWriteExt;
+
+    use super::*;
+    use crate::effects::Ports;
+    use crate::gate::Principal;
+
+    /// Une page de résultats à la forme de `lite.duckduckgo.com` : trois lignes
+    /// de tableau par résultat, le rang collé au titre.
+    fn serp(results: &[(&str, &str, &str)]) -> String {
+        let mut html = String::from("<!doctype html><html><body><table border=\"0\">");
+        for (index, (title, snippet, host)) in results.iter().enumerate() {
+            html.push_str(&format!(
+                "<tr><td valign=\"top\">{}.&nbsp;</td>\
+                 <td><a class='result-link' href='//duckduckgo.com/l/?uddg=x'>{title}</a></td></tr>\
+                 <tr><td>&nbsp;</td><td class='result-snippet'>{snippet}</td></tr>\
+                 <tr><td>&nbsp;</td><td><span class='link-text'>{host}</span></td></tr>",
+                index + 1
+            ));
+        }
+        html.push_str("</table></body></html>");
+        html
+    }
+
+    /// Le domaine `ours` au rang 3, deux concurrents devant — et il y est comme
+    /// un **sous-domaine**, parce que c'est la forme réelle (`orizn.app` est le
+    /// domaine d'envoi, `visa.orizn.app` est le site) et parce que c'est ce qui
+    /// fait passer la mesure par [`covers`] plutôt que par une égalité.
+    fn three_results(ours: &str) -> String {
+        let mine = format!("visa.{ours}");
+        serp(&[
+            (
+                "Visa API by Travel Buddy",
+                "Free tier included. JSON endpoints and examples.",
+                "travel-buddy.ai/api/",
+            ),
+            (
+                "Post-covid visa requirements API",
+                "Real-time visa, entry and vaccination requirements.",
+                "visadb.io/api",
+            ),
+            (
+                "Visa Requirements API | Orizn",
+                "47,362 pairs across 199 passports.",
+                &mine,
+            ),
+        ])
+    }
+
+    // -- le scan, sans base ni réseau ---------------------------------------
+
+    #[test]
+    fn le_scan_rend_le_rang_et_les_concurrents() {
+        // Le texte que `browser_http::visible_text` produit de `three_results`,
+        // écrit ici à la main : ce test-ci mesure le scan, pas l'extracteur.
+        let text = "1. Visa API by Travel Buddy\n\
+                    Free tier included. JSON endpoints and examples.\n\
+                    travel-buddy.ai/api/\n\
+                    2. Post-covid visa requirements API\n\
+                    Real-time visa, entry and vaccination requirements.\n\
+                    visadb.io/api\n\
+                    3. Visa Requirements API | Orizn\n\
+                    47,362 pairs across 199 passports.\n\
+                    visa.orizn.app\n";
+        let cited = read_results(
+            text,
+            &["orizn.app".to_owned()],
+            Engine::DuckDuckGoLite,
+            Utc::now(),
+        );
+        assert!(cited.cited);
+        assert_eq!(cited.rank, Some(3));
+        assert_eq!(
+            cited.competitors,
+            ["travel-buddy.ai", "visadb.io", "visa.orizn.app"]
+        );
+
+        // Le désarmement : la même page, sans nous. Si `cited` était calculé
+        // autrement que par la présence d'un de nos domaines, ce test passerait
+        // aussi.
+        let absent = read_results(
+            text,
+            &["ailleurs.example".to_owned()],
+            Engine::DuckDuckGoLite,
+            Utc::now(),
+        );
+        assert!(!absent.cited);
+        assert_eq!(absent.rank, None);
+        assert_eq!(absent.competitors.len(), 3);
+    }
+
+    /// Une ligne de résumé n'est pas un hôte, et un hôte n'est pas un résumé.
+    #[test]
+    fn un_resume_qui_ressemble_a_un_hote_nen_est_pas_un() {
+        assert_eq!(
+            display_host("visa.orizn.app"),
+            Some("visa.orizn.app".into())
+        );
+        assert_eq!(
+            display_host("www.oanor.com/api/visa-api"),
+            Some("oanor.com".into())
+        );
+        // Des blancs : c'est une phrase.
+        assert_eq!(display_host("REST API for visa requirements"), None);
+        // Pas de point, ou un TLD d'une lettre, ou vide.
+        assert_eq!(display_host("visa"), None);
+        assert_eq!(display_host("e.g"), None);
+        assert_eq!(display_host("..."), None);
+    }
+
+    /// Le rang doit suivre, sinon un résumé numéroté ouvre un faux résultat.
+    #[test]
+    fn un_rang_hors_sequence_nouvre_rien() {
+        let text = "1. Un titre\n\
+                    7. ce résumé commence par un chiffre\n\
+                    exemple.com\n";
+        let scanned = read_results(
+            text,
+            &["nous.example".to_owned()],
+            Engine::DuckDuckGoLite,
+            Utc::now(),
+        );
+        assert_eq!(scanned.competitors, ["exemple.com"]);
+        assert!(
+            scanned.excerpt.contains("7. ce résumé"),
+            "le résumé numéroté doit rester du résumé : {:?}",
+            scanned.excerpt
+        );
+    }
+
+    #[test]
+    fn lurl_du_moteur_encode_la_question() {
+        let url = Engine::DuckDuckGoLite.results_url("comment vérifier un visa par API ?");
+        assert_eq!(url.host_str(), Some("lite.duckduckgo.com"));
+        assert_eq!(
+            url.query(),
+            Some("q=comment+v%C3%A9rifier+un+visa+par+API+%3F")
+        );
+    }
+
+    // -- le brief ------------------------------------------------------------
+
+    /// **Le brief nomme ce que les pages citées ne couvrent pas.**
+    #[test]
+    fn le_brief_nomme_ce_qui_manque_aux_pages_citees() {
+        let citation = read_results(
+            "1. Visa API by Travel Buddy\n\
+             Free tier included with pricing per request. JSON example with curl.\n\
+             travel-buddy.ai/api/\n\
+             2. Orizn\n\
+             47,362 pairs.\n\
+             visa.orizn.app\n",
+            &["orizn.app".to_owned()],
+            Engine::DuckDuckGoLite,
+            Utc::now(),
+        );
+        let sheet = brief("visa requirements api", &citation);
+
+        assert_eq!(sheet.angle, Angle::Outrank);
+        assert!(sheet.covered.contains(&"prix"), "{:?}", sheet.covered);
+        assert!(sheet.covered.contains(&"exemple"), "{:?}", sheet.covered);
+        assert!(sheet.covered.contains(&"couverture"), "{:?}", sheet.covered);
+        // Aucune des deux pages ne parle de limites de débit ni de SLA : c'est
+        // la place, et c'est ce que l'employé doit écrire.
+        assert!(sheet.missing.contains(&"limites"), "{:?}", sheet.missing);
+        assert!(sheet.missing.contains(&"fiabilité"), "{:?}", sheet.missing);
+        // Devant nous : celui-là et lui seul.
+        assert_eq!(sheet.outrank, ["travel-buddy.ai"]);
+
+        // Le désarmement : une facette n'est « couverte » que parce que le mot
+        // est là. Sans les mots, la même mesure la déclare manquante.
+        let silent = Citation {
+            excerpt: "Orizn\n".to_owned(),
+            ..citation.clone()
+        };
+        let sheet = brief("visa requirements api", &silent);
+        assert!(sheet.missing.contains(&"prix"), "{:?}", sheet.missing);
+        assert!(sheet.covered.is_empty(), "{:?}", sheet.covered);
+    }
+
+    #[test]
+    fn langle_suit_le_rang() {
+        let base = read_results(
+            "",
+            &["nous.example".to_owned()],
+            Engine::DuckDuckGoLite,
+            Utc::now(),
+        );
+        let with_rank = |rank: Option<i32>| Citation {
+            rank,
+            cited: rank.is_some(),
+            competitors: vec!["a.example".into(), "b.example".into(), "c.example".into()],
+            ..base.clone()
+        };
+        assert_eq!(brief("q", &with_rank(Some(1))).angle, Angle::Hold);
+        assert_eq!(brief("q", &with_rank(Some(4))).angle, Angle::Outrank);
+        assert_eq!(brief("q", &with_rank(None)).angle, Angle::Uncovered);
+        // Absents, on nomme les trois premiers ; premiers, personne.
+        assert_eq!(brief("q", &with_rank(None)).outrank.len(), 3);
+        assert!(brief("q", &with_rank(Some(1))).outrank.is_empty());
+    }
+
+    // -- de bout en bout, sur un faux moteur servi en local -------------------
+
+    async fn db() -> Option<Db> {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; les tests de contenu veulent un vrai Postgres");
+            return None;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        Some(db)
+    }
+
+    /// Un locataire, un siège actif, une politique qui autorise le web, un
+    /// navigateur provisionné et **un domaine à lui**.
+    ///
+    /// Le domaine est dérivé du locataire et pas écrit en dur : `tenant_domains`
+    /// impose `domain` unique sur toute la base (0093), donc deux tests qui
+    /// adoptent `orizn.app` sont deux tests dont le second meurt sur une clé
+    /// dupliquée — et la trace accuse le contenu plutôt que la fixture.
+    async fn seed(db: &Db) -> (Principal, String) {
+        let now = Utc::now();
+        let tenant = TenantId::new_v7(now);
+        let employee = EmployeeId::new_v7(now);
+        let label = format!("geo-{}", employee.as_uuid().simple());
+        let domain = format!("{}.example", tenant.as_uuid().simple());
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
+            .bind(tenant.as_uuid())
+            .bind(&label)
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, 'lena', 'lena', 'active')",
+        )
+        .bind(employee.as_uuid())
+        .bind(tenant.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert employee");
+        tx.commit().await.expect("commit seed");
+
+        install_web_policy(db, tenant, true).await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        sqlx::query(
+            "INSERT INTO tenant_domains (tenant_id, domain, provider, status, is_primary) \
+             VALUES ($1, $2, 'mock-email', 'verified', true)",
+        )
+        .bind(tenant.as_uuid())
+        .bind(&domain)
+        .execute(&mut **tx)
+        .await
+        .expect("insert domain");
+        sqlx::query(
+            "INSERT INTO employee_resources \
+                 (employee_id, step, tenant_id, state, provider, external_id) \
+             VALUES ($1, 'browser', $2, 'ready', 'mock-browser', $3)",
+        )
+        .bind(employee.as_uuid())
+        .bind(tenant.as_uuid())
+        .bind(format!("ctx-{}", employee.as_uuid().simple()))
+        .execute(&mut **tx)
+        .await
+        .expect("insert browser resource");
+        tx.commit().await.expect("commit resources");
+
+        (Principal::employee(tenant, employee), domain)
+    }
+
+    /// La couche du locataire. `web: false` est le désarmement de la Gate.
+    async fn install_web_policy(db: &Db, tenant: TenantId, web: bool) {
+        let mut allowed_channels = BTreeSet::new();
+        if web {
+            allowed_channels.insert(Channel::Web);
+        }
+        agentos_store::policy::install(
+            db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &PolicyLimits {
+                allowed_channels,
+                max_turns_per_day: 10,
+                ..PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("install policy");
+    }
+
+    /// Sert une page unique sur le loopback, comme `effects.rs` le fait.
+    async fn static_site(html: String) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let html = html.clone();
+                tokio::spawn(async move {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{html}",
+                        html.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Les ports de ce déploiement, le navigateur remplacé par un `GET` épinglé
+    /// sur le faux moteur.
+    fn ports_reading(site: SocketAddr) -> Arc<Ports> {
+        let browser: Arc<dyn BrowserProvider> = Arc::new(HttpBrowser::new(Arc::new(
+            PinnedHost::new(Engine::DuckDuckGoLite.host(), site.ip()),
+        )));
+        Arc::new(Ports {
+            browser,
+            ..crate::mocks::ports()
+        })
+    }
+
+    /// L'URL du faux moteur : son hôte, le port que le système a donné.
+    fn fake_results(site: SocketAddr, question: &str) -> Url {
+        let mut url = Engine::DuckDuckGoLite.results_url(question);
+        url.set_scheme("http").expect("http");
+        url.set_port(Some(site.port())).expect("port");
+        url
+    }
+
+    /// Ce que « nous » veut dire pour ce locataire, lu comme une route le lit.
+    async fn ours(db: &Db, tenant: TenantId) -> Vec<String> {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let domains = our_domains(&mut tx).await.expect("our domains");
+        tx.commit().await.expect("commit");
+        domains
+    }
+
+    #[tokio::test]
+    async fn la_mesure_lit_le_rang_sur_un_faux_moteur_et_sempile_sans_se_reecrire() {
+        let Some(db) = db().await else { return };
+        let (principal, domain) = seed(&db).await;
+        let site = static_site(three_results(&domain)).await;
+        let effects = Effects::new(db.clone(), ports_reading(site), principal.clone());
+        let gate = PolicyGate::new(db.clone());
+        let url = fake_results(site, "visa requirements api");
+        let ours = ours(&db, principal.tenant_id).await;
+
+        let citation = measure_page(&effects, &gate, &ours, &url, Engine::DuckDuckGoLite)
+            .await
+            .expect("la mesure");
+        assert!(citation.cited);
+        assert_eq!(citation.rank, Some(3));
+        assert_eq!(
+            citation.competitors,
+            [
+                "travel-buddy.ai",
+                "visadb.io",
+                format!("visa.{domain}").as_str()
+            ]
+        );
+        assert!(citation.excerpt.contains("Travel Buddy"));
+
+        // La série s'empile. Deux mesures, deux lignes, et la première est
+        // toujours là avec sa valeur.
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        let question = questions::add(&mut tx, "visa requirements api", "en", Source::Founder, 5)
+            .await
+            .expect("add");
+        citations::record(&mut tx, question.id, &citation)
+            .await
+            .expect("record");
+        let second = Citation {
+            checked_at: citation.checked_at + chrono::Duration::hours(1),
+            cited: false,
+            rank: None,
+            ..citation.clone()
+        };
+        citations::record(&mut tx, question.id, &second)
+            .await
+            .expect("record again");
+        let series = citations::list(&mut tx, question.id, 30)
+            .await
+            .expect("list");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(series.len(), 2, "une mesure n'écrase pas la précédente");
+        assert!(!series[0].cited);
+        assert_eq!(
+            series[1].rank,
+            Some(3),
+            "la première mesure a gardé son rang"
+        );
+
+        // Le désarmement de l'ajout seul : `app_role` n'a pas le droit de
+        // réécrire une mesure. Si le grant de `0100` glissait, ce `UPDATE`
+        // passerait.
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        let refused = sqlx::query("UPDATE content_citations SET cited = true")
+            .execute(&mut **tx)
+            .await;
+        assert!(
+            refused.is_err(),
+            "une mesure a pu être réécrite : le grant de 0100 a glissé"
+        );
+        drop(tx);
+
+        drop_tenant(&db, principal.tenant_id).await;
+    }
+
+    /// **La même page, sans nous.**
+    #[tokio::test]
+    async fn la_meme_page_sans_nous_nest_pas_une_citation() {
+        let Some(db) = db().await else { return };
+        // Le seul changement : le domaine cité au rang 3 n'est pas le nôtre.
+        // Rien d'autre ne bouge — même page, même siège, même politique.
+        let (principal, _) = seed(&db).await;
+        let site = static_site(three_results("quelquun-dautre.example")).await;
+        let effects = Effects::new(db.clone(), ports_reading(site), principal.clone());
+        let gate = PolicyGate::new(db.clone());
+
+        let citation = measure_page(
+            &effects,
+            &gate,
+            &ours(&db, principal.tenant_id).await,
+            &fake_results(site, "visa requirements api"),
+            Engine::DuckDuckGoLite,
+        )
+        .await
+        .expect("la mesure");
+        assert!(!citation.cited);
+        assert_eq!(citation.rank, None);
+        assert_eq!(citation.competitors.len(), 3, "les trois sont toujours lus");
+
+        drop_tenant(&db, principal.tenant_id).await;
+    }
+
+    /// **La Gate mord.** Un siège sans `Channel::Web` ne mesure pas.
+    #[tokio::test]
+    async fn un_siege_sans_le_web_ne_mesure_pas() {
+        let Some(db) = db().await else { return };
+        let (principal, domain) = seed(&db).await;
+        let site = static_site(three_results(&domain)).await;
+        let effects = Effects::new(db.clone(), ports_reading(site), principal.clone());
+        let gate = PolicyGate::new(db.clone());
+        let url = fake_results(site, "visa requirements api");
+        let ours = ours(&db, principal.tenant_id).await;
+
+        // Armé : avec le web, la mesure passe.
+        measure_page(&effects, &gate, &ours, &url, Engine::DuckDuckGoLite)
+            .await
+            .expect("avec le web, la mesure passe");
+
+        // Désarmé : on retire le canal, et rien d'autre.
+        install_web_policy(&db, principal.tenant_id, false).await;
+        let err = measure_page(&effects, &gate, &ours, &url, Engine::DuckDuckGoLite)
+            .await
+            .expect_err("sans le web, rien ne sort");
+        assert!(
+            matches!(err, MeasureError::Denied(_)),
+            "la Gate doit refuser, et pas le navigateur : {err}"
+        );
+
+        drop_tenant(&db, principal.tenant_id).await;
+    }
+
+    /// Un locataire sans domaine n'écrit pas un `cited: false` qu'on ne pourrait
+    /// plus retirer.
+    #[tokio::test]
+    async fn sans_domaine_a_nous_la_mesure_refuse() {
+        let Some(db) = db().await else { return };
+        let (principal, _) = seed(&db).await;
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        // Le `WHERE` n'est pas décoratif : la policy RLS bornerait déjà la
+        // portée, mais `crates/app/tests/scoped_deletes.rs` refuse tout `DELETE`
+        // sans clause — un `DELETE FROM tenant_domains` vide la table pour
+        // chaque test qui tourne à côté le jour où quelqu'un le copie hors d'un
+        // `tenant_tx`.
+        sqlx::query("DELETE FROM tenant_domains WHERE tenant_id = $1")
+            .bind(principal.tenant_id.as_uuid())
+            .execute(&mut **tx)
+            .await
+            .expect("delete domain");
+        tx.commit().await.expect("commit");
+
+        let site = static_site(three_results("personne.example")).await;
+        let effects = Effects::new(db.clone(), ports_reading(site), principal.clone());
+        let gate = PolicyGate::new(db.clone());
+        let err = measure_page(
+            &effects,
+            &gate,
+            &ours(&db, principal.tenant_id).await,
+            &fake_results(site, "q"),
+            Engine::DuckDuckGoLite,
+        )
+        .await
+        .expect_err("sans domaine, rien à chercher");
+        assert!(matches!(err, MeasureError::NoDomainOfOurs), "{err}");
+
+        drop_tenant(&db, principal.tenant_id).await;
+    }
+
+    /// **RLS.** Deux locataires, et aucun ne voit les questions, les mesures ni
+    /// les brouillons de l'autre.
+    #[tokio::test]
+    async fn un_locataire_ne_voit_pas_le_contenu_dun_autre() {
+        let Some(db) = db().await else { return };
+        let (a, _) = seed(&db).await;
+        let (b, _) = seed(&db).await;
+
+        let mut tx = db.tenant_tx(a.tenant_id).await.expect("tenant tx");
+        let question = questions::add(
+            &mut tx,
+            "comment vérifier un visa",
+            "fr",
+            Source::Customer,
+            9,
+        )
+        .await
+        .expect("add");
+        citations::record(
+            &mut tx,
+            question.id,
+            &read_results(
+                "",
+                &["a.example".to_owned()],
+                Engine::DuckDuckGoLite,
+                Utc::now(),
+            ),
+        )
+        .await
+        .expect("record");
+        drafts::create(&mut tx, question.id, "Titre", "Corps")
+            .await
+            .expect("draft");
+        tx.commit().await.expect("commit");
+
+        let mut tx = db.tenant_tx(b.tenant_id).await.expect("tenant tx");
+        assert!(questions::list(&mut tx).await.expect("list").is_empty());
+        assert!(
+            citations::list(&mut tx, question.id, 30)
+                .await
+                .expect("list")
+                .is_empty()
+        );
+        assert!(drafts::list(&mut tx).await.expect("list").is_empty());
+        // Et il ne peut pas non plus la retirer.
+        assert!(
+            !questions::remove(&mut tx, question.id)
+                .await
+                .expect("remove")
+        );
+        tx.commit().await.expect("commit");
+
+        // Le désarmement : chez lui, tout est là.
+        let mut tx = db.tenant_tx(a.tenant_id).await.expect("tenant tx");
+        assert_eq!(questions::list(&mut tx).await.expect("list").len(), 1);
+        assert_eq!(
+            citations::list(&mut tx, question.id, 30)
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
+        assert_eq!(drafts::list(&mut tx).await.expect("list").len(), 1);
+        tx.commit().await.expect("commit");
+
+        drop_tenant(&db, a.tenant_id).await;
+        drop_tenant(&db, b.tenant_id).await;
+    }
+
+    /// Un brouillon devient publié quand une adresse est constatée, et sa date
+    /// de publication ne bouge plus.
+    #[tokio::test]
+    async fn un_brouillon_publie_garde_sa_date() {
+        let Some(db) = db().await else { return };
+        let (principal, _) = seed(&db).await;
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        let question = questions::add(&mut tx, "q", "fr", Source::Founder, 1)
+            .await
+            .expect("add");
+        let draft = drafts::create(&mut tx, question.id, "Titre", "Corps")
+            .await
+            .expect("draft");
+        assert_eq!(draft.state, "draft");
+        assert!(draft.published_at.is_none());
+
+        let published = drafts::update(
+            &mut tx,
+            draft.id,
+            &drafts::Revision {
+                title: "Titre",
+                body: "Corps",
+                url: Some("https://visa.orizn.app/blog/visa-api"),
+            },
+        )
+        .await
+        .expect("update")
+        .expect("le brouillon existe");
+        assert_eq!(published.state, "published");
+        let first = published.published_at.expect("publié porte sa date");
+
+        let corrected = drafts::update(
+            &mut tx,
+            draft.id,
+            &drafts::Revision {
+                title: "Titre corrigé",
+                body: "Corps corrigé",
+                url: Some("https://visa.orizn.app/blog/visa-api"),
+            },
+        )
+        .await
+        .expect("update")
+        .expect("le brouillon existe");
+        assert_eq!(
+            corrected.published_at,
+            Some(first),
+            "une typo n'est pas une publication"
+        );
+        tx.commit().await.expect("commit");
+
+        drop_tenant(&db, principal.tenant_id).await;
+    }
+
+    async fn drop_tenant(db: &Db, tenant: TenantId) {
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("DELETE FROM tenants WHERE id = $1")
+            .bind(tenant.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .expect("delete tenant");
+        tx.commit().await.expect("commit");
+    }
+}

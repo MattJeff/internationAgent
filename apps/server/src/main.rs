@@ -805,6 +805,16 @@ fn app(
             // seats consumed at the tenant's declared rate, against what they
             // invoiced, collected and spent. Same window parser again.
             .merge(routes::outreach::router(db.clone()))
+            // À côté d'`outreach`, et c'est l'autre moitié de la même question.
+            // Celui-là compte les inconnus qu'on est allé chercher ; celui-ci
+            // mesure ceux qui nous trouvent — et il emprunte le même `ports`,
+            // donc le même navigateur, que le tour qui lit la page d'un
+            // prospect.
+            .merge(routes::content::router(routes::content::Content {
+                db: db.clone(),
+                gate: gate.clone(),
+                ports: ports.clone(),
+            }))
             .merge(routes::prospects::router(db.clone()))
             .merge(routes::sequences::router(db.clone()))
             .merge(routes::quotes::router(db.clone()))
