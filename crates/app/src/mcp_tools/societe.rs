@@ -206,6 +206,46 @@ pub fn tools() -> Vec<ToolDef> {
             &[],
             Risk::Destructive,
         ),
+        // -------------------------------------------------------------------
+        // Les humains : qui, chez le client, peut engager la société
+        // -------------------------------------------------------------------
+        t(
+            "console_accounts_role_set",
+            "Qui, parmi vos humains, peut engager la société",
+            "Donne ou retire le rôle `owner` à une personne de votre entreprise, désignée par \
+             l'adresse avec laquelle elle ouvre la console. Un `owner` peut tout : approuver un \
+             paiement, arrêter l'entreprise, résilier un siège, brancher le modèle, émettre une \
+             clé, déplacer un plafond. Un `member` lit tout et écrit ce qui n'engage rien — une \
+             tâche, un rendez-vous, un brouillon, un message à un siège. À ne pas confondre avec \
+             `policy_role_set`, qui borne ce qu'un employé **logiciel** fait tout seul ; celui-ci \
+             dit ce qu'un **humain** a le droit de décider. Trois pièges : la personne doit déjà \
+             avoir un compte (c'est le fournisseur qui le crée, pas cet outil, et une adresse \
+             inconnue rend 404) ; le dernier `owner` actif ne peut pas se rétrograder, sinon plus \
+             personne ne pourrait rendre le rôle ; et le changement est senti par la requête \
+             suivante, sans reconnexion.",
+            Method::Put,
+            "/v1/console/accounts/role",
+            json!({
+                "type": "object",
+                "properties": {
+                    "email": {
+                        "type": "string",
+                        "description": "l'adresse avec laquelle cette personne ouvre la console"
+                    },
+                    "role": {
+                        "type": "string",
+                        "enum": ["owner", "member"],
+                        "description": "`owner` : tout, y compris donner ce rôle. `member` : \
+                                        tout ce qui n'engage ni l'argent ni l'existence de la \
+                                        société"
+                    },
+                },
+                "required": ["email", "role"],
+            }),
+            &[],
+            // Rétrograder retire un droit, et c'est bien un `set` qui remplace.
+            Risk::Destructive,
+        ),
         t(
             "company_health_get",
             "Est-ce que cette société travaille encore ?",
@@ -1639,7 +1679,7 @@ mod tests {
     /// une route, sans qu'aucun test ne rougisse. En lisant le source, le test
     /// compare la table à ce qui est **réellement monté**, et un fichier déplacé
     /// ne compile même pas.
-    const ROUTE_SOURCES: [&str; 17] = [
+    const ROUTE_SOURCES: [&str; 18] = [
         include_str!("../../../../apps/server/src/routes/employees.rs"),
         include_str!("../../../../apps/server/src/routes/teams.rs"),
         include_str!("../../../../apps/server/src/routes/companies.rs"),
@@ -1660,6 +1700,11 @@ mod tests {
         include_str!("../../../../apps/server/src/routes/public_register.rs"),
         include_str!("../../../../apps/server/src/routes/health.rs"),
         include_str!("../../../../apps/server/src/routes/keys.rs"),
+        // Les comptes humains, ajoutés le 2026-09-11 avec le rôle de console :
+        // deux des trois routes de ce fichier sont sur l'étage public et ne
+        // sont donc pas des verbes de locataire, mais la troisième — celle qui
+        // donne le rôle — en est un et a son outil.
+        include_str!("../../../../apps/server/src/routes/accounts.rs"),
     ];
 
     /// Tout chemin passé à un `.route(` dans ces sources.
