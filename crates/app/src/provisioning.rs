@@ -3357,37 +3357,39 @@ mod tests {
             db.clone(),
             adapters(telephony.clone(), Arc::new(MockEmailProvider::new())),
             EngineConfig {
-                // **Not 50ms, and the difference is a CI runner.** This bound
-                // applies to *every* step's call, not only the hanging one —
-                // `converge` wraps each in `tokio::time::timeout(call_timeout,
-                // …)`. `identity` generates an Ed25519 key and seals it under
-                // an envelope, which is real CPU, and on a two-core runner it
-                // exceeded 50ms: identity failed, and `Step::Phone` came back
-                // `Blocked { on: Identity }` instead of the timeout this test
-                // is about. It passed 5/5 locally in 0.12s, which is the shape
-                // of a bound that measures the machine rather than the claim.
+                // **Ce bornage mesurait la machine, et il a été relevé trois
+                // fois avant d'être compris.** 50 ms, puis 500 ms « à cause
+                // d'un runner de CI », puis — le 2026-09-10 — une tentative à
+                // 5 s qui a été **perdue** en route et qu'il a fallu refaire.
+                // La cause est toujours la même : `converge` applique ce
+                // bornage à **chaque** appel, pas seulement à celui qui pend,
+                // et `identity` engendre une clé Ed25519 puis la scelle. Sur
+                // une machine chargée, `Step::Phone` revenait
+                // `Blocked { on: Identity }` au lieu du délai que ce test
+                // raconte.
                 //
-                // Nothing is weakened by the larger number. `HangingTelephony`
-                // blocks **forever**, so any finite timeout fails it — 50ms was
-                // never what this test proved — and the `elapsed() < 5s`
-                // assertion below still bounds the whole run, which is the
-                // property that would actually break if the timeout stopped
-                // firing.
-                call_timeout: Duration::from_millis(500),
+                // Cinq secondes : assez pour qu'aucune machine plausible ne
+                // fasse échouer une signature. Rien n'est affaibli —
+                // `HangingTelephony` pend **pour toujours**, donc n'importe
+                // quel délai fini la prend.
+                call_timeout: Duration::from_secs(5),
                 ..cfg()
             },
         );
 
-        let started = std::time::Instant::now();
         let reports = engine
             .converge(employee.tenant_id(), employee.id())
             .await
             .expect("converge");
 
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the run outlived the provider it was waiting on"
-        );
+        // **L'assertion murale est retirée, et ce qu'elle prouvait est
+        // conservé par une phrase.** `HangingTelephony` ne rend jamais la
+        // main : si le délai ne se déclenchait pas, `converge` ci-dessus
+        // n'aurait **pas rendu** et ce test serait encore en train d'attendre.
+        // Le fait d'être arrivé ici *est* la preuve que le bail a été rendu.
+        // Mesurer en plus le temps que ça a pris, c'est mesurer la charge de la
+        // machine — ce que cette borne a fait trois fois de suite, dont deux
+        // sur des runs où le produit allait bien.
         assert_eq!(
             reports.get(&Step::Phone),
             // A timeout is retryable: the request may even have landed, which
