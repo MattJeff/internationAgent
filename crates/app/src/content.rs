@@ -1042,6 +1042,19 @@ pub mod repos {
     /// `StoreError`, c'est-à-dire en 500 pour un appelant qui a simplement mal
     /// recopié un nom. Une lecture d'abord, et la faute revient à qui peut la
     /// corriger.
+    ///
+    /// [`StoreError::NotFound`] quand le siège n'est pas celui de ce locataire,
+    /// **et cette lecture-là n'est pas une commodité**. La clé étrangère vers
+    /// `employees` est vérifiée par Postgres hors de la RLS, donc elle accepte
+    /// l'identifiant d'un siège d'en face ; la policy de cette table, elle, ne
+    /// regarde que `tenant_id`, que la ligne écrite porte correctement. Sans
+    /// cette lecture, un locataire qui a branché un serveur peut écrire une
+    /// ligne sur le siège d'un autre — il n'en tirerait rien (la Gate refuse un
+    /// employé que sa transaction ne voit pas, `UnknownEmployee`), mais la
+    /// ligne occuperait la clé primaire et le vrai propriétaire du siège ne
+    /// pourrait plus poser la sienne. C'est la forme d'`employee_resources` et
+    /// de toutes les tables pendues à un siège ; ici la lecture coûte une ligne
+    /// et referme la question.
     pub async fn set(
         tx: &mut TenantTx<'_>,
         employee_id: Uuid,
@@ -1050,7 +1063,14 @@ pub mod repos {
         branch: &str,
         folder: &str,
     ) -> Result<Option<Repo>, StoreError> {
-        // La policy RLS de `mcp_servers` borne déjà la lecture au locataire.
+        // Les deux lectures sont bornées au locataire par la RLS de leur table.
+        let seat: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM employees WHERE id = $1")
+            .bind(employee_id)
+            .fetch_optional(&mut ***tx)
+            .await?;
+        if seat.is_none() {
+            return Err(StoreError::NotFound);
+        }
         let bound: Option<(String,)> =
             sqlx::query_as("SELECT server FROM mcp_servers WHERE server = $1")
                 .bind(server)
@@ -2590,6 +2610,35 @@ mod tests {
             .await
             .expect("set")
             .is_none()
+        );
+        tx.commit().await.expect("commit");
+
+        // **Et même branché, il ne peut pas écrire sur le siège d'en face.**
+        // La clé étrangère vers `employees` est vérifiée hors de la RLS : sans
+        // la lecture que `set` fait, cette ligne passerait, et le vrai
+        // propriétaire du siège ne pourrait plus poser la sienne.
+        let mut tx = db.tenant_tx(b.tenant_id).await.expect("tenant tx");
+        sqlx::query(
+            "INSERT INTO mcp_servers (tenant_id, server, url, reach, connector) \
+             VALUES ($1, $2, 'https://api.githubcopilot.com/mcp/', 'public', 'github')",
+        )
+        .bind(b.tenant_id.as_uuid())
+        .bind(HANDLE)
+        .execute(&mut **tx)
+        .await
+        .expect("insert binding");
+        let stolen = repos::set(
+            &mut tx,
+            a.employee_id.as_uuid(),
+            HANDLE,
+            "voleur/site",
+            "main",
+            "content",
+        )
+        .await;
+        assert!(
+            matches!(stolen, Err(agentos_store::db::StoreError::NotFound)),
+            "un voisin a pu écrire sur le siège d'en face"
         );
         tx.commit().await.expect("commit");
 
