@@ -69,7 +69,7 @@
 //! toute la table — parce que la première protège d'une erreur de câblage et la
 //! seconde d'une ligne ajoutée par distraction.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use agentos_app::mcp_server::ToolDef;
 use agentos_app::mcp_tools::registry;
@@ -77,8 +77,9 @@ use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Request as HttpRequest, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Map, Value, json};
 use tower::ServiceExt;
@@ -90,6 +91,15 @@ use crate::error::ApiError;
 /// Le seul chemin de ce module. Nommé plutôt qu'écrit deux fois : la garde
 /// anti-boucle le compare à chaque ligne de la table.
 pub const PATH: &str = "/v1/mcp/server";
+
+/// Le voyant d'installation : combien d'outils, et si un client s'est déjà
+/// présenté.
+///
+/// Sous `PATH`, donc **hors** du routeur que l'exécuteur rejoue, donc aucun
+/// outil ne peut l'appeler (`no_tool_can_call_the_mcp_server_back` refuse tout
+/// ce qui est sous ce chemin, et cette route n'est de toute façon pas dans
+/// l'étage `api`). C'est la console qui la lit, avec la clé de la session.
+pub const STATUS_PATH: &str = "/v1/mcp/server/status";
 
 /// La révision du protocole que ce serveur parle.
 ///
@@ -145,6 +155,34 @@ pub struct McpServerState {
     /// paniquer — une route qui n'est pas câblée est une panne de déploiement,
     /// pas de requête.
     inner: Arc<OnceLock<Router>>,
+    /// La dernière poignée de main réussie, **en mémoire de ce processus**.
+    ///
+    /// Pas une table, et c'est un choix plutôt qu'une économie : ce que le
+    /// fondateur demande à cet écran est « est-ce que mon terminal parle à ce
+    /// déploiement », question dont la réponse utile vaut quelques minutes. Une
+    /// ligne par `initialize` serait un journal — une écriture sur le chemin
+    /// d'une sonde non authentifiée, donc un chemin d'écriture ouvert à qui
+    /// n'a pas de clé.
+    ///
+    /// ponytail : une seule case pour tout le déploiement, et elle est perdue
+    /// au redémarrage. Perdue = « aucune session vue » sur un serveur qui
+    /// marche, ce qui se rattrape en relançant `/mcp` dans le terminal ; c'est
+    /// acceptable parce que c'est un voyant d'installation, pas une preuve. La
+    /// case n'est pas non plus par locataire : `initialize` passe sans clé (voir
+    /// les docs du module), donc il n'y a personne à qui l'attribuer. Le jour où
+    /// le multi-locataire s'allume, il faudra d'abord décider ce qu'on retient
+    /// d'une sonde anonyme — et sans doute ne noter que les `tools/list`, qui
+    /// eux portent une clé.
+    seen: Arc<Mutex<Option<Handshake>>>,
+}
+
+/// Qui s'est présenté, et quand.
+#[derive(Clone)]
+struct Handshake {
+    /// `clientInfo.name` et sa version, tels que le client les a dits. Une
+    /// chaîne et pas deux champs : le seul lecteur l'affiche telle quelle.
+    client: Option<String>,
+    at: DateTime<Utc>,
 }
 
 impl McpServerState {
@@ -154,6 +192,7 @@ impl McpServerState {
         Self {
             keys,
             inner: Arc::new(OnceLock::new()),
+            seen: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -163,11 +202,43 @@ impl McpServerState {
         // le même de toute façon, et paniquer au boot pour ça serait pire.
         let _ = self.inner.set(api);
     }
+
+    /// Retenir qui vient de se présenter.
+    ///
+    /// Un verrou empoisonné est ignoré plutôt que propagé : ce qu'il garde est
+    /// un voyant, et refuser une poignée de main parce qu'un thread a paniqué
+    /// ailleurs coûterait la session qu'on essaie justement d'établir.
+    fn note_handshake(&self, client: Option<String>, at: DateTime<Utc>) {
+        if let Ok(mut seen) = self.seen.lock() {
+            *seen = Some(Handshake { client, at });
+        }
+    }
+
+    fn last_handshake(&self) -> Option<Handshake> {
+        self.seen.lock().ok().and_then(|seen| seen.clone())
+    }
+}
+
+/// `clientInfo` d'un `initialize`, en une ligne affichable.
+///
+/// `None` quand le client ne se nomme pas : MCP le demande, tous ne le font
+/// pas, et inventer « inconnu » ici mettrait ce mot dans une console au lieu de
+/// la laisser dire ce qu'elle veut d'une absence.
+fn client_of(request: &Value) -> Option<String> {
+    let info = request.get("params")?.get("clientInfo")?;
+    let name = info.get("name").and_then(Value::as_str)?;
+    Some(match info.get("version").and_then(Value::as_str) {
+        Some(version) => format!("{name} {version}"),
+        None => name.to_owned(),
+    })
 }
 
 /// La route. **À monter hors de `with_api_stack`** — voir les docs du module.
 pub fn router(state: McpServerState) -> Router {
-    Router::new().route(PATH, post(rpc)).with_state(state)
+    Router::new()
+        .route(PATH, post(rpc))
+        .route(STATUS_PATH, get(status))
+        .with_state(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -507,6 +578,33 @@ fn failure(id: Value, err: &RpcError) -> Response {
     .into_response()
 }
 
+/// `GET /v1/mcp/server/status` — le voyant que la console relit.
+///
+/// Authentifié comme `tools/list`, par la même fonction et rendu par le même
+/// `auth::unauthorized()` : cette route dit ce que ce déploiement expose, et
+/// c'est une phrase de locataire.
+async fn status(State(state): State<McpServerState>, headers: HeaderMap) -> Response {
+    match state
+        .keys
+        .principal_of(headers.get(header::AUTHORIZATION))
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return crate::auth::unauthorized(),
+        Err(err) => return ApiError::from(err).into_response(),
+    }
+
+    let seen = state.last_handshake();
+    Json(json!({
+        // La table, comptée là où elle est écrite. Un nombre en dur ici serait
+        // un nombre faux le jour où un outil est ajouté.
+        "tools": registry().len(),
+        "last_session_at": seen.as_ref().map(|handshake| handshake.at),
+        "last_client": seen.and_then(|handshake| handshake.client),
+    }))
+    .into_response()
+}
+
 async fn rpc(State(state): State<McpServerState>, headers: HeaderMap, body: Bytes) -> Response {
     let Ok(request) = serde_json::from_slice::<Value>(&body) else {
         return failure(
@@ -552,6 +650,13 @@ async fn dispatch(
         .ok_or_else(|| RpcError::new(code::INVALID_REQUEST, "method est requis"))?;
 
     if method == "initialize" {
+        // Notée avant de répondre, et sans clé : c'est la poignée de main
+        // elle-même qu'on note, et elle n'en présente pas (voir les docs du
+        // module). Un client qui se présente mais dont la clé est fausse
+        // s'affichera donc comme « vu » ici et échouera sur `tools/list` — ce
+        // qui est la vérité, et la distinction que la console rend en disant
+        // le nom du client plutôt qu'« authentifié ».
+        state.note_handshake(client_of(request), Utc::now());
         return Ok(json!({
             "protocolVersion": PROTOCOL,
             "capabilities": {"tools": {"listChanged": false}},
@@ -1082,6 +1187,73 @@ mod tests {
                 serde_json::from_slice(&bytes).unwrap_or(Value::Null),
             )
         }
+
+        /// Le voyant, lu comme la console le lit.
+        async fn status(&self, secret: Option<&str>) -> (StatusCode, Value) {
+            let mut request = HttpRequest::get(STATUS_PATH);
+            if let Some(secret) = secret {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {secret}"));
+            }
+            let response = self
+                .app
+                .clone()
+                .oneshot(request.body(Body::empty()).expect("request"))
+                .await
+                .expect("service");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+                .await
+                .expect("body");
+            (
+                status,
+                serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    }
+
+    /// Le voyant : il compte la table, il ne prétend pas avoir vu une session
+    /// avant d'en voir une, et il en nomme une après.
+    #[tokio::test]
+    async fn the_status_counts_the_tools_and_only_sees_a_session_after_one() {
+        let Some(harness) = Harness::new().await else {
+            return;
+        };
+
+        // Sans clé, comme toute lecture de locataire.
+        let (status, _) = harness.status(None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, before) = harness.status(Some(SECRET)).await;
+        assert_eq!(status, StatusCode::OK, "{before}");
+        assert_eq!(before["tools"], json!(registry().len()));
+        assert!(
+            before["tools"].as_u64().unwrap_or_default() > 0,
+            "un registre vide ferait passer ce test sans rien compter"
+        );
+        assert_eq!(before["last_session_at"], Value::Null);
+        assert_eq!(before["last_client"], Value::Null);
+
+        let (status, _) = harness
+            .rpc(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"clientInfo": {"name": "claude-code", "version": "2.1.0"}}}),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, after) = harness.status(Some(SECRET)).await;
+        assert_eq!(status, StatusCode::OK, "{after}");
+        assert_eq!(after["last_client"], json!("claude-code 2.1.0"));
+        let seen: chrono::DateTime<Utc> = after["last_session_at"]
+            .as_str()
+            .expect("un instant")
+            .parse()
+            .expect("une date");
+        assert!(
+            (Utc::now() - seen).num_seconds().abs() < 60,
+            "l'instant noté n'est pas celui de la poignée de main : {seen}"
+        );
     }
 
     /// La poignée de main : la version, l'identité, et le texte qu'un modèle lit

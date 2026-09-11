@@ -732,6 +732,11 @@ fn app(
     let api = with_api_stack(
         Router::new()
             .route("/v1/whoami", get(whoami))
+            // La clé que le locataire émet pour lui-même, et la seule chose de
+            // cet étage qui rende un secret. Dans `with_api_stack` et pas à
+            // côté de `platform` : le locataire vient du credential, donc il
+            // n'y a pas de corps qui puisse en nommer un autre.
+            .merge(routes::keys::router(db.clone(), keyring.hasher().clone()))
             .merge(routes::browser::router(browser))
             .merge(routes::employees::router(hiring.clone()))
             .merge(routes::domain::router(hiring.clone()))
@@ -947,8 +952,10 @@ fn app(
     .merge(routes::public_register::public_router(db.clone()))
     // Sans credential, et c'est le point : une personne qui se connecte n'en a
     // pas encore. Ce qu'elle obtient est un jeton de session — une clé de son
-    // seul locataire, qui ne peut en fabriquer aucune autre. `platform` reste
-    // la seule autorité qui crée une personne et qui la révoque.
+    // seul locataire. Depuis `routes::keys`, elle peut en fabriquer d'autres
+    // *pour ce locataire-là* et seulement des clés qui ne portent aucun rôle
+    // qu'elle ne tienne déjà ; `platform` reste la seule autorité qui crée une
+    // personne, qui la révoque, et qui émet chez quelqu'un d'autre.
     .merge(routes::accounts::public_router(
         db.clone(),
         keyring.hasher().clone(),

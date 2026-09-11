@@ -428,7 +428,11 @@ fn forbidden(code: &'static str, title: &'static str) -> ApiError {
 }
 
 /// The role this credential holds. See the module docs: it is the key's label.
-fn held_role(actor: &AuditActor) -> Option<&str> {
+///
+/// `pub(crate)` for `routes::keys`, which has to refuse a tenant issuing itself
+/// a label it does not already hold. That refusal and this check must read the
+/// role the same way, or the door and the lock are two opinions.
+pub(crate) fn held_role(actor: &AuditActor) -> Option<&str> {
     match actor {
         AuditActor::Operator(label) => Some(label),
         // An employee or the system holding a human approval role would defeat

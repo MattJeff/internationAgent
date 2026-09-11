@@ -158,10 +158,37 @@ claude mcp get siglair   # le détail de celui-ci
 
 et, depuis Claude Code, `/mcp`.
 
-La clé est une clé de locataire ordinaire — une entrée de `AGENTOS_API_KEYS`, ou
-une clé émise par `POST /v1/platform/keys`. Voir `OPERATIONS.md` §1.4. **Rien de
+La clé est une clé de locataire ordinaire — une entrée de `AGENTOS_API_KEYS`, une
+clé émise par `POST /v1/platform/keys`, ou, depuis le 2026-09-11, **une clé que le
+locataire s'émet lui-même** avec `POST /v1/keys {label}` (liste : `GET /v1/keys`,
+retrait : `DELETE /v1/keys/{id}`). Voir `OPERATIONS.md` §1.4. **Rien de
 spécifique au MCP n'est à provisionner** : pas de compte, pas d'OAuth, pas de
 rôle à part.
+
+Cette troisième forme est celle que la console pose sous le bouton « Créer une
+clé pour Claude Code » de son écran *Connexion* : l'étiquette d'une clé **est**
+son rôle (`routes::approvals::held_role`), donc la route refuse une étiquette qui
+nomme un rôle que l'appelant ne tient pas, et le préfixe `session-` des sessions
+de console. Un fondateur ne peut donc pas s'émettre depuis un navigateur une clé
+qui approuve ses propres paiements.
+
+Et pour savoir si ça a marché sans quitter la console :
+
+```
+GET /v1/mcp/server/status
+→ {"tools": 116, "last_session_at": "…" | null, "last_client": "claude-code 2.1.0" | null}
+```
+
+`tools` est `registry().len()`. Les deux autres sont la **dernière poignée de
+main réussie, retenue en mémoire du processus** : un redémarrage les remet à
+`null`, et c'est assumé — c'est un voyant d'installation, pas un journal. Comme
+`initialize` passe sans clé, la case n'est pas attribuée à un locataire ; le jour
+où le multi-locataire s'allume, il faudra d'abord décider ce qu'on retient d'une
+sonde anonyme.
+
+Aucun outil ne peut pointer sur `/v1/mcp/server/status` : `no_tool_can_call_the_mcp_server_back`
+refuse tout chemin sous `/v1/mcp/server/`, et cette route n'est de toute façon
+pas dans l'étage `api` que l'exécuteur rejoue.
 
 ---
 

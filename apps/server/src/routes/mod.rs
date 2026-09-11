@@ -53,6 +53,10 @@ pub mod inventory;
 // arrived. The employee's half is `agentos_app::effects::issue_invoice` — and
 // there is deliberately no operator way to *issue* one; see the module docs.
 pub mod invoices;
+// la clé que le locataire émet pour lui-même : celle qu'on colle dans
+// `claude mcp add`. `platform` en est la moitié fournisseur — il nomme le
+// locataire, celui-ci le lit dans le credential et ne sait pas dire « autrui ».
+pub mod keys;
 pub mod knowledge;
 pub mod mcp;
 // le serveur MCP : l'autre sens de `mcp`. Celui-ci n'appelle personne — il
