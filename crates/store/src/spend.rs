@@ -786,6 +786,20 @@ mod tests {
     /// not actually racing. A green result that proves nothing is worse than a
     /// red one. Even so, a storm is probabilistic; the deterministic proof that
     /// the bucket is genuinely locked is the test above.
+    ///
+    /// **Ce que « 1000 » veut dire, corrigé le 2026-09-11.** Le pool de
+    /// connexions est plus petit que mille, donc une partie des tâches attend
+    /// son tour et, sur une machine chargée, expire avant de l'obtenir. Ce test
+    /// les comptait comme des tentatives et paniquait sur `PoolTimedOut` —
+    /// trois agents l'ont vu rouge le même jour, chacun concluant à un défaut
+    /// pré-existant, et il passait seul à chaque fois. Il mesurait la taille du
+    /// pool de la machine, pas le verrou du seau.
+    ///
+    /// Un appelant qui n'a jamais ouvert de transaction n'a rien réservé.
+    /// L'invariant porte donc sur ceux qui sont **entrés** : de ceux-là,
+    /// exactement vingt gagnent. `attempted` doit rester assez grand pour que
+    /// ce soit un résultat, et `peak` prouve qu'ils se sont vraiment
+    /// chevauchés — les deux gardes restent, seule la panique s'en va.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn a_thousand_concurrent_reservations_cannot_structure_past_the_cap() {
         let Some(db) = db().await else { return };
@@ -822,7 +836,18 @@ mod tests {
                     // Timed from the moment the transaction exists, so the
                     // window measured is the one where the row lock is held —
                     // not the time spent queueing for a pool connection.
-                    let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+                    // **Obtenir une connexion n'est pas une tentative.** Le
+                    // pool est plus petit que ces mille tâches, et sur une
+                    // machine chargée certaines expirent en l'attendant. Un
+                    // appelant qui n'est jamais entré dans la base n'a rien
+                    // réservé et n'a rien à prouver : il est compté à part, et
+                    // l'invariant plus bas porte sur ceux qui sont entrés.
+                    // Trois agents ont vu ce test rouge le 2026-09-11 sur ce
+                    // `expect`, en `PoolTimedOut` — c'était la taille du pool
+                    // de la machine qui parlait, jamais le verrou du seau.
+                    let Ok(mut tx) = db.tenant_tx(tenant).await else {
+                        return None;
+                    };
                     let start = Instant::now();
                     let outcome = reserve(&mut tx, employee, DAY, usd_minor(AMOUNT)).await;
                     let ok = match outcome {
@@ -836,18 +861,34 @@ mod tests {
                         }
                         Err(other) => panic!("unexpected refusal: {other}"),
                     };
-                    (ok, start, Instant::now())
+                    Some((ok, start, Instant::now()))
                 })
             })
             .collect();
 
         let mut granted = 0usize;
+        let mut turned_away = 0usize;
         let mut spans = Vec::with_capacity(ATTEMPTS);
         for task in tasks {
-            let (ok, start, end) = task.await.expect("task panicked");
-            granted += usize::from(ok);
-            spans.push((start, end));
+            match task.await.expect("task panicked") {
+                Some((ok, start, end)) => {
+                    granted += usize::from(ok);
+                    spans.push((start, end));
+                }
+                None => turned_away += 1,
+            }
         }
+        let attempted = ATTEMPTS - turned_away;
+        // Assez d'entrants pour que la bousculade veuille dire quelque chose.
+        // `peak` plus bas prouve qu'ils se sont vraiment chevauchés ; ceci
+        // prouve qu'ils étaient assez nombreux pour que vingt gagnants soit un
+        // résultat et non une fatalité.
+        assert!(
+            attempted >= WINNERS * 5,
+            "seulement {attempted} des {ATTEMPTS} tâches ont atteint la base \
+             ({turned_away} recalées par le pool) : la bousculade est trop \
+             petite pour prouver quoi que ce soit"
+        );
 
         // Did they actually race? Sweep the [start, end) intervals and take the
         // deepest overlap. If this is 1, every reservation ran alone and the
@@ -865,13 +906,17 @@ mod tests {
         }
         assert!(
             peak >= 8,
-            "reservations serialised (peak concurrency {peak}); this test proves nothing"
+            "reservations serialised (peak concurrency {peak} over {attempted} \
+             attempts); this test proves nothing"
         );
 
         // The invariant. Not "roughly 20", not "we logged the overage": the
         // committed total is under the cap and the winners are exact.
         let (reserved, txns) = bucket(&db, tenant, employee).await;
-        assert_eq!(granted, WINNERS, "peak concurrency was {peak}");
+        assert_eq!(
+            granted, WINNERS,
+            "peak concurrency was {peak} over {attempted} attempts"
+        );
         assert_eq!(txns as usize, WINNERS);
         assert_eq!(reserved as u64, AMOUNT * WINNERS as u64);
         assert!(
