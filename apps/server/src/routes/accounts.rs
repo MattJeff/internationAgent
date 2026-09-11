@@ -525,7 +525,12 @@ mod tests {
                 api: crate::with_api_stack(
                     crate::routes::employees::router(crate::routes::domain::Hiring::for_tests(
                         db.clone(),
-                    )),
+                    ))
+                    // Le geste qui donne le rôle est sur cet étage-là, donc
+                    // sous la couche qui vérifie le rôle : c'est ce qui rend
+                    // `un_membre_ne_se_promeut_pas_lui_meme` vrai sans une
+                    // ligne de vérification dans son gestionnaire.
+                    .merge(console_router(db.clone())),
                     db.clone(),
                     Keyring::new(ApiKeys::default(), db.clone(), TEST_MASTER_KEY),
                 ),
@@ -577,6 +582,25 @@ mod tests {
                 .await
                 .expect("service")
                 .status()
+        }
+
+        /// Donner un rôle, avec le jeton de quelqu'un.
+        async fn set_role(
+            &self,
+            token: &str,
+            email: &str,
+            role: &str,
+        ) -> (StatusCode, serde_json::Value) {
+            let req = HttpRequest::builder()
+                .method("PUT")
+                .uri("/v1/console/accounts/role")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "email": email, "role": role }).to_string(),
+                ))
+                .expect("request");
+            read(self.api.clone().oneshot(req).await.expect("service")).await
         }
 
         /// Ce que la console lit vraiment avec son jeton : les sièges de son
@@ -644,6 +668,63 @@ mod tests {
 
     fn token(body: &serde_json::Value) -> String {
         body["token"].as_str().expect("a token").to_owned()
+    }
+
+    /// **Le deuxième humain d'un client, de bout en bout.**
+    ///
+    /// La fondatrice ouvre sa session, son collègue ouvre la sienne, et le
+    /// collègue ne peut rien engager — y compris pas se promouvoir lui-même,
+    /// ce qui rendrait tout le reste décoratif. Elle le promeut d'un appel, et
+    /// il passe. Aucune de ces quatre assertions n'est vérifiée par une ligne
+    /// de `set_role` : le gestionnaire n'en a aucune, c'est la couche qui
+    /// refuse.
+    #[tokio::test]
+    async fn un_membre_ne_se_promeut_pas_lui_meme_et_une_proprietaire_le_promeut() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (_, founder) = h.account(h.a, PASSWORD).await;
+        let (colleague_id, colleague) = h.account(h.a, PASSWORD).await;
+
+        let (_, body) = h.login(&founder, PASSWORD).await;
+        let founder_token = token(&body);
+        let (_, body) = h.login(&colleague, PASSWORD).await;
+        let colleague_token = token(&body);
+
+        // Le collègue lit — c'est tout ce qu'un membre fait de plus que rien.
+        let (status, _) = h.employees(&colleague_token).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Et il ne se donne pas le rôle.
+        let (status, body) = h.set_role(&colleague_token, &colleague, "owner").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["code"], json!("owner_role_required"));
+
+        // Elle, oui.
+        let (status, body) = h.set_role(&founder_token, &colleague, "owner").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["account_id"], json!(colleague_id));
+        assert_eq!(body["role"], json!("owner"));
+
+        // Et maintenant il peut, à la requête suivante, sans s'être reconnecté.
+        let (status, body) = h.set_role(&colleague_token, &founder, "member").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // Il ne peut plus se rétrograder : il est le dernier propriétaire.
+        let (status, body) = h.set_role(&colleague_token, &colleague, "member").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("last_owner"));
+
+        // Une adresse que ce locataire ne connaît pas, et un rôle qui n'existe
+        // pas, se lisent tous les deux.
+        let (status, _) = h
+            .set_role(&colleague_token, "personne@example.test", "owner")
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = h.set_role(&colleague_token, &founder, "admin").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        h.teardown().await;
     }
 
     /// **Le test qui compte.** Le jeton de A ne lit rien de B.

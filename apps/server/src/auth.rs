@@ -1558,4 +1558,282 @@ mod tests {
         assert!(keys.lookup(SECRET).is_none());
         assert!(keys.lookup("").is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // Le rôle de console
+    // -----------------------------------------------------------------------
+
+    /// **Les soixante-et-une routes qui engagent l'argent ou l'existence de la
+    /// société, écrites en toutes lettres.**
+    ///
+    /// Écrites, et pas dérivées de [`MEMBER_WRITES`] : une liste construite à
+    /// partir de la table que la table est censée décider serait l'assertion
+    /// « la table est égale à elle-même », qui ne peut pas rougir. Celle-ci
+    /// rougit dans les deux sens qui comptent — si quelqu'un ouvre une de ces
+    /// routes aux membres, et si quelqu'un renomme un chemin sans le dire.
+    const ENGAGES_THE_COMPANY: &[(&str, &str)] = &[
+        // Les credentials
+        ("POST", "/v1/keys"),
+        ("DELETE", "/v1/keys/{id}"),
+        // Les sièges : en créer un achète onze ressources, en résilier un les rend
+        ("POST", "/v1/employees"),
+        ("POST", "/v1/employees/{id}/suspend"),
+        ("POST", "/v1/employees/{id}/resume"),
+        ("POST", "/v1/employees/{id}/terminate"),
+        ("POST", "/v1/companies"),
+        ("POST", "/v1/org"),
+        // Le domaine d'envoi : la réputation d'expéditeur du client
+        ("POST", "/v1/domain"),
+        ("POST", "/v1/domain/verify"),
+        ("POST", "/v1/domain/dns"),
+        ("PUT", "/v1/domains/{domain}/cap"),
+        ("DELETE", "/v1/domains/{domain}"),
+        // L'existence même
+        ("POST", "/v1/halt"),
+        ("DELETE", "/v1/halt"),
+        ("PUT", "/v1/window"),
+        ("PUT", "/v1/employees/{id}/initiative"),
+        // L'argent qu'on approuve, et les plafonds qui le bornent
+        ("POST", "/v1/approvals/{id}/approve"),
+        ("POST", "/v1/approvals/{id}/deny"),
+        ("POST", "/v1/capability-requests/decide"),
+        ("PUT", "/v1/employees/{id}/spend-caps"),
+        ("PUT", "/v1/policy/roles/{role}"),
+        ("PUT", "/v1/teams/{team_id}/budget"),
+        ("PUT", "/v1/teams/{team_id}/policy-role"),
+        ("POST", "/v1/teams/{team_id}/members"),
+        ("PUT", "/v1/teams/{team_id}/members/{employee_id}"),
+        ("DELETE", "/v1/teams/{team_id}/members/{employee_id}"),
+        // De qui est la facture du modèle, et par où sort le navigateur
+        ("POST", "/v1/model"),
+        ("PUT", "/v1/browser/proxy"),
+        ("DELETE", "/v1/browser/proxy"),
+        // Les outils que les sièges ont le droit d'appeler
+        ("POST", "/v1/mcp/connect"),
+        ("POST", "/v1/mcp/servers"),
+        ("DELETE", "/v1/mcp/servers/{server}"),
+        ("PUT", "/v1/mcp/servers/{server}/tools/{tool}"),
+        ("POST", "/v1/mcp/oauth/start"),
+        // Ce qui sort devant des tiers
+        ("POST", "/v1/social/accounts/connect"),
+        ("POST", "/v1/social/posts"),
+        ("POST", "/v1/public-register/consent"),
+        ("PUT", "/v1/employees/{id}/booking"),
+        ("POST", "/v1/sequences/{id}/enroll"),
+        ("POST", "/v1/employees/{id}/queue/export"),
+        ("POST", "/v1/content/questions/{id}/measure"),
+        ("POST", "/v1/employees/{id}/interview"),
+        ("POST", "/a2a/jsonrpc"),
+        // Les livres
+        ("POST", "/v1/invoices/{id}/paid"),
+        ("POST", "/v1/invoices/{id}/credit"),
+        ("PUT", "/v1/invoices/issuer"),
+        ("POST", "/v1/quotes/{id}/accepted"),
+        ("POST", "/v1/quotes/{id}/declined"),
+        // Les numéros
+        ("POST", "/v1/pool/numbers"),
+        ("POST", "/v1/pool/numbers/{id}/reassign"),
+        // Et le rôle lui-même : sans cette ligne, un membre se promeut
+        ("PUT", "/v1/console/accounts/role"),
+    ];
+
+    /// **Aucune de ces routes n'est jouable sans le rôle, et les autres le
+    /// sont.**
+    ///
+    /// La deuxième moitié est la garde : sans elle, un `member_may` qui
+    /// rendrait `false` partout passerait la première et aurait tout fermé, y
+    /// compris la lecture.
+    #[test]
+    fn a_member_may_not_touch_what_engages_the_company_and_may_touch_the_rest() {
+        for (verb, path) in ENGAGES_THE_COMPANY {
+            let method = axum::http::Method::from_bytes(verb.as_bytes()).expect("une méthode");
+            assert!(
+                !member_may(&method, path),
+                "{verb} {path} engage la société et un membre peut l'appeler"
+            );
+        }
+
+        // La garde. Les lectures d'abord — toutes ouvertes, y compris celles
+        // des chemins ci-dessus.
+        for (verb, path) in [
+            ("GET", "/v1/halt"),
+            ("GET", "/v1/keys"),
+            ("GET", "/v1/employees/{id}/spend-caps"),
+            ("HEAD", "/v1/pnl"),
+        ] {
+            let method = axum::http::Method::from_bytes(verb.as_bytes()).expect("une méthode");
+            assert!(member_may(&method, path), "{verb} {path}");
+        }
+        // Puis les écritures qui n'engagent rien, telles que la table les
+        // nomme : celle-ci peut se lire depuis `MEMBER_WRITES` sans rien
+        // affaiblir, puisque l'assertion qui compte est celle du dessus.
+        for (verb, path) in MEMBER_WRITES {
+            let method = axum::http::Method::from_bytes(verb.as_bytes()).expect("une méthode");
+            assert!(member_may(&method, path), "{verb} {path}");
+        }
+
+        // Une route d'écriture que personne n'a classée est fermée aux
+        // membres, pas ouverte. C'est le sens de la liste, et c'est ce qui
+        // rend une vague future sûre par défaut.
+        assert!(!member_may(
+            &axum::http::Method::POST,
+            "/v1/quelque-chose-que-personne-na-encore-ecrit"
+        ));
+    }
+
+    /// L'étiquette d'une session porte l'id du compte, et rien d'autre ne la
+    /// porte.
+    #[test]
+    fn only_a_console_session_label_names_a_person() {
+        let account = Uuid::now_v7();
+        let label = agentos_store::api_keys::session_label(account);
+        assert_eq!(
+            console_account_of(&AuditActor::Operator(label)),
+            Some(account)
+        );
+        for other in ["ops-console", "claude-code", "session-pas-un-uuid", ""] {
+            assert_eq!(
+                console_account_of(&AuditActor::Operator(other.to_owned())),
+                None,
+                "{other:?}"
+            );
+        }
+        assert_eq!(console_account_of(&AuditActor::System), None);
+    }
+
+    /// **Le refus et son contraire, par la vraie pile HTTP.**
+    ///
+    /// Quatre appels sur deux routes, dont l'une engage : le membre est refusé
+    /// avec la phrase qui dit quoi demander, le propriétaire passe, le membre
+    /// passe sur l'écriture qui n'engage rien, et la clé d'intégration —
+    /// celle qui n'a aucun humain derrière — n'a rien perdu.
+    #[tokio::test]
+    async fn a_member_is_refused_where_an_owner_and_an_integration_key_pass() {
+        let Some(db) = db().await else { return };
+
+        let tenant = TenantId::new_v7(chrono::Utc::now());
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, 'roles')")
+            .bind(tenant.as_uuid())
+            .bind(format!("roles-{}", tenant.as_uuid().simple()))
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        tx.commit().await.expect("commit");
+
+        let keys = Keyring::new(ApiKeys::parse("").expect("empty"), db.clone(), MASTER);
+
+        // Deux personnes : la première est propriétaire par construction, la
+        // seconde ne l'est pas. C'est `accounts::create` qui décide, et c'est
+        // le fait sur lequel tout ce fichier repose.
+        let token_of = |who: &str| {
+            let db = db.clone();
+            let hasher = keys.hasher().clone();
+            let email = format!("{who}-{}@example.test", Uuid::now_v7().simple());
+            async move {
+                let account = agentos_store::accounts::create(
+                    &db,
+                    Uuid::now_v7(),
+                    tenant,
+                    &email,
+                    &hash_password("un-mot-de-passe-honnete"),
+                    chrono::Utc::now(),
+                )
+                .await
+                .expect("créer la personne");
+                let issued = agentos_app::api_keys::issue(
+                    &db,
+                    &hasher,
+                    tenant,
+                    &agentos_store::api_keys::session_label(account.id),
+                    &AuditActor::Operator("test".to_owned()),
+                    chrono::Utc::now(),
+                )
+                .await
+                .expect("ouvrir la session");
+                (
+                    account.role,
+                    format!("Bearer {}", issued.secret.expose_for_transport()),
+                )
+            }
+        };
+        let (owner_role, owner) = token_of("fondatrice").await;
+        let (member_role, member) = token_of("stagiaire").await;
+        assert_eq!(owner_role, agentos_store::accounts::ConsoleRole::Owner);
+        assert_eq!(member_role, agentos_store::accounts::ConsoleRole::Member);
+
+        // La clé d'intégration du locataire : aucune ligne dans
+        // `console_accounts`, donc aucun rôle à lire.
+        let integration = agentos_app::api_keys::issue(
+            &db,
+            keys.hasher(),
+            tenant,
+            "claude-code",
+            &AuditActor::Operator("test".to_owned()),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("émettre");
+        let integration = format!("Bearer {}", integration.secret.expose_for_transport());
+
+        // Deux routes, l'une engage et l'autre non, derrière les deux couches
+        // dans l'ordre où `with_api_stack` les monte.
+        let app = Router::new()
+            .route("/v1/halt", axum::routing::post(|| async { "arrêtée" }))
+            .route("/v1/work", axum::routing::post(|| async { "notée" }))
+            .layer(axum::middleware::from_fn_with_state(
+                db.clone(),
+                require_console_role,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                keys.clone(),
+                require_api_key,
+            ));
+
+        let call = |token: String, path: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        HttpRequest::post(path)
+                            .header(header::AUTHORIZATION, token)
+                            .body(Body::empty())
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("service");
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .expect("body");
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+
+        let (status, body) = call(member.clone(), "/v1/halt").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("owner_role_required"), "{body}");
+        assert!(
+            body.contains("/v1/console/accounts/role"),
+            "le refus doit dire qui peut donner le droit : {body}"
+        );
+
+        // Et avec le droit, ça passe — sans quoi on aurait tout fermé.
+        let (status, body) = call(owner.clone(), "/v1/halt").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = call(member.clone(), "/v1/work").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "un membre écrit ce qui n'engage rien : {body}"
+        );
+
+        let (status, body) = call(integration, "/v1/halt").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "une clé d'intégration n'a pas d'humain derrière et ne perd rien : {body}"
+        );
+    }
 }
