@@ -278,7 +278,7 @@ mod tests {
         vec![
             ("email", email),
             ("first_name", ""),
-            ("company_name", "SafetyWing"),
+            ("company_name", "SunWing"),
             ("objet_email", subject),
         ]
     }

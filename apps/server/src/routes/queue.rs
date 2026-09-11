@@ -803,7 +803,7 @@ mod tests {
     }
 
     /// Split one RFC 4180 line — the fixture needs it, because
-    /// `"Faye (Zenner, Inc.)"` is a quoted field with a comma in it.
+    /// `"Mira (Alcove, Inc.)"` is a quoted field with a comma in it.
     fn split_row(line: &str) -> Vec<String> {
         let mut fields = vec![String::new()];
         let mut quoted = false;

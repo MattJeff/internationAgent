@@ -2487,8 +2487,8 @@ mod tests {
             tx,
             g.account,
             &NewAccount {
-                legal_name: "Deutsche Lufthansa AG",
-                domain: "lufthansa.com",
+                legal_name: "Luftlinie Verkehr AG",
+                domain: "luftlinie.com",
                 segment: "airline",
                 country: "DE",
                 employee_id: None,
@@ -2504,7 +2504,7 @@ mod tests {
             g.contact,
             &NewContact {
                 account_id: g.account,
-                full_name: "Anke Vogel",
+                full_name: "Anja Kessler",
                 email: Some(email),
                 phone: Some("+4915112345678"),
                 role: Some("Head of Digital"),
@@ -2527,7 +2527,7 @@ mod tests {
                 passport_country: "FR",
                 destination_country: "VN",
                 travel_date: Some(now.date_naive() + TimeDelta::days(1)),
-                source_url: "https://www.lufthansa.com/de/en/flight-search",
+                source_url: "https://www.luftlinie.com/de/en/flight-search",
                 reproduction: "Book CDG->SGN, passenger nationality France, \
                                step 3 shows 'No visa required'.",
                 artifact_ref: Some("s3://orizn-evidence/lh-fr-vn.png"),
@@ -2594,13 +2594,13 @@ mod tests {
         let b = seed_tenant(&db, "revenue-iso-b").await;
 
         let mut tx = db.tenant_tx(a).await.expect("tenant tx");
-        let graph = seed_graph(&mut tx, now, "anke.iso.a@lufthansa.test").await;
+        let graph = seed_graph(&mut tx, now, "anke.iso.a@luftlinie.test").await;
         suppress(
             &mut tx,
             Uuid::now_v7(),
             &NewSuppression {
                 channel: Channel::Email,
-                address: "gone.iso.a@lufthansa.test",
+                address: "gone.iso.a@luftlinie.test",
                 reason: "opt_out",
                 scope: Scope::Tenant,
                 contact_id: None,
@@ -2620,7 +2620,7 @@ mod tests {
             a,
             graph.account,
             &NewProspectFlow {
-                entry_url: "https://lufthansa.com/entry",
+                entry_url: "https://luftlinie.com/entry",
                 passport_field: "#passport",
                 destination_field: "#destination",
                 date_field: None,
@@ -2761,8 +2761,8 @@ mod tests {
             &mut tx,
             account,
             &NewAccount {
-                legal_name: "Deutsche Lufthansa AG",
-                domain: "lufthansa.com",
+                legal_name: "Luftlinie Verkehr AG",
+                domain: "luftlinie.com",
                 segment: "airline",
                 country: "DE",
                 employee_id: None,
@@ -2779,7 +2779,7 @@ mod tests {
             tenant,
             account,
             &NewProspectFlow {
-                entry_url: "https://lufthansa.com/entry",
+                entry_url: "https://luftlinie.com/entry",
                 passport_field: "#passport",
                 destination_field: "#destination",
                 date_field: None,
@@ -2803,7 +2803,7 @@ mod tests {
         let inserted = sqlx::query(
             "INSERT INTO prospect_flows (account_id, tenant_id, entry_url, passport_field, \
                                          destination_field, panel) \
-             VALUES ($1, $2, 'https://lufthansa.com/x', '#a', '#b', '#c')",
+             VALUES ($1, $2, 'https://luftlinie.com/x', '#a', '#b', '#c')",
         )
         .bind(Uuid::now_v7())
         .bind(tenant.as_uuid())
@@ -2896,8 +2896,8 @@ mod tests {
             &mut tx,
             account,
             &NewAccount {
-                legal_name: "Deutsche Lufthansa AG",
-                domain: "lufthansa.com",
+                legal_name: "Luftlinie Verkehr AG",
+                domain: "luftlinie.com",
                 segment: "airline",
                 country: "DE",
                 employee_id: None,
@@ -2909,7 +2909,7 @@ mod tests {
         .expect("account");
 
         let proposal = NewFlowProposal {
-            entry_url: "https://book.lufthansa.com/entry",
+            entry_url: "https://book.luftlinie.com/entry",
             passport_field: Some("#pp"),
             destination_field: Some("#dest"),
             date_field: None,
@@ -2920,7 +2920,7 @@ mod tests {
         // 3. A subdomain of the account's domain resolves to that account, and
         //    the caller never names it.
         assert_eq!(
-            propose_prospect_flow(&mut tx, employee, "book.lufthansa.com", &proposal)
+            propose_prospect_flow(&mut tx, employee, "book.luftlinie.com", &proposal)
                 .await
                 .expect("app_role may write a proposal"),
             Some(account),
@@ -2972,14 +2972,14 @@ mod tests {
         let b = seed_tenant(&db, "revenue-same-b").await;
 
         let mut tx = db.tenant_tx(a).await.expect("tenant tx");
-        let theirs = seed_graph(&mut tx, now, "anke.same.a@lufthansa.test").await;
+        let theirs = seed_graph(&mut tx, now, "anke.same.a@luftlinie.test").await;
         // The same domain twice in one tenant is a duplicate, and refused.
         let err = insert_account(
             &mut tx,
             Uuid::now_v7(),
             &NewAccount {
-                legal_name: "Lufthansa (dup)",
-                domain: "lufthansa.com",
+                legal_name: "Luftlinie (dup)",
+                domain: "luftlinie.com",
                 segment: "airline",
                 country: "DE",
                 employee_id: None,
@@ -2997,7 +2997,7 @@ mod tests {
 
         // Tenant B holds the same company, with its own id and its own view.
         let mut tx = db.tenant_tx(b).await.expect("tenant tx");
-        let mine = seed_graph(&mut tx, now, "anke.same.b@lufthansa.test").await;
+        let mine = seed_graph(&mut tx, now, "anke.same.b@luftlinie.test").await;
         assert_ne!(mine.account, theirs.account);
         let found = accounts_without_evidence(&mut tx, "ota", 10)
             .await
@@ -3007,7 +3007,7 @@ mod tests {
         assert_eq!(pipe.len(), 1, "only tenant B's own deal");
         assert_eq!(pipe[0].id, mine.opportunity);
         assert_eq!(pipe[0].value, eur(4_800_000));
-        assert_eq!(pipe[0].legal_name, "Deutsche Lufthansa AG");
+        assert_eq!(pipe[0].legal_name, "Luftlinie Verkehr AG");
         tx.commit().await.expect("commit b");
 
         drop_tenant(&db, a).await;
@@ -3040,7 +3040,7 @@ mod tests {
         let tenant = seed_tenant(&db, "revenue-stop-follow-up").await;
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
 
-        let email = "anke.stop@lufthansa.test";
+        let email = "anke.stop@luftlinie.test";
         let phone = "+4915112345678";
         let graph = seed_graph(&mut tx, now, email).await;
 
@@ -3152,7 +3152,7 @@ mod tests {
         let tenant = seed_tenant(&db, "revenue-suppress").await;
 
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let graph = seed_graph(&mut tx, now, "anke.sup@lufthansa.test").await;
+        let graph = seed_graph(&mut tx, now, "anke.sup@luftlinie.test").await;
 
         // Before any of that, the follow-up loop works: they are due, chasing
         // them moves the date, and the queue respects the new one.
@@ -3187,7 +3187,7 @@ mod tests {
         // They ask to be removed. Email and phone are separate addresses;
         // suppressing either is enough, because it is the person who asked.
         for (channel, address) in [
-            (Channel::Email, "anke.sup@lufthansa.test"),
+            (Channel::Email, "anke.sup@luftlinie.test"),
             (Channel::Phone, "+4915112345678"),
         ] {
             suppress(
@@ -3286,8 +3286,8 @@ mod tests {
             Uuid::now_v7(),
             &NewContact {
                 account_id: second_account,
-                full_name: "Anke Vogel",
-                email: Some("anke.sup@lufthansa.test"),
+                full_name: "Anja Kessler",
+                email: Some("anke.sup@luftlinie.test"),
                 phone: None,
                 role: None,
                 language: Some("de"),
@@ -3356,7 +3356,7 @@ mod tests {
         let a = seed_tenant(&db, "revenue-global-a").await;
         let b = seed_tenant(&db, "revenue-global-b").await;
         // A distinct address per run: the row outlives the tenants, by design.
-        let address = format!("removed-{}@lufthansa.test", Uuid::now_v7());
+        let address = format!("removed-{}@luftlinie.test", Uuid::now_v7());
 
         let mut tx = db.tenant_tx(a).await.expect("tenant tx");
         let graph = seed_graph(&mut tx, now, &address).await;
@@ -3405,8 +3405,8 @@ mod tests {
             &mut tx,
             account,
             &NewAccount {
-                legal_name: "Deutsche Lufthansa AG",
-                domain: "lufthansa.com",
+                legal_name: "Luftlinie Verkehr AG",
+                domain: "luftlinie.com",
                 segment: "airline",
                 country: "DE",
                 employee_id: None,
@@ -3421,7 +3421,7 @@ mod tests {
             Uuid::now_v7(),
             &NewContact {
                 account_id: account,
-                full_name: "Anke Vogel",
+                full_name: "Anja Kessler",
                 email: Some(&address),
                 phone: None,
                 role: None,
@@ -3619,7 +3619,7 @@ mod tests {
         let tenant = seed_tenant(&db, "revenue-evidence").await;
 
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let graph = seed_graph(&mut tx, now, "anke.ev@lufthansa.test").await;
+        let graph = seed_graph(&mut tx, now, "anke.ev@luftlinie.test").await;
 
         let found = evidence_for_account(&mut tx, graph.account, 10)
             .await
@@ -3670,7 +3670,7 @@ mod tests {
 
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
         // seed_graph's airline already has a finding.
-        seed_graph(&mut tx, now, "anke.q@lufthansa.test").await;
+        seed_graph(&mut tx, now, "anke.q@luftlinie.test").await;
 
         let unchecked = Uuid::now_v7();
         let disqualified = Uuid::now_v7();
@@ -3762,7 +3762,7 @@ mod tests {
         let tenant = seed_tenant(&db, "revenue-cold").await;
 
         let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
-        let graph = seed_graph(&mut tx, now, "anke.cold@lufthansa.test").await;
+        let graph = seed_graph(&mut tx, now, "anke.cold@luftlinie.test").await;
 
         // Two more deals on two more prospects: one silent for a month, one
         // that will be closed.

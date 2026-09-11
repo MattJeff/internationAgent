@@ -1259,7 +1259,7 @@ the employee could look at the page in the first place — but the prober *types
 into the form, and that is a `BrowserWrite`, which is exactly what the row for
 `allowed_domains` at the top of this document says. `sales-development` ships
 with two write domains and neither of them is a prospect's. So promoting a flow
-for `lufthansa.com` and expecting a probe is the mistake to expect; the probe
+for `luftlinie.com` and expecting a probe is the mistake to expect; the probe
 comes back refused with the domain named. Widening that list is
 `agentos-server policy install` with the host added, per host, deliberately —
 and it is a decision about typing into a stranger's system, which is not a

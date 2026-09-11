@@ -6947,7 +6947,7 @@ mod tests {
             &mut tx,
             account,
             &revenue_store::NewAccount {
-                legal_name: "Deutsche Lufthansa AG",
+                legal_name: "Luftlinie Verkehr AG",
                 // Unique per tenant, and two prospects here mean two accounts.
                 domain: &format!("{}.test", phone.digits()),
                 segment: "airline",
@@ -6966,7 +6966,7 @@ mod tests {
             contact,
             &revenue_store::NewContact {
                 account_id: account,
-                full_name: "Anke Vogel",
+                full_name: "Anja Kessler",
                 email: Some(email),
                 phone: Some(phone.as_str()),
                 role: None,
@@ -7031,7 +7031,7 @@ mod tests {
         // failed to cross the threshold shows up as claim 1 and not as a
         // silently empty queue underneath claims 2 and 3.
         let texter_number = number(21);
-        let texter = prospect(&db, tenant, &texter_number, "anke@lh.test", now).await;
+        let texter = prospect(&db, tenant, &texter_number, "anja@lh.test", now).await;
         // The address `raw`/`notice` write into `From`, so this one is
         // reachable by the email ingest below without a second fixture.
         let silent = prospect(&db, tenant, &number(22), "ap@supplier.example", now).await;

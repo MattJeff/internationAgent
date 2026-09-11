@@ -280,7 +280,7 @@ pub const COLUMNS: [&str; 10] = [
 /// Strings and not parsed types, deliberately, for everything but the address:
 /// these are directory values being passed through, and re-deriving `website`
 /// from a [`Domain`](agentos_domain::action::Domain) turns
-/// `https://safetywing.com` into `https://safetywing.com/`, which is an edit to
+/// `https://sunwing.com` into `https://sunwing.com/`, which is an edit to
 /// a file that has to load without editing. The address is an
 /// [`EmailAddress`] because that is what the suppression list is keyed on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1010,7 +1010,7 @@ mod tests {
     }
 
     /// Split one RFC 4180 line. Twelve lines because the fixture needs it —
-    /// `"Faye (Zenner, Inc.)"` is a quoted field with a comma in it, and a
+    /// `"Mira (Alcove, Inc.)"` is a quoted field with a comma in it, and a
     /// `split(',')` would call that two columns.
     fn split_row(line: &str) -> Vec<String> {
         let mut fields = vec![String::new()];
@@ -1227,7 +1227,7 @@ mod tests {
             tx,
             account,
             &revenue_store::NewAccount {
-                legal_name: "SafetyWing",
+                legal_name: "SunWing",
                 domain: &format!("{}.example", contact.simple()),
                 segment: "insurer",
                 country: "US",
@@ -1281,7 +1281,7 @@ mod tests {
         .expect("due");
         assert!(due.iter().any(|c| c.id == contact), "seeded contact is due");
 
-        let mut candidate = ready(&email, "SafetyWing", an_approach());
+        let mut candidate = ready(&email, "SunWing", an_approach());
         candidate.who.contact_id = contact;
         let leads = plan(vec![candidate], &pack(10), &Suppression::new(), 0);
         assert_eq!(leads.len(), 1);
@@ -1471,7 +1471,7 @@ mod tests {
     fn an_approach() -> Approach {
         Approach::filed(
             Outreach {
-                subject: "SafetyWing: what your entry-requirements step shows for FRA → VNM"
+                subject: "SunWing: what your entry-requirements step shows for FRA → VNM"
                     .to_owned(),
                 body: "line one\nline two\n\nReply STOP and I will not write again.".to_owned(),
             },
