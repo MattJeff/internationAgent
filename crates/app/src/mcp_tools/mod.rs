@@ -14,7 +14,7 @@
 //! Le `name`, le `title` et la `description` d'un outil ne sont pas de la
 //! documentation : ce sont **l'interface**. C'est littéralement ce qu'un modèle
 //! lit pour décider quel outil appeler, et ce qu'un humain lit dans la liste de
-//! son terminal. Les 116 lignes ont été écrites en un jour par trois mains
+//! son terminal. Les premières lignes ont été écrites en un jour par trois mains
 //! parallèles, chacune dans son fichier ; elles marchaient toutes et elles ne
 //! se ressemblaient pas. La convention ci-dessous a été **relue sur la table
 //! entière** le 2026-09-11 plutôt qu'inventée, puis appliquée partout.
@@ -147,6 +147,48 @@ mod tests {
                     tool.name
                 );
             }
+        }
+    }
+
+    /// **Un nombre écrit en prose ne se rejoue pas.**
+    ///
+    /// Trois fichiers annonçaient « 116 outils » le 2026-09-11 alors que le
+    /// registre en portait 136 : le compte datait d'avant l'ouverture des
+    /// quatre domaines de la croissance, et personne ne l'avait revu parce que
+    /// rien ne pouvait le contredire. `crates/eval/src/cost.rs` dit déjà la
+    /// règle pour les prix — *prose cannot be re-run* — et c'est le même
+    /// problème : un chiffre juste le jour où on le tape, faux la vague
+    /// suivante, et lu comme vrai entre les deux.
+    ///
+    /// Alors le voici rejouable. Ce test lit les fichiers qui annoncent un
+    /// compte et exige qu'il soit celui du registre. Les deux issues sont
+    /// bonnes : soit on met le chiffre à jour, soit on retire la phrase qui le
+    /// porte — c'est ce qui a été fait de deux commentaires de ce module, dont
+    /// le compte n'apprenait rien à personne.
+    #[test]
+    fn every_written_count_is_the_registry_s_own() {
+        let expected = registry().len();
+        // Chemin relatif à ce paquet, comme le test de couverture ci-dessous.
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+        let claims = [
+            ("crates/app/src/mcp_server.rs", "à chacun des {} outils"),
+            ("docs/MCP_SERVEUR.md", "{\"tools\": {},"),
+            ("docs/PLUGIN.md", "par-dessus les {} outils"),
+            ("docs/PLUGIN.md", "rend {} outils"),
+            ("docs/PLUGIN.md", "donne {} verbes bruts"),
+            ("docs/PLUGIN.md", "les {} lignes du registre"),
+        ];
+        for (file, shape) in claims {
+            let source = std::fs::read_to_string(format!("{root}/{file}"))
+                .unwrap_or_else(|_| panic!("lire {file}"));
+            let wanted = shape.replace("{}", &expected.to_string());
+            assert!(
+                source.contains(&wanted),
+                "{file} n'annonce plus le bon compte : le registre porte \
+                 {expected} outils, et {wanted:?} n'y est pas. Mettre le \
+                 chiffre à jour, ou retirer la phrase qui le porte et sa ligne \
+                 ici."
+            );
         }
     }
 
@@ -336,7 +378,7 @@ mod tests {
             .count()
     }
 
-    /// **La convention du module, tenue sur les 116 lignes.**
+    /// **La convention du module, tenue sur toute la table.**
     ///
     /// Une phrase de description ne prouve rien : c'est celle qu'on écrit en
     /// recopiant le nom de la route. Deux obligent à dire *quand* s'en servir,

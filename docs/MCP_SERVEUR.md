@@ -176,7 +176,7 @@ Et pour savoir si ça a marché sans quitter la console :
 
 ```
 GET /v1/mcp/server/status
-→ {"tools": 116, "last_session_at": "…" | null, "last_client": "claude-code 2.1.0" | null}
+→ {"tools": 136, "last_session_at": "…" | null, "last_client": "claude-code 2.1.0" | null}
 ```
 
 `tools` est `registry().len()`. Les deux autres sont la **dernière poignée de

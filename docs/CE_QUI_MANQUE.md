@@ -48,7 +48,7 @@ il l'a dite, puis ce qu'une entreprise gère et qu'il n'a pas nommé.
 ### Un chiffre corrigé en passant
 
 `crates/app/src/mcp_tools/mod.rs`, `crates/app/src/mcp_server.rs` et
-`docs/MCP_SERVEUR.md` disent tous les trois **116 outils**. Le compte des noms
+`docs/MCP_SERVEUR.md` disaient tous les trois **116 outils** au sha lu. Le compte des noms
 distincts hors blocs de test, au sha lu, est **136** : `societe` 51,
 `commerce` 36, `exploitation` 32, `contenu` 9, `social` 5, `croissance` 3,
 `appels` **0**. Les 116 datent d'avant l'ouverture des quatre domaines de la
@@ -635,6 +635,9 @@ document avant le sixième client.
    refus qui coûte une journée par mois, et la relecture est due.
 2. **Le paiement sortant.** Le port est vide parce qu'Orizn ne paie personne.
    Le premier client qui achète vraiment le remplit.
-3. **Le chiffre 116.** Trois fichiers l'annoncent, le compte est 136. Ce n'est
+3. **Le chiffre 116.** Trois fichiers l'annonçaient, le compte était 136 —
+   corrigé à l'intégration de ce document, et désormais tenu par
+   `every_written_count_is_the_registry_s_own`, qui lit ces fichiers et refuse
+   un compte qui n'est pas celui du registre. Ce n'est
    pas grave, et c'est la démonstration de la règle du dépôt : un nombre dans
    de la prose est vrai le jour où il est écrit.
