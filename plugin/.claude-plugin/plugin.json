@@ -1,0 +1,23 @@
+{
+  "name": "siglair",
+  "displayName": "Siglair",
+  "version": "0.1.0",
+  "description": "Le serveur MCP de siglair.com, plus quatre gestes de fondateur : le point du jour, lancer une campagne, répondre aux demandes, embaucher.",
+  "homepage": "https://siglair.com",
+  "keywords": ["siglair", "mcp", "employes", "prospection", "approbations"],
+  "userConfig": {
+    "cle_api": {
+      "type": "string",
+      "title": "Clé d'API du locataire",
+      "description": "La clé émise pour votre entreprise (console Siglair, ou POST /v1/platform/keys). Elle part en en-tête Authorization vers https://siglair.com/v1/mcp/server et n'est jamais écrite dans un fichier du dépôt.",
+      "sensitive": true,
+      "required": true
+    },
+    "base_url": {
+      "type": "string",
+      "title": "URL du serveur",
+      "description": "À ne changer que pour viser un déploiement autre que la production.",
+      "default": "https://siglair.com"
+    }
+  }
+}

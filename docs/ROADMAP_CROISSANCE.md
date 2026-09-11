@@ -59,13 +59,41 @@ l'interface, pas de la documentation. Une passe de relecture unique, avec une
 convention écrite (singulier/pluriel, verbe, ordre des mots).
 
 ### 1.5 Ce que les rapports d'agents ont laissé, et qui est vrai
-- `GET /v1/quotes` et `GET /v1/invoices` n'ont **ni filtre ni pagination** :
-  sur un an de registre, l'outil verse tout dans le contexte du modèle.
-- `Risk` n'a que trois crans ; « n'écrit rien chez nous mais ouvre une connexion
-  sortante » n'en a aucun.
-- `echo_url` est `Option` dans le type et obligatoire dans le gestionnaire.
-- Le Postgres local diverge de la CI ; deux tests de gate rougissent ici et
-  passent là-bas, et personne ne sait lequel dit la vérité.
+
+**Fermé le 2026-09-11.** Les cinq lignes ci-dessous et ce qu'elles sont
+devenues — trois corrigées, une écrite plutôt que codée, une refusée faute de
+preuve.
+
+- ~~`GET /v1/quotes` et `GET /v1/invoices` n'ont **ni filtre ni pagination**~~ —
+  fait. `state` / `after` / `limit` (défaut 50, plafond 200) sur les deux, sur
+  la forme de `GET /v1/employees`. Le curseur des devis est un UUID comparé sur
+  la paire `(issued_at, id)` dont l'ordre est fait ; celui des factures est le
+  **numéro**, parce que le numéro *est* l'ordre. `outstanding_minor` reste
+  calculé sur le registre entier et jamais sur la page : un total qui rétrécit
+  quand on pagine est le mauvais chiffre sous le bon nom.
+- ~~`Risk` n'a que trois crans~~ — **pas de quatrième cran**, et c'est la
+  décision. On n'a trouvé que deux outils dans le cas « sort sans écrire »
+  (`integrations_discover`, déjà classé `Write`, et `knowledge_search`, resté
+  `Read`) ; deux ne valent pas un cran qu'il faudrait ensuite trancher pour 116
+  outils. Et le cran serait le mauvais outil : « ça sort » est un axe
+  *orthogonal* au risque, que MCP appelle déjà `openWorldHint`, donc la vraie
+  suite est un booléen à côté de `Risk` et non une valeur dedans. La règle est
+  écrite à la place, dans la doc de `Risk` (`crates/app/src/mcp_server.rs`) :
+  ce qui départage les trois crans, et où tombent les cas limites.
+- ~~`echo_url` est `Option` dans le type et obligatoire dans le gestionnaire~~ —
+  fait, le type dit la vérité. Le code d'erreur d'un corps absent, vide ou mal
+  formé reste `no_echo_url` et non un 400 de désérialisation, avec un test qui
+  le tient.
+- ~~Le Postgres local diverge de la CI ; deux tests de gate rougissent ici~~ —
+  **non reproduit**, donc rien n'a été changé. Mesuré base vierge, base
+  partagée, seuls et en compagnie, sur Homebrew PG 17.11 : verts partout, et
+  les 40 bases dérivées de cette machine sont intactes. Ce qu'il faut regarder
+  en premier la prochaine fois est écrit dans `docs/OPERATIONS.md` §1.7.
+- ~~Le plafond de corps de 1 Mio, dont trois surfaces se plaignent~~ — inchangé,
+  et **dit une fois** : `docs/OPERATIONS.md` §1.4e³ donne le plafond, ce qu'il
+  vaut en base64 (≈ 760 Kio de fichier réel) et pourquoi il ne se relève pas
+  route par route — la couche est au-dessus de l'authentification, donc le
+  plafond est ce qu'un appelant anonyme peut faire allouer.
 
 ---
 
@@ -98,6 +126,12 @@ de rendez-vous. **Ensuite** seulement, l'enrichissement et la qualification.
 `apps/social` est un agrégateur abouti, hors du produit. Le rattacher — un
 locataire branche ses comptes, ses employés publient — est du câblage, pas de
 la conception.
+
+**Fait le 2026-09-11**, et par du câblage en effet : le service reste un serveur
+MCP séparé que le locataire branche comme il branche GitHub (`CUSTOM`, handle
+`social`), et cinq outils du produit publient par lui — `docs/SOCIAL.md`
+§ « Comment un locataire publie aujourd'hui ». Ce qui reste n'est plus du code :
+déployer le service, frapper un jeton, et les revues d'app du fondateur.
 
 ### 2.4 Les appels
 L'adaptateur Twilio est réel et mocké en production. Le levier est vrai mais il

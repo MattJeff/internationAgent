@@ -107,6 +107,14 @@ use crate::routes::webhooks::Webhooks;
 
 /// Largest request body we will read. Bigger than any control-plane payload
 /// and smaller than anything that could exhaust memory.
+///
+/// Three surfaces have complained about it in writing — the CSV import, the
+/// file deposit and desk attachments — so the answer is written down once,
+/// where an operator meets it: `docs/OPERATIONS.md` §1.4e³ says what the
+/// megabyte is worth through base64 (≈ 760 KiB of real file) and why it is not
+/// raised route by route. The short version is that [`with_outer_stack`] sits
+/// *outside* [`with_api_stack`], so this ceiling is what an **unauthenticated**
+/// caller can make this process allocate per connection.
 pub(crate) const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Wall clock a handler gets before the client is answered 408.
@@ -695,7 +703,11 @@ fn app(
     // as `secret_decrypt_failed` on a verifier that was sealed correctly.
     let mcp_state = McpState::new(
         db.clone(),
-        fleets,
+        // Cloné, pas déplacé : `routes::social` lit le MÊME registre. Deux
+        // registres seraient un branchement visible par la page des
+        // intégrations et absent de la flotte que les routes sociales
+        // interrogent — un `Fleets` partage sa carte, pas ses copies.
+        fleets.clone(),
         credentials.clone(),
         config.oauth_clients.clone(),
         bridges,
@@ -724,6 +736,11 @@ fn app(
     let api = with_api_stack(
         Router::new()
             .route("/v1/whoami", get(whoami))
+            // La clé que le locataire émet pour lui-même, et la seule chose de
+            // cet étage qui rende un secret. Dans `with_api_stack` et pas à
+            // côté de `platform` : le locataire vient du credential, donc il
+            // n'y a pas de corps qui puisse en nommer un autre.
+            .merge(routes::keys::router(db.clone(), keyring.hasher().clone()))
             .merge(routes::browser::router(browser))
             .merge(routes::employees::router(hiring.clone()))
             .merge(routes::domain::router(hiring.clone()))
@@ -848,6 +865,13 @@ fn app(
             // there is no held pool to be empty, and there is a way to fill it.
             .merge(routes::pool::router(db.clone(), gate.clone()))
             .merge(routes::mcp::router(mcp_state.clone()))
+            // Juste après, et c'est l'ordre du parcours : on branche
+            // l'agrégateur comme n'importe quel connecteur, puis on publie par
+            // lui. Ces routes ne détiennent que le registre des flottes —
+            // aucune base, aucun credential, aucun octet de média : le service
+            // branché fait tout, et son module dit pourquoi c'est un
+            // connecteur et pas un service interne.
+            .merge(routes::social::router(fleets))
             // The step that changes whose bill this is. Before it, no tenant has
             // a model and no employee takes a turn; after it, every token is the
             // customer's. See its module docs for why a refused key is a 200.
@@ -939,8 +963,10 @@ fn app(
     .merge(routes::public_register::public_router(db.clone()))
     // Sans credential, et c'est le point : une personne qui se connecte n'en a
     // pas encore. Ce qu'elle obtient est un jeton de session — une clé de son
-    // seul locataire, qui ne peut en fabriquer aucune autre. `platform` reste
-    // la seule autorité qui crée une personne et qui la révoque.
+    // seul locataire. Depuis `routes::keys`, elle peut en fabriquer d'autres
+    // *pour ce locataire-là* et seulement des clés qui ne portent aucun rôle
+    // qu'elle ne tienne déjà ; `platform` reste la seule autorité qui crée une
+    // personne, qui la révoque, et qui émet chez quelqu'un d'autre.
     .merge(routes::accounts::public_router(
         db.clone(),
         keyring.hasher().clone(),

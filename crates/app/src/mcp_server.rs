@@ -42,11 +42,72 @@
 use serde_json::Value;
 
 /// Ce qu'un outil fait au monde, tel que le client MCP doit l'annoncer.
+///
+/// # La règle, parce que trois crans ne se lisent pas tout seuls
+///
+/// Un rapport du 2026-09-10 a demandé un quatrième cran pour « n'écrit rien
+/// chez nous mais ouvre une connexion sortante » — `integrations_discover` lie
+/// un serveur tiers et ne pose aucune ligne. Le cran n'a pas été ajouté, parce
+/// qu'on n'a pas trouvé trois outils dans ce cas : `integrations_discover` est
+/// le seul propre. `browser_proxy_check` sort aussi mais écrit son verdict sur
+/// la ligne du proxy ; `domain_verify` sort aussi mais écrit le statut ;
+/// `knowledge_search` fait plonger la question par le fournisseur
+/// d'embeddings — sortant, payant, sans écriture — et c'est le seul autre
+/// candidat. **Deux cas ne valent pas un cran** : un quatrième mal défini
+/// coûterait une décision à chacun des 116 outils.
+///
+/// Et surtout, le cran serait le mauvais outil. Ce que ce rapport décrit, MCP
+/// l'a déjà nommé : **`openWorldHint`**, une annotation *orthogonale* à
+/// `readOnlyHint` — « cet outil touche des entités extérieures ». Cette
+/// dimension-là est un booléen à côté du risque, pas une quatrième valeur
+/// dedans ; un enum linéaire ne peut pas porter deux axes sans mentir sur l'un
+/// des deux. `apps/server/src/routes/mcp_server.rs` n'émet aujourd'hui que
+/// `readOnlyHint` et `destructiveHint`, donc **la vraie suite est un champ
+/// `outbound: bool` sur `ToolDef`**, publié sous ce nom-là, le jour où un
+/// client s'en sert.
+///
+/// Ce qui décide, dans cet ordre, et la première ligne qui mord gagne :
+///
+/// 1. **Est-ce qu'un appel *sort* de ce déploiement ?** Si oui, ce n'est pas
+///    [`Risk::Read`], même sans écriture. `readOnlyHint: true` dit au client
+///    qu'il peut jouer l'outil sans demander ; un appel qui part chez un tiers
+///    coûte de l'argent, consomme un quota, et se voit d'en face. C'est le
+///    plancher [`Risk::Write`], et c'est pourquoi `integrations_discover` est
+///    `Write` alors que sa description dit « n'écrit rien ».
+/// 2. **Est-ce que quelque chose disparaît, s'annule, ou engage la société
+///    devant un tiers ?** Un envoi, un paiement, une signature, une suppression,
+///    une résiliation : [`Risk::Destructive`]. *Devant un tiers* est la moitié
+///    qu'on oublie — un courriel parti ne se retire pas.
+/// 3. Sinon, écrire ici et rien de plus : [`Risk::Write`].
+/// 4. Sinon : [`Risk::Read`].
+///
+/// Les cas limites, nommés une fois pour ne pas être rejugés :
+///
+/// * `desk_send` **coûte un tour au client** — il réveille un employé, sur le
+///   modèle et la facture du client — et il est `Write`, pas `Destructive` :
+///   **ce que ça coûte n'est pas le critère**. Le message reste dans la
+///   société, rien ne disparaît, et personne d'extérieur ne l'a vu. Si le coût
+///   était le critère, il faudrait classer par prix et non par risque, et le
+///   client MCP ne saurait plus quoi faire confirmer.
+/// * `sequences_enroll` n'enlève rien non plus et il est `Destructive`, par la
+///   seconde moitié de la règle 2 : l'inscription fait écrire la société à un
+///   inconnu, et un courriel parti ne se retire pas.
+/// * `files_put` écrase une version et reste `Write` : le dépôt versionne, donc
+///   rien ne disparaît.
+/// * `integrations_declare_tool` écrit une classe de risque et reste `Write` —
+///   déclarer qu'un outil tiers est dangereux n'est pas le jouer.
+/// * `knowledge_search` est `Read` **aujourd'hui**, à contre-courant de la
+///   règle 1 : il fait plonger la question par le fournisseur d'embeddings.
+///   C'est la dette que ce texte assume plutôt que de la cacher — et c'est
+///   aussi la preuve que l'axe manquant n'est pas un cran de risque : personne
+///   ne veut faire confirmer une recherche, on veut seulement savoir qu'elle
+///   sort. C'est `openWorldHint`, pas `Risk`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Risk {
-    /// Ne change rien. `readOnlyHint: true`.
+    /// Ne change rien **et ne sort pas**. `readOnlyHint: true`.
     Read,
-    /// Écrit, crée, met à jour. Rien ne disparaît.
+    /// Écrit, crée, met à jour — ou sort du déploiement sans rien écrire. Rien
+    /// ne disparaît.
     Write,
     /// Retire, annule, ou engage la société devant un tiers (un envoi, un
     /// paiement, une signature). `destructiveHint: true`.

@@ -87,12 +87,13 @@ use agentos_domain::ids::InvoiceId;
 use agentos_store::audit::{self, AuditEvent, AuditKind};
 use agentos_store::db::Db;
 use agentos_store::invoices::{self, Issuer};
-use axum::extract::{Path, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -181,65 +182,88 @@ impl From<invoices::Invoice> for InvoiceView {
     }
 }
 
-/// `GET /v1/invoices` — everything this company has issued, oldest first.
+/// Page size when the caller does not ask for one. `routes::employees`' number,
+/// and its argument: a page a person scrolls once.
+const DEFAULT_LIMIT: i64 = 50;
+
+/// Largest page we will build, however big a `limit` the caller sends.
 ///
-/// Settled and outstanding together, and no filter, for `GET /v1/work`'s and
+/// Two hundred and not two thousand, and the ceiling is not the database's: the
+/// first reader of this route is an MCP tool, so a page is a model's context. A
+/// register of invoices with their lines runs a few hundred tokens per document,
+/// and two hundred of them is already most of what a turn can afford to spend on
+/// one call.
+const MAX_LIMIT: i64 = 200;
+
+/// The window and the cut. `deny_unknown_fields` so a caller who misspells
+/// `state` finds out now rather than wondering why nothing was filtered — the
+/// failure mode that matters here, because the wrong answer is a *longer* list
+/// that looks right.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Page {
+    /// `outstanding` or `paid`. Absent is the whole register, credit notes
+    /// included — see `invoices::State`, which owns the two words.
+    #[serde(default)]
+    state: Option<String>,
+    /// The `number` of the last invoice on the previous page. The number and not
+    /// the id, because the number is the order.
+    #[serde(default)]
+    after: Option<i64>,
+    /// How many documents to return, capped at [`MAX_LIMIT`].
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// `GET /v1/invoices` — one page of what this company has issued, oldest first.
+///
+/// Settled and outstanding together **by default**, for `GET /v1/work`'s and
 /// `GET /v1/calendar`'s reason: what somebody wants at the end of a month is
 /// what is outstanding *and* what came in, and a list that hid the second half
-/// would make the first look like nothing had happened.
+/// would make the first look like nothing had happened. `state=outstanding`
+/// exists for the other question — *who do I chase* — and it is a caller's
+/// choice rather than this route's opinion.
 ///
 /// `outstanding_minor` is a sum per currency and not one number, because there
 /// is no exchange rate in this workspace and there must not be one — the same
-/// refusal `SpendLimits` makes by rejecting mixed currencies outright.
-async fn register(State(db): State<Db>, principal: Principal) -> Result<Response, ApiError> {
+/// refusal `SpendLimits` makes by rejecting mixed currencies outright. **It is
+/// computed over the whole register on every page**, not over the rows returned:
+/// a total that shrank as you paged would be a wrong number wearing the right
+/// name, and the wrong number here is the one somebody puts in a forecast.
+///
+/// `limit` is clamped rather than refused, `routes::employees`' choice: an
+/// over-large ask still gets a page and a `next_after`, so nothing is lost and
+/// the caller finds out by walking. A `limit` that is not a number is still a
+/// 400 — that is serde's, and it is the useful one.
+async fn register(
+    State(db): State<Db>,
+    principal: Principal,
+    page: Result<Query<Page>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(page) = page.map_err(|err| ApiError::bad_request(err.body_text()))?;
+    let state = match page.state.as_deref() {
+        None => None,
+        Some(text) => Some(invoices::State::parse(text).ok_or_else(|| {
+            ApiError::bad_request("state: one of \"outstanding\", \"paid\", or absent for both")
+        })?),
+    };
+    let limit = page.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
-    let all = invoices::register(&mut tx).await?;
+    let all = invoices::register(&mut tx, state, page.after, limit).await?;
+    let outstanding = invoices::outstanding(&mut tx).await?;
     tx.rollback().await?;
 
-    // What each invoice has been credited, so the total below is net. A credit
-    // note is a positive figure pointing at the invoice it withdraws — see
-    // `migrations/0071_an_invoice_needs_a_number.sql` — and this is the one
-    // place in the product that applies the sign.
-    let mut credited: std::collections::HashMap<Uuid, u64> = std::collections::HashMap::new();
-    for note in &all {
-        if let Some(corrected) = note.corrects_invoice_id {
-            let entry = credited.entry(corrected.as_uuid()).or_default();
-            *entry = entry.saturating_add(note.amount.minor());
-        }
-    }
-
-    let mut outstanding: std::collections::BTreeMap<&'static str, u64> =
-        std::collections::BTreeMap::new();
-    for invoice in &all {
-        // Credit notes are not owed to anybody and settled invoices are not
-        // owed any more. A credit note against an invoice that was *already
-        // paid* is a refund the company owes its customer, which this register
-        // does not track and does not pretend to: it is left out of both sides.
-        if invoice.corrects_invoice_id.is_some() || invoice.paid_at.is_some() {
-            continue;
-        }
-        let owed = invoice.amount.minor().saturating_sub(
-            credited
-                .get(&invoice.id.as_uuid())
-                .copied()
-                .unwrap_or_default(),
-        );
-        if owed == 0 {
-            continue;
-        }
-        // Saturating, and it is not laziness: the alternative is a 500 on a
-        // read, and a register that refuses to display itself because the
-        // total overflowed a u64 is worse than a total that is visibly
-        // wrong. Nothing branches on this number.
-        let entry = outstanding
-            .entry(invoice.amount.currency().code())
-            .or_default();
-        *entry = entry.saturating_add(owed);
-    }
+    // Only a full page can have a successor. A short page ends the walk without
+    // costing the client one more round trip to discover that.
+    let next_after = (all.len() as i64 == limit)
+        .then(|| all.last().map(|last| last.number))
+        .flatten();
 
     Ok(Json(json!({
         "invoices": all.into_iter().map(InvoiceView::from).collect::<Vec<_>>(),
         "outstanding_minor": outstanding,
+        "next_after": next_after,
     }))
     .into_response())
 }
@@ -1011,6 +1035,65 @@ mod tests {
             .collect();
         assert_eq!(numbers, vec![json!(1), json!(2), json!(3)]);
         let _ = next;
+
+        // --- and the window, on the one fixture that has all three shapes ----
+        //
+        // Here rather than in a test of its own: a filter is only interesting
+        // against a register that holds something it must *leave out*, and the
+        // three documents above are exactly that — two demands and a credit
+        // note. A fixture built for the window alone would have been a second
+        // copy of this one with the interesting row missing.
+        let total = body["outstanding_minor"].clone();
+
+        let (_, owed) = h
+            .send("GET", "/v1/invoices?state=outstanding", SECRET_A)
+            .await;
+        let cut: Vec<_> = owed["invoices"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|invoice| invoice["number"].clone())
+            .collect();
+        assert_eq!(
+            cut,
+            vec![json!(1), json!(3)],
+            "a credit note is owed by nobody and has no business in this cut"
+        );
+        assert_eq!(
+            owed["outstanding_minor"], total,
+            "the total is the register's, not the page's — it must not move with the filter"
+        );
+
+        // The arm filters rather than falling through to "no filter", which is
+        // the way a `CASE` over a parameter fails quietly.
+        let (_, paid) = h.send("GET", "/v1/invoices?state=paid", SECRET_A).await;
+        assert!(
+            paid["invoices"].as_array().expect("array").is_empty(),
+            "nobody has settled anything in this company: {paid}"
+        );
+
+        // One document per page, walked by number, and the total holds all the
+        // way down.
+        let mut walked = Vec::new();
+        let mut uri = "/v1/invoices?limit=1".to_owned();
+        loop {
+            let (_, page) = h.send("GET", &uri, SECRET_A).await;
+            assert_eq!(page["outstanding_minor"], total, "the total shrank: {page}");
+            let rows = page["invoices"].as_array().expect("array");
+            walked.extend(rows.iter().map(|invoice| invoice["number"].clone()));
+            assert!(walked.len() <= 3, "the cursor is looping: {walked:?}");
+            let Some(after) = page["next_after"].as_i64() else {
+                break;
+            };
+            uri = format!("/v1/invoices?limit=1&after={after}");
+        }
+        assert_eq!(walked, numbers, "the walk and the whole register disagree");
+
+        // A `state` this route does not know is a 400 and never a silent
+        // "no filter", which would answer a question nobody asked with a
+        // longer list that looks right.
+        let (status, refused) = h.send("GET", "/v1/invoices?state=late", SECRET_A).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
     }
 
     /// **A company with no letterhead may not emit a document**, and the refusal

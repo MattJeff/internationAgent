@@ -326,6 +326,36 @@ What to know:
   another company's file reads identically. Six names is a 400. The message
   is not written in either case.
 
+### 1.4e³ The body limit, said once
+
+**Every route of `/v1` refuses a request body over 1 MiB with a `413`.** One
+number, one layer (`RequestBodyLimitLayer` in `apps/server/src/main.rs`), no
+per-route exception — including the three surfaces above that push hardest
+against it:
+
+| Surface | What 1 MiB is worth there |
+|---|---|
+| `POST /v1/prospects/import` | raw CSV, so the full megabyte. The largest list on file is 141 KB |
+| `POST /v1/files` | the content is **base64 inside JSON**, so ≈ **760 KiB** of real file — base64 costs a third, and the JSON envelope and the escaping take the rest |
+| `POST /v1/employees/{chair}/desk` | attachments are names, not bytes, so the limit here is the *deposit* above and never the message |
+
+**Why it is not raised route by route**, which is the request that keeps
+arriving: the limit is not about what Postgres can hold, it is about what a
+request may cost before anybody has been authenticated. The layer sits *above*
+the key check — it has to, or a body has already been read into memory by the
+time we know who sent it — so every byte of the ceiling is a byte an anonymous
+caller can make this process allocate, on every concurrent connection. A limit
+raised for one route is raised for that route's unauthenticated traffic too,
+and "10 MiB, but only for the CSV" is not a thing a tower layer can say without
+becoming a second place where the number lives.
+
+So the answer to "my file is too big" is not a bigger number. It is the upload
+this API does not have yet and would need for a real one: a presigned deposit
+straight to object storage, with the API carrying the *handle* rather than the
+bytes — which is the same shape `desk` already uses for attachments, one layer
+down. Until somebody needs it, splitting a 3 MB list into three is cheaper than
+building it.
+
 ### 1.4f The sending domains — the tenant's, verified before a seat writes, each under a daily cap
 
 Every employee address is `slug@domain`, and a domain is a row of the
@@ -488,6 +518,73 @@ Pannes possibles, et ce qu'elles veulent dire :
 | `-32602` | un nom d'outil qui n'est pas dans la table |
 | `-32603` « pas de routeur » | le déploiement est mal câblé : `McpServerState::attach` n'a pas été appelé |
 | `isError: true` avec un `code` | la route a refusé. C'est le produit qui parle, pas le transport ; le code est celui que la route rend déjà à la console |
+
+### 1.4i Publier sur les réseaux sociaux — un connecteur, pas un service interne
+
+`apps/social` (`docs/SOCIAL.md`) est un serveur MCP **séparé** : sa base, ses
+jetons par tenant, ses six outils, ses cinq plateformes. Le produit ne l'héberge
+pas et ne le branche pour personne tout seul — un locataire le branche comme il
+branche GitHub, et publie ensuite par quatre chemins de ce déploiement.
+
+Prérequis, dans l'ordre. Les trois premiers sont des outils qui existaient déjà,
+et c'est le but :
+
+```bash
+# 0. Le service tourne quelque part, et ce locataire-ci a un jeton.
+#    (sur l'hôte du service, pas ici) agentos-social mint-tenant acme
+#    -> imprime le jeton UNE fois ; il n'y a pas de route qui le refrappe.
+
+# 1. Brancher, sous le handle `social` — ce nom est ce que les routes cherchent.
+curl -sX POST $API/v1/mcp/connect -H "$AUTH" -H 'content-type: application/json' \
+  -d '{"server":"social","connector":"custom","url":"https://social.example/mcp",
+       "reach":"public","token":"<le jeton frappé>"}'
+
+# 2. Lire sa table et l'empreinte de chaque outil.
+curl -sX POST $API/v1/mcp/servers/social/discover -H "$AUTH"
+
+# 3. Épingler les outils qu'on veut, au digest qu'on vient de lire.
+curl -sX PUT $API/v1/mcp/servers/social/tools/post_publish -H "$AUTH" \
+  -H 'content-type: application/json' -d '{"risk":"write","digest":"<64 hex>"}'
+```
+
+**L'étape 3 n'est pas une formalité** : un outil que personne n'a déclaré est
+`destructive`, donc il demande un humain, donc l'appel est refusé. C'est la
+panne la plus probable d'un premier essai, et elle se lit `403
+tool_not_declared`.
+
+Puis les quatre routes, toutes sous la clé du locataire :
+
+```
+GET  /v1/social/accounts           # les comptes connectés (plateforme, handle, état)
+POST /v1/social/accounts/connect   # {"platform":"x|linkedin|instagram|tiktok|youtube"}
+                                   #   -> l'URL OAuth qu'un HUMAIN ouvre
+POST /v1/social/preview            # {"account_id","text","media"?,"poll"?,…}
+                                   #   -> le contenu exact + l'empreinte à contresigner
+POST /v1/social/posts              # idem + "idempotency_key" (obligatoire) et
+                                   #   "expected_media_digests" (celles de l'aperçu)
+GET  /v1/social/posts?limit=<1..200>  # ce qui est parti
+```
+
+Le corps part **tel quel** comme arguments de l'outil : le service est
+l'autorité sur son propre schéma, il borne chaque champ et cite la limite exacte
+de chaque plateforme. La réponse est le `CallToolResult` du service, intact —
+`content[0].text` porte le JSON de l'outil, `isError` dit si l'outil a refusé.
+Un refus d'outil (une limite de plateforme, `media_change`, un compte inconnu)
+est **200 avec `isError: true`**, parce que c'est une réponse et pas une panne.
+
+| ce que l'appelant voit | ce que c'est |
+|---|---|
+| `404 no_social_binding` | rien n'est branché sous le handle `social` — ou ce qui l'est ne sert pas cet outil |
+| `403 tool_not_declared` | branché mais pas vetté : `discover`, puis `declare_tool` avec le digest lu |
+| `422` avec le code du service | le service a dit non à quelque chose que l'appelant contrôle |
+| `503 social_unavailable` | le service n'a pas répondu ; la flotte se relie toute seule à la prochaine passe (§3.5) |
+| `200` avec `isError: true` | la plateforme ou l'aperçu a refusé, avec le mot du service |
+
+Deux choses que ce câblage ne fait pas, et c'est écrit dans le code plutôt que
+promis ici : il ne sait prononcer que **cinq noms d'outils**, tous de la table
+d'éditeur, aucun de la seconde table `/mcp/messagerie` — un test crible la liste
+et le source du module. Et il ne mint, ne stocke et ne déchiffre aucun jeton de
+plateforme : ceux-ci vivent scellés chez le service, sous **sa** clé maître.
 
 ### 1.5 The policy ceiling you have to install
 
@@ -658,6 +755,46 @@ no connection.
 
 Honour `PGHOST` / `PGPORT` / `PGUSER` / `PGPASSWORD`; it defaults to
 `localhost:5442` with `postgres`/`postgres`.
+
+#### When a test is red here and green in CI, look at the derived databases first
+
+A handful of tests need a database **nobody else is in**, because what they
+arrange is a row there is only one of per deployment — the platform policy
+ceiling (`tenant_id IS NULL`), or a schema function they drop on purpose. They
+take one by deriving a name from `DATABASE_URL`: `<db>_gateceiling`,
+`<db>_no_suppression_fn`, `<db>_outbox`, `<db>_platformpolicy`, and a dozen
+more. **`scripts/test.sh` collects only the ones under its own `ci_…_<run id>`
+prefix**, so a database derived from a hand-set `DATABASE_URL` survives the run,
+the day, and the checkout — and CI, which starts from an empty container, never
+sees what it accumulated.
+
+So a test that is red here and green there is asking about its derived database
+before it is asking about the code. The two questions worth one round trip each:
+
+```bash
+DB=agent_catalogue   # whatever the last path segment of DATABASE_URL is
+
+# Did a run die between a DROP and its restore? A missing function here is a
+# database that will fail its own arrangement for good, run after run.
+psql -d "${DB}_no_suppression_fn" -tAc \
+  "SELECT count(*) FROM pg_proc WHERE proname = 'revenue_suppression_of'"   # want 1
+
+# How far behind is it? A derived database is migrated on use, never rebuilt.
+psql -d "${DB}_gateceiling" -tAc "SELECT count(*) FROM _sqlx_migrations"
+```
+
+`DROP DATABASE … WITH (FORCE)` on the derived name is always safe: the next run
+recreates and migrates it.
+
+**Measured on 2026-09-11** against the two tests that were reported as
+diverging, `gate::tests::a_deployment_with_no_platform_layer_refuses_everything`
+and `gate::tests::a_suppression_list_that_will_not_answer_refuses_the_send`:
+both pass on Homebrew **PostgreSQL 17.11** (port 5432) on a virgin database, on
+a stale shared one twenty-two migrations behind, run alone and run beside their
+38 module neighbours; and all 40 pairs of derived databases on this machine
+were found intact (function present, one ceiling row). The divergence
+did not reproduce, so nothing was changed for it; the checks above are what to
+run before anybody spends another afternoon on it.
 
 ---
 

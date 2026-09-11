@@ -403,15 +403,106 @@ pub async fn for_opportunity(
     with_lines(tx, rows).await
 }
 
-/// Every quote this company has written, newest first.
+/// Which slice of the register [`register`] hands back.
 ///
-/// ponytail: no pagination and no filter. A register is a thing a human reads;
-/// add the window the day one has enough rows for the scan to show up in a
-/// plan — `sales_quotes_opportunity_idx` is already there for the per-deal cut.
-pub async fn register(tx: &mut TenantTx<'_>) -> Result<Vec<Quote>, StoreError> {
+/// **A partition, and that is what makes it worth having.** The four values do
+/// not overlap, so `Open` means "still acceptable" and nothing else — an
+/// unanswered quote whose validity has run out is [`State::Lapsed`] and
+/// deliberately *not* open, because [`accept`] would refuse it. The `expired`
+/// flag a reader sees on a row answers a different question and keeps its own
+/// answer: a quote accepted in time whose `valid_until` has since passed is
+/// `Accepted` here and `expired` there, and both are true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    /// No answer yet, and the offer still stands.
+    Open,
+    /// No answer, and the validity has run out. Re-issued, never back-dated.
+    Lapsed,
+    Accepted,
+    Declined,
+}
+
+impl State {
+    /// The wire spelling, and the one [`register`] binds.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            State::Open => "open",
+            State::Lapsed => "lapsed",
+            State::Accepted => "accepted",
+            State::Declined => "declined",
+        }
+    }
+
+    /// The wire spelling back, so a route does not keep a second copy of the
+    /// four words that is free to drift from this one.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        [State::Open, State::Lapsed, State::Accepted, State::Declined]
+            .into_iter()
+            .find(|state| state.as_str() == text)
+    }
+}
+
+/// One page of quotes, newest first.
+///
+/// # The window, and why it stopped being optional
+///
+/// This returned the whole table until 2026-09-11, under a `ponytail:` note
+/// saying to add the window the day somebody had enough rows for the scan to
+/// show up in a plan. The day arrived from the other end: `GET /v1/quotes` is
+/// an MCP tool, so an unwindowed register is poured into a model's context *in
+/// full, on every call*. The cost that forced this is tokens, not the scan,
+/// which is why the caller's cap is small rather than "whatever Postgres can
+/// serve".
+///
+/// # Keyset, on the pair the order is actually made of
+///
+/// The order is `issued_at DESC, id DESC`, so the cursor compares the **pair**
+/// and not the id alone. Ids are UUIDv7 and would usually agree — but
+/// `issued_at` defaults to `now()`, which is the *transaction's* start, so two
+/// overlapping proposals can carry timestamps in the opposite order to their
+/// ids, and a cursor that assumed otherwise would drop a row exactly on the
+/// boundary where one page ends and the next begins. An `after` naming a row
+/// this tenant cannot see yields an empty page rather than the whole register:
+/// RLS's usual silence, in one round trip, with nothing leaked about whether
+/// the row exists.
+///
+/// `now` is the caller's clock rather than SQL's `now()` for
+/// [`Quote::is_expired_at`]'s reason: the reader renders `expired` against one
+/// clock, and a filter running a few microseconds later on a second one would
+/// hand back a row the reader then contradicts.
+pub async fn register(
+    tx: &mut TenantTx<'_>,
+    state: Option<State>,
+    after: Option<QuoteId>,
+    limit: i64,
+    now: DateTime<Utc>,
+) -> Result<Vec<Quote>, StoreError> {
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM sales_quotes ORDER BY issued_at DESC, id DESC"
+        // A `CASE` over a bound parameter rather than a WHERE built per
+        // filter: the statement stays one compile-time constant — nothing a
+        // caller sends reaches the SQL text — and the four arms sit next to
+        // each other where a reader can check they still partition.
+        "SELECT {COLUMNS} FROM sales_quotes \
+          WHERE CASE $1::text \
+                  WHEN 'open'     THEN accepted_at IS NULL AND declined_at IS NULL \
+                                       AND valid_until > $2 \
+                  WHEN 'lapsed'   THEN accepted_at IS NULL AND declined_at IS NULL \
+                                       AND valid_until <= $2 \
+                  WHEN 'accepted' THEN accepted_at IS NOT NULL \
+                  WHEN 'declined' THEN declined_at IS NOT NULL \
+                  ELSE TRUE \
+                END \
+            AND ($3::uuid IS NULL OR (issued_at, id) < \
+                 (SELECT p.issued_at, p.id FROM sales_quotes p WHERE p.id = $3)) \
+          ORDER BY issued_at DESC, id DESC \
+          LIMIT $4"
     )))
+    .bind(state.map(State::as_str))
+    .bind(now)
+    .bind(after.map(|id| id.as_uuid()))
+    .bind(limit)
     .fetch_all(&mut ***tx)
     .await?;
     with_lines(tx, rows).await
@@ -876,6 +967,115 @@ mod tests {
                 if message.contains("100000") && message.contains("120000")),
             "{refused:?}"
         );
+
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// **The four states partition the register, and the walk loses nobody.**
+    ///
+    /// The two halves are one test because the bug they guard against is one
+    /// bug: a filter that quietly admits an extra row and a cursor that quietly
+    /// drops one are both "the page is not what it says it is", and both are
+    /// invisible to a test that only checks the first page of an unfiltered
+    /// register — which is exactly what this module had before the window
+    /// existed.
+    ///
+    /// The walk runs at `limit = 1` on purpose: every page is full, so every
+    /// page has a successor, and the cursor is exercised once per row instead of
+    /// once per run.
+    #[tokio::test]
+    async fn the_four_states_partition_the_register_and_the_walk_repeats_nobody() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee, opportunity) = seed(&db, "qualified").await;
+        let now = Utc::now();
+        let lines = lines();
+
+        // One of each: answered yes, answered no, still live, and run out.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let mut made = Vec::new();
+        for valid_until in [
+            now + TimeDelta::days(30),
+            now + TimeDelta::days(30),
+            now + TimeDelta::days(30),
+            // A short fuse rather than a past date: the row has to be legal at
+            // insert (`sales_quotes_validity_is_a_future` compares against
+            // `issued_at`), so the only way to hold a lapsed offer is to read
+            // it at `later` below. `an_expired_quote_cannot_be_accepted` makes
+            // its one the same way.
+            now + TimeDelta::seconds(1),
+        ] {
+            let quote = propose(
+                &mut tx,
+                draft(opportunity, employee, eur(120_000), valid_until, &lines),
+            )
+            .await
+            .expect("propose");
+            made.push(quote.id);
+        }
+        assert!(accept(&mut tx, made[0], now).await.expect("accept"));
+        assert!(decline(&mut tx, made[1], now).await.expect("decline"));
+        tx.commit().await.expect("commit the four");
+
+        // Every read below is at `later`, which is past the short fuse: the
+        // fourth document is legal at insert and lapsed at read, which is the
+        // whole state a stored flag would be wrong about.
+        let later = now + TimeDelta::seconds(2);
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let mut seen_by_state = Vec::new();
+        for (state, expected) in [
+            (State::Accepted, made[0]),
+            (State::Declined, made[1]),
+            (State::Open, made[2]),
+            (State::Lapsed, made[3]),
+        ] {
+            let page = register(&mut tx, Some(state), None, 200, later)
+                .await
+                .expect("one state");
+            assert_eq!(
+                page.iter().map(|q| q.id).collect::<Vec<_>>(),
+                vec![expected],
+                "{} admitted the wrong rows",
+                state.as_str()
+            );
+            seen_by_state.push(expected);
+        }
+
+        // A partition, not four overlapping cuts: the four states between them
+        // name every row of the register exactly once.
+        let whole = register(&mut tx, None, None, 200, later)
+            .await
+            .expect("unfiltered");
+        assert_eq!(whole.len(), 4, "the fixture is four documents");
+        seen_by_state.sort();
+        let mut all: Vec<_> = whole.iter().map(|q| q.id).collect();
+        all.sort();
+        assert_eq!(all, seen_by_state, "the four states do not partition");
+
+        // And the same four, one page at a time, in the same order.
+        let mut walked = Vec::new();
+        let mut after = None;
+        loop {
+            let page = register(&mut tx, None, after, 1, later)
+                .await
+                .expect("page");
+            let Some(last) = page.last() else { break };
+            after = Some(last.id);
+            walked.extend(page.iter().map(|q| q.id));
+            assert!(walked.len() <= 4, "the cursor is looping: {walked:?}");
+        }
+        assert_eq!(
+            walked,
+            whole.iter().map(|q| q.id).collect::<Vec<_>>(),
+            "the walk and the whole register disagree"
+        );
+
+        // A cursor naming a row this tenant cannot see is an empty page and not
+        // the whole register — the refusal that keeps a bad `after` from
+        // reading like "no filter".
+        let stranger = register(&mut tx, None, Some(QuoteId::new_v7(later)), 200, later)
+            .await
+            .expect("unknown cursor");
+        assert!(stranger.is_empty(), "an unknown cursor opened the register");
 
         tx.rollback().await.expect("rollback");
     }

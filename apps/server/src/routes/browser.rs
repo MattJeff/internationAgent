@@ -346,10 +346,19 @@ struct ProxyBody {
     bypass: Option<String>,
 }
 
+/// Le corps de `POST /v1/browser/proxy/check`.
+///
+/// **`echo_url` n'est pas une `Option`, et ça a été un correctif** : le champ a
+/// été déclaré facultatif jusqu'au 2026-09-11 alors que le gestionnaire refusait
+/// son absence par un 400. Un type qui ment ainsi est pire qu'un type
+/// permissif : il dit à tout lecteur — et à tout générateur de schéma qui le
+/// lirait un jour — qu'il existe un comportement par défaut, alors que ce
+/// déploiement n'embarque **aucune** adresse de tiers (voir l'en-tête). Le
+/// défaut qu'on imaginerait ici n'existe nulle part.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckBody {
-    echo_url: Option<String>,
+    echo_url: String,
 }
 
 fn no_proxy() -> ApiError {
@@ -462,14 +471,26 @@ async fn proxy_delete(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// Rendre `echo_url` obligatoire déplace le refus du gestionnaire vers le
+/// désérialiseur, et un 400 de serde aurait remplacé `no_echo_url` par un code
+/// générique sur le cas le plus banal — un corps vide. Donc le rejet est
+/// rattrapé et **rendu sous le même code qu'avant**, avec la phrase de
+/// `Refusal::NoEcho` : pour l'appelant, « pas de corps », « corps vide » et
+/// « `echo_url` manquant » sont un seul problème et méritent une seule réponse.
+///
+/// Le texte du rejet de serde n'est pas repris — `proxy_put` argumente
+/// pourquoi, et l'argument tient ici aussi : ce module ne renvoie jamais la
+/// valeur qu'il n'a pas comprise.
 async fn proxy_check(
     State(state): State<BrowserState>,
     principal: Principal,
-    body: Option<axum::Json<CheckBody>>,
+    body: Result<axum::Json<CheckBody>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    let echo_url = body.and_then(|axum::Json(body)| body.echo_url);
+    let axum::Json(CheckBody { echo_url }) = body.map_err(|_| refused(Refusal::NoEcho))?;
     let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
-    let checked = browser_proxy::check(&mut tx, &state.cipher, echo_url.as_deref()).await;
+    // Toujours `Some` — la chaîne vide, elle, reste à `check`, qui la refuse
+    // avec le même `NoEcho` : « fourni mais blanc » n'est pas un autre problème.
+    let checked = browser_proxy::check(&mut tx, &state.cipher, Some(&echo_url)).await;
     // Le verdict est écrit sur la ligne même quand il est mauvais, donc la
     // transaction se valide dans les deux cas — sauf si rien n'a été tenté.
     let checked = match checked {
@@ -1056,6 +1077,17 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["code"], "no_echo_url");
+        // Et pas de corps du tout : depuis que `echo_url` est obligatoire, c'est
+        // le désérialiseur qui refuse celui-ci et non le gestionnaire, donc
+        // cette ligne est la garde qui empêche le code de redevenir générique.
+        let (status, body) = h
+            .send("POST", "/v1/browser/proxy/check", SECRET_A, None)
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["code"], "no_echo_url",
+            "un corps absent est le même problème qu'un `echo_url` absent"
+        );
         // Avec un écho, mais un proxy qui n'existe pas : le code nommé, et le
         // verdict reste sur la ligne pour la console.
         let (status, body) = h

@@ -53,6 +53,10 @@ pub mod inventory;
 // arrived. The employee's half is `agentos_app::effects::issue_invoice` — and
 // there is deliberately no operator way to *issue* one; see the module docs.
 pub mod invoices;
+// la clé que le locataire émet pour lui-même : celle qu'on colle dans
+// `claude mcp add`. `platform` en est la moitié fournisseur — il nomme le
+// locataire, celui-ci le lit dans le credential et ne sait pas dire « autrui ».
+pub mod keys;
 pub mod knowledge;
 pub mod mcp;
 // le serveur MCP : l'autre sens de `mcp`. Celui-ci n'appelle personne — il
@@ -77,6 +81,11 @@ pub mod pnl; // the seat's P&L: tokens at the declared tariff against the money 
 pub mod policy;
 pub mod pool;
 pub mod sequences;
+// le social : `apps/social` est un agrégateur abouti et séparé ; ces quatre
+// chemins sont tout ce qu'il fallait pour qu'un locataire qui l'a branché
+// publie depuis le produit. Aucun octet de plateforme ne passe par ici — le
+// service le fait, et lui seul sait ce qu'une plateforme accepte.
+pub mod social;
 // le registre public: la preuve qu'on a et qu'un concurrent sans gate ne peut
 // pas copier — ce que la gate a refusé, agrégé, sur consentement explicite. Sa
 // lecture est montée hors de toute clé; sa bascule est un acte de locataire.

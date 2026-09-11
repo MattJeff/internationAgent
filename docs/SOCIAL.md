@@ -245,6 +245,31 @@ quand la doc le donne. Faits repris de la sonde du 2026-09-02
 (`catalog.rs`, `CATALOGUE.md`) et complétés par lecture des docs officielles
 le 2026-09-02.
 
+**Ce que le rattachement du 2026-09-11 a changé à cette liste** — parce qu'une
+liste de ce qui reste au fondateur qui ne dit pas ce qui n'y est plus est une
+liste qu'on relit pour rien :
+
+* **Rien n'y est devenu faux.** Aucune revue n'a été levée par du code, et
+  aucune ne pouvait l'être : ce sont des comptes développeur, des paires
+  client/secret et des dépôts sur des portails tiers. Les cinq blocs
+  ci-dessous sont intacts, délais compris.
+* **Deux gestes s'y ajoutent, et ce ne sont pas des revues** — donc ils ne sont
+  bloqués par personne, et ce sont eux qui séparent aujourd'hui « construit » de
+  « ça publie » :
+  1. **Déployer `agentos-social`** quelque part (sa base
+     `SOCIAL_DATABASE_URL`, sa `SOCIAL_MASTER_KEY`, son `SOCIAL_PUBLIC_URL`
+     joignable — Instagram et TikTok tirent les médias dessus).
+  2. **Frapper un jeton de tenant** : `agentos-social mint-tenant <label>`.
+     Le jeton ne se frappe pas par une route, à dessein ; il se colle dans
+     `integrations_connect`, une fois, par locataire.
+* **Ce qui n'était pas nommé et qui l'est maintenant** : tant que la revue
+  d'une plateforme n'est pas passée, le compte qui publie doit être un compte
+  que cette revue autorise déjà — un RÔLE sur l'app Meta, un des cinq comptes
+  cibles de la Sandbox TikTok, un test user de l'écran Google en `Testing`
+  (dont le refresh token meurt en sept jours). C'est exactement la raison pour
+  laquelle le service est **branché par locataire** et pas allumé pour tout le
+  monde : voir « Comment un locataire publie aujourd'hui ».
+
 ### X — pas une revue, un compte à créditer (jour un)
 
 * **Portail** : https://console.x.com (Developer Console).
@@ -417,7 +442,83 @@ le 2026-09-02.
    fondateur peut faire), chacune une plateforme de plus derrière les six
    mêmes outils, sans nouvel outil.
 
+## Comment un locataire publie aujourd'hui
+
+Écrit le 2026-09-11, le jour du rattachement (`apps/server/src/routes/social.rs`,
+`crates/app/src/mcp_tools/social.rs`). **Le service reste un serveur MCP séparé,
+et le produit le branche comme il branche GitHub ou Linear** — c'est le chemin
+A ; le chemin B (hébergé par le déploiement, branché tout seul pour chaque
+locataire) a été refusé, et les deux raisons sont dans les docs du module de
+routes : il faudrait frapper un jeton dans une seconde base depuis le binaire du
+produit, et surtout brancher tout le monde promettrait à chaque locataire une
+publication que les revues d'app ci-dessus ne permettent pas encore.
+
+Ce que ça donne, dans l'ordre, et **rien de tout cela n'est du code neuf sauf
+la dernière ligne** :
+
+| # | Geste | Avec quoi |
+|---|---|---|
+| 1 | Déployer le service, frapper un jeton | `agentos-social mint-tenant <label>` |
+| 2 | Brancher l'agrégateur sous le handle **`social`** | `integrations_connect` (`connector: "custom"`, l'URL du service, le jeton) |
+| 3 | Lire sa table et ses empreintes | `integrations_discover` |
+| 4 | Épingler chaque outil au digest lu | `integrations_declare_tool` (`risk: "write"`) |
+| 5 | Autoriser un compte de plateforme | `social_connect_url_get`, puis un humain ouvre l'URL |
+| 6 | Publier | `social_post_preview_get` → `social_post_publish` |
+
+Les étapes 2 à 4 sont la machinerie MCP du produit, telle quelle : la
+vérification d'adresse au bind, le credential scellé, le pin SHA-256 par outil,
+la classe de risque qu'un opérateur seul peut baisser. **L'étape 4 n'est pas
+une formalité** : un outil que personne n'a déclaré est `Destructive`, donc il
+demande un humain, donc l'appel est refusé — un `403 tool_not_declared` qui
+nomme les deux outils à appeler. Publier au nom de l'entreprise ne se branche
+pas par accident.
+
+Les cinq outils du produit, à la convention `domaine_objet_verbe`, chacun une
+route (`docs/OPERATIONS.md` § 1.4i) :
+
+| Outil | Route | Risque |
+|---|---|---|
+| `social_accounts_list` | `GET /v1/social/accounts` | `read` |
+| `social_connect_url_get` | `POST /v1/social/accounts/connect` | `write` |
+| `social_post_preview_get` | `POST /v1/social/preview` | `read` |
+| `social_post_publish` | `POST /v1/social/posts` | `destructive` |
+| `social_posts_list` | `GET /v1/social/posts` | `read` |
+
+Le sixième outil du service (`post_metrics`) n'a pas de route : il n'est pas sur
+le chemin entre « je veux publier » et « c'est publié », et deux lignes
+suffiront le jour où quelqu'un le demande.
+
+**Et l'employé, lui ?** Il n'a besoin d'aucune de ces routes, et c'est le
+meilleur signe que le chemin A était le bon : un siège publie par un
+`Action::McpCall` sur `social/post-publish`, à travers la même flotte, la même
+Gate et la même politique que n'importe quel autre connecteur — il faut donc
+que l'outil soit dans l'allowlist du siège (`PolicyLimits::allowed_mcp_tools`),
+comme pour GitHub. Rien n'a été écrit pour ça : c'était déjà là. Les cinq routes
+ci-dessus sont la moitié **humaine** — le fondateur, depuis son terminal, par le
+serveur MCP du produit.
+
+**La garde, du côté appelant.** Le service n'a aucune surface de contact privé
+et son test anti-DM le prouve ; ce rattachement est la première chose qui
+pouvait rouvrir la porte, puisqu'il est un *appelant*. Il ne le fait pas, et ce
+n'est pas une promesse : les cinq noms d'outils que ces routes savent prononcer
+sont une constante du fichier, rien d'une requête ne les choisit, et
+`aucune_route_ne_parle_a_quelqu_un` crible cette liste **et le source du module,
+commentaires retirés**, avec le même jeu d'interdits que le service (éprouvé en
+y glissant un `"dm-open"` : le test tombe). La seconde table du service,
+`/mcp/messagerie` et ses quatorze outils qui atteignent des gens, est
+inatteignable d'ici — aucun de ses noms n'est prononçable, et un
+`/mcp/messagerie` branché sous le handle `social` rend `404 no_social_binding`
+parce qu'il ne sert aucun des cinq.
+
 ## L'entrée au catalogue — plus tard, et pourquoi
+
+**Ce que le rattachement n'a pas changé** : le service n'a toujours pas d'entrée
+nommée dans `CATALOG`, et l'argument ci-dessous tient toujours. Ce qu'il a
+changé, c'est qu'on n'attend plus cette entrée pour brancher : `catalog::CUSTOM`
+prend l'URL dans la requête — c'est le cas « le client fait tourner ce serveur et
+donne son adresse » — et les routes de publication ne lisent pas le connecteur,
+elles lisent le HANDLE. Le jour où l'entrée nommée arrive, elle est douze lignes
+et rien du câblage ne bouge.
 
 Le service n'a pas d'entrée dans `CATALOG` aujourd'hui, et c'est voulu :
 chaque littéral du catalogue est resondé le jour de son écriture, et une
