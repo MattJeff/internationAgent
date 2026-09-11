@@ -20,7 +20,7 @@
 --
 -- 2. `website`. `accounts.domain` is the *registrable* domain, lower case,
 --    because that is the identity of a prospect and where its booking flow
---    lives. It is derived: `https://www.qilutravel.com/` becomes `qilutravel.com`. The
+--    lives. It is derived: `https://www.qyer.com/` becomes `qyer.com`. The
 --    scheme, the `www.` and the path are the founder's data and they do not
 --    survive that derivation, so the URL as the list spells it is kept here.
 --    `agentos_app::queue` has a test that a row of his file comes back out of

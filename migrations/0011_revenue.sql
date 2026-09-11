@@ -52,7 +52,7 @@
 --
 -- 4. THE SAME COMPANY IS A DIFFERENT ACCOUNT IN EVERY TENANT. `accounts` is
 --    unique on `(tenant_id, domain)`, never on `domain`: two customers
---    prospecting Luftlinie hold two unrelated accounts, and neither is visible
+--    prospecting Lufthansa hold two unrelated accounts, and neither is visible
 --    to the other.
 --
 -- Replayable: everything is IF NOT EXISTS / OR REPLACE / DROP-then-CREATE.
