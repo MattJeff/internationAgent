@@ -488,7 +488,17 @@ mod tests {
             return;
         };
         let seat = employee(&h.db, h.a, "orizn-ventes").await;
-        let at = Utc::now();
+        // **Midi du jour courant, et pas « il y a N minutes ».** La fenêtre que
+        // compte cette route est le jour UTC ; semer trois tours à 5, 65 et
+        // 125 minutes en arrière les fait tomber la veille dès que la suite
+        // tourne après minuit — mesuré en CI le 2026-09-11, qui n'en a compté
+        // qu'un sur trois. L'heure à laquelle une suite s'exécute n'est pas
+        // une propriété du produit.
+        let at = Utc::now()
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .expect("midi existe")
+            .and_utc();
         trace(&h.db, h.a, seat, at - Duration::hours(30), TURN, None).await;
         for minutes in [5_i64, 65, 125] {
             trace(
