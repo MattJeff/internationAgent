@@ -61,9 +61,37 @@
 --
 -- `add constraint` valide les lignes existantes. Une base où le défaut a déjà
 -- été exploité — une ligne dont le `tenant_id` ne correspond pas à celui de son
--- employé — fera échouer la migration en nommant la table fautive. C'est voulu :
--- un `not valid` laisserait la ligne squattée en place et le vrai propriétaire
--- du siège toujours dehors.
+-- employé — fera échouer la migration en nommant la table, la contrainte et la
+-- paire fautive :
+--
+--   ERROR:  insert or update on table "employee_charters" violates foreign key
+--           constraint "employee_charters_employee_id_fkey"
+--   DETAIL: Key (tenant_id, employee_id)=(…, …) is not present in table "employees".
+--
+-- # Le verrou, mesuré, et comment en sortir le jour où il gênera
+--
+-- La validation prend un `ACCESS EXCLUSIVE` sur la table enfant pendant toute sa
+-- durée. Mesure sur cette machine, `turn_outcomes` chargée à 500 000 lignes
+-- (66 Mo), Postgres 17, trois suites de tests tournant à côté :
+--
+--   * une contrainte seule ................ 16,9 s
+--   * les trente-sept d'un coup ........... 65,8 s (les 36 autres tables vides)
+--   * base vierge, rien dedans ............  4,8 s
+--
+-- Soit une trentaine de microsecondes par ligne. La production ne porte qu'un
+-- seul locataire et ces tables y sont minuscules, donc c'est quelques
+-- millisecondes ; et pour la même raison une ligne squattée y est impossible
+-- aujourd'hui. Le `VALIDATE` immédiat est donc gardé délibérément, et son coût
+-- le jour où il mordra est le prix de sa vertu : une migration qui échoue au
+-- déploiement, bruyamment, avant la mise en service, vaut mieux qu'une ligne
+-- squattée qui survit en silence à son correctif.
+--
+-- **Le recours, nommé pour le successeur qui trouvera ceci lent** : scinder en
+-- `add constraint … not valid` (verrou bref) puis `validate constraint` (verrou
+-- `SHARE UPDATE EXCLUSIVE`, qui laisse passer lectures et écritures). Le prix est
+-- exactement ce que le paragraphe au-dessus refuse : les lignes déjà squattées
+-- restent en place et le vrai propriétaire du siège reste dehors. À ne prendre
+-- que sur une table dont le volume l'impose, et en sachant ce qu'on achète.
 
 -- a2a_tasks
 alter table a2a_tasks drop constraint if exists a2a_tasks_employee_id_fkey;
