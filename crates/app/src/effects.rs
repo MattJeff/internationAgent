@@ -3368,6 +3368,32 @@ impl Effects {
     /// `mcp_call` in the audit row for the act that binds the company, where
     /// `contract_sign` belongs.
     ///
+    /// # The suppression list is not consulted, and that is a decision
+    ///
+    /// `Authorized`'s own docs say the token is proof the address was not
+    /// suppressed **for the four actions that address a person on a channel** —
+    /// email, SMS, WhatsApp, a dial. A signature request is a fifth way a
+    /// stranger's inbox rings, and `crate::catalog`'s `docusign` entry says so
+    /// in as many words: it is `OptOuts::HeldHere`, because *« une demande de
+    /// signature est un courriel envoyé à une adresse que l'appelant nomme, à
+    /// quelqu'un qui n'a rien demandé à DocuSign »*.
+    ///
+    /// It is still not checked here, deliberately. `suppressions` is a register
+    /// of people who asked us to stop **soliciting** them — five reasons, all of
+    /// them a bounce, a complaint or a STOP — and a counterparty who is about to
+    /// sign a contract is not being solicited. Refusing to send somebody the
+    /// agreement they negotiated because they once unsubscribed from a mailing
+    /// would be a break an operator could only undo by deleting a row from the
+    /// register, which is the one table that must not be edited to get work
+    /// done.
+    ///
+    /// What stands in its place is stronger than a list lookup and is the whole
+    /// subject of this method: **a named human reads the title and approves each
+    /// one.** Nothing here is a campaign, and there is no path that sends a
+    /// second envelope without a second decision. The day somebody wants the
+    /// list consulted anyway, the place is `gate::suppressible`, which is one
+    /// array.
+    ///
     /// # What is **not** verified, said here rather than discovered later
     ///
     /// [`SEND_ENVELOPE`] is a tool name **this file invented**. No DocuSign
