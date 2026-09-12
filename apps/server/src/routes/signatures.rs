@@ -178,8 +178,9 @@ struct Signed {
 /// 404 couvre quatre refus, et c'est délibéré — la forme de `paid` : le pli
 /// n'est pas à cette entreprise, il n'existe pas, il n'est jamais parti, ou il
 /// est déjà signé. Aucun des quatre ne doit devenir un oracle sur les plis du
-/// voisin. 400 est réservé à la seule faute actionnable : le fichier n'est pas
-/// dans le classeur, ou c'est le document d'origine.
+/// voisin. 400 est réservé aux deux fautes qu'un appelant peut corriger
+/// lui-même : le fichier n'est pas dans le classeur, ou c'est le document
+/// d'origine qu'on lui redonne pour exemplaire signé.
 async fn signed(
     State(state): State<Signatures>,
     principal: Principal,
