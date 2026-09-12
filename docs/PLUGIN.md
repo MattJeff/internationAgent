@@ -1,7 +1,7 @@
-# Le plugin Claude Code — l'interface par-dessus les 141 outils
+# Le plugin Claude Code — l'interface par-dessus les 144 outils
 
-Le serveur MCP (`docs/MCP_SERVEUR.md`) rend 141 outils. Brancher une URL et une
-clé donne 141 verbes bruts et aucun mode d'emploi : le modèle doit deviner
+Le serveur MCP (`docs/MCP_SERVEUR.md`) rend 144 outils. Brancher une URL et une
+clé donne 144 verbes bruts et aucun mode d'emploi : le modèle doit deviner
 qu'on lit `company_health_get` avant de croire un chiffre, qu'un import se fait à
 blanc d'abord, qu'une action d'approbation se recopie octet par octet.
 
@@ -185,13 +185,13 @@ python3 scripts/verifier-plugin.py
 
 Vérifié par ce script : chaque JSON parse, chaque `SKILL.md` porte un
 frontmatter délimité dont tous les champs sont documentés et dont le `name`
-correspond à son dossier, **chacun des 60 outils nommés par les quatre gestes
+correspond à son dossier, **chacun des 62 outils nommés par les quatre gestes
 existe encore dans `crates/app/src/mcp_tools/`**, aucun fichier ne contient
 `sk-`, `re_`, `whsec_` ni un `Bearer ` suivi d'un jeton, et la `source` du
 marketplace mène à un manifeste dont le nom correspond.
 
 La troisième ligne est la seule qui mérite un script plutôt qu'une relecture :
-les 141 lignes du registre sont éditées par d'autres chantiers, et un outil
+les 144 lignes du registre sont éditées par d'autres chantiers, et un outil
 renommé rend un geste faux **sans rien casser d'autre**. Le script a été vu
 rougir — renommer `company_health_get` dans `point-du-jour` le fait échouer — parce
 qu'une vérification qui n'a jamais échoué ne prouve rien.
