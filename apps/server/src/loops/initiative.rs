@@ -5025,6 +5025,8 @@ pub(crate) mod tests {
                 is_primary: true,
                 lawful_basis: "legitimate_interest",
                 next_follow_up_at: None,
+                origin: None,
+                origin_ref: None,
             },
         )
         .await
@@ -5399,6 +5401,8 @@ pub(crate) mod tests {
                 is_primary: true,
                 lawful_basis: "legitimate_interest",
                 next_follow_up_at: None,
+                origin: None,
+                origin_ref: None,
             },
         )
         .await
@@ -5488,6 +5492,8 @@ pub(crate) mod tests {
                 is_primary: true,
                 lawful_basis: "legitimate_interest",
                 next_follow_up_at: None,
+                origin: None,
+                origin_ref: None,
             },
         )
         .await

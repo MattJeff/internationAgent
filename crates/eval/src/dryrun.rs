@@ -653,6 +653,8 @@ async fn seed_prospect(db: &Db, tenant: TenantId, sdr: EmployeeId, nth: usize) {
             // row it lands. A date here would put a person nobody has written to
             // at the head of the follow-up queue.
             next_follow_up_at: None,
+            origin: None,
+            origin_ref: None,
         },
     )
     .await

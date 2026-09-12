@@ -2520,6 +2520,11 @@ impl Effects {
             // reason `ZZ` exists.
             country: crate::prospects::UNKNOWN_COUNTRY,
             employee_id: Some(self.principal.employee_id),
+            // L'URL qu'on a demandée, qui est la nôtre — pas un octet que la
+            // page a écrit. Elle devient `contacts.origin_ref` (0107), et c'est
+            // ce qui laisse `GET /v1/growth` nommer *quelle* page a produit quel
+            // euro plutôt que « une découverte ».
+            source: Some(url.as_str()),
         };
         let report = crate::prospects::discover(&mut tx, &list, &page, Utc::now(), budget)
             .await

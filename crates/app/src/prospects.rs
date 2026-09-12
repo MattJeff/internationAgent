@@ -217,7 +217,25 @@ pub struct List<'a> {
     pub country: &'a str,
     /// The employee who owns these prospects, if any.
     pub employee_id: Option<EmployeeId>,
+    /// What to call this source on every contact it creates: the file's path
+    /// for [`import`], the page's URL for [`discover`]. `None` is honest and
+    /// costs the reading its name — see
+    /// `migrations/0107_un_contact_dit_dou_il_vient.sql`, which is the column
+    /// this lands in, and [`ORIGIN_IMPORT`] / [`ORIGIN_DISCOVERY`], which are
+    /// the door it came through. The two together are what lets
+    /// `GET /v1/growth` answer "which list produced this euro" instead of
+    /// "seven invoices were paid".
+    pub source: Option<&'a str>,
 }
+
+/// The door [`import`] writes on every contact it creates.
+pub const ORIGIN_IMPORT: &str = "import";
+
+/// The door [`discover`] writes. Both are the closed set of
+/// `contacts_origin` in `migrations/0107_un_contact_dit_dou_il_vient.sql`, and
+/// they are constants here because that CHECK and these two calls are the only
+/// places the strings exist.
+pub const ORIGIN_DISCOVERY: &str = "discovery";
 
 /// Why a file could not be loaded at all.
 ///
@@ -492,6 +510,8 @@ pub async fn import(
                 is_primary: false,
                 lawful_basis: LAWFUL_BASIS,
                 next_follow_up_at: Some(now),
+                origin: Some(ORIGIN_IMPORT),
+                origin_ref: list.source,
             },
         )
         .await?;
@@ -623,6 +643,10 @@ pub async fn discover(
                 is_primary: false,
                 lawful_basis: LAWFUL_BASIS,
                 next_follow_up_at: Some(now),
+                origin: Some(ORIGIN_DISCOVERY),
+                // The URL the operator asked for, which is ours; not a byte the
+                // page authored. Same refusal as `legal_name` above.
+                origin_ref: list.source,
             },
         )
         .await?;
@@ -964,6 +988,7 @@ mod tests {
             segment: "insurer",
             country: UNKNOWN_COUNTRY,
             employee_id: None,
+            source: None,
         }
     }
 
@@ -1278,6 +1303,7 @@ mod tests {
             segment: "relocation",
             country: "PH",
             employee_id: None,
+            source: None,
         };
         let report = import(&mut tx, &list_of, &list, now).await.expect("import");
         assert_eq!(report.contacts_created, 3);
@@ -1408,6 +1434,7 @@ mod tests {
             segment: "cruise_line",
             country: UNKNOWN_COUNTRY,
             employee_id: None,
+            source: None,
         };
         let err = import(&mut tx, &wrong_segment, REAL, now)
             .await
@@ -1418,6 +1445,7 @@ mod tests {
             segment: "other",
             country: "Philippines",
             employee_id: None,
+            source: None,
         };
         let err = import(&mut tx, &wrong_country, REAL, now)
             .await
@@ -1448,6 +1476,7 @@ mod tests {
                 segment,
                 country: "FR",
                 employee_id: None,
+                source: None,
             };
             let report = import(&mut tx, &list_of, &list, now)
                 .await
@@ -1492,6 +1521,7 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
             segment: "other",
             country: UNKNOWN_COUNTRY,
             employee_id: None,
+            source: None,
         }
     }
 
@@ -1943,6 +1973,7 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
             segment: "cruise_line",
             country: UNKNOWN_COUNTRY,
             employee_id: None,
+            source: None,
         };
         let err = discover(&mut tx, &wrong, &directory(), now, 50)
             .await

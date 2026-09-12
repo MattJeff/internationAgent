@@ -6974,6 +6974,8 @@ mod tests {
                 is_primary: false,
                 lawful_basis: "legitimate_interest",
                 next_follow_up_at: Some(due),
+                origin: None,
+                origin_ref: None,
             },
         )
         .await

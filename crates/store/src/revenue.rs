@@ -747,6 +747,16 @@ pub struct NewContact<'a> {
     pub lawful_basis: &'a str,
     /// When to chase them.
     pub next_follow_up_at: Option<DateTime<Utc>>,
+    /// The door this address came through: `import`, `discovery`, or `None`
+    /// when the caller does not know. `0107_un_contact_dit_dou_il_vient.sql`
+    /// holds the closed set and the argument; `None` is *unknown* and never
+    /// "organic". It is the first link of the chain `GET /v1/growth` walks
+    /// backwards from a paid invoice.
+    pub origin: Option<&'a str>,
+    /// The operator's own name for that source — the file's path, the page's
+    /// URL. Free text, and never set without [`NewContact::origin`]: a
+    /// reference to a door nobody named does not read.
+    pub origin_ref: Option<&'a str>,
 }
 
 /// Create a contact.
@@ -761,8 +771,9 @@ pub async fn insert_contact(
 ) -> Result<(), RevenueError> {
     sqlx::query(
         "INSERT INTO contacts (id, tenant_id, account_id, full_name, email, phone, role, \
-                               language, is_primary, lawful_basis, next_follow_up_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                               language, is_primary, lawful_basis, next_follow_up_at, \
+                               origin, origin_ref) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
     )
     .bind(id)
     .bind(tx.tenant_id().as_uuid())
@@ -775,6 +786,8 @@ pub async fn insert_contact(
     .bind(contact.is_primary)
     .bind(contact.lawful_basis)
     .bind(contact.next_follow_up_at)
+    .bind(contact.origin)
+    .bind(contact.origin_ref)
     .execute(&mut ***tx)
     .await?;
     Ok(())
@@ -814,9 +827,10 @@ pub async fn upsert_contact(
     let (created, existing, suppressed): (Option<Uuid>, Option<Uuid>, bool) = sqlx::query_as(
         "WITH ins AS ( \
            INSERT INTO contacts (id, tenant_id, account_id, full_name, email, phone, role, \
-                                 language, is_primary, lawful_basis, next_follow_up_at) \
+                                 language, is_primary, lawful_basis, next_follow_up_at, \
+                                 origin, origin_ref) \
            SELECT $1::uuid, $2::uuid, $3::uuid, $4::text, $5::text, $6::text, $7::text, \
-                  $8::text, $9::boolean, $10::text, $11::timestamptz \
+                  $8::text, $9::boolean, $10::text, $11::timestamptz, $12::text, $13::text \
             WHERE revenue_suppression_of($5::text, $6::text) IS NULL \
            ON CONFLICT (tenant_id, email) DO NOTHING \
            RETURNING id \
@@ -836,6 +850,8 @@ pub async fn upsert_contact(
     .bind(contact.is_primary)
     .bind(contact.lawful_basis)
     .bind(contact.next_follow_up_at)
+    .bind(contact.origin)
+    .bind(contact.origin_ref)
     .fetch_one(&mut ***tx)
     .await?;
 
@@ -2512,6 +2528,8 @@ mod tests {
                 is_primary: true,
                 lawful_basis: "legitimate_interest",
                 next_follow_up_at: Some(now + TimeDelta::days(3)),
+                origin: None,
+                origin_ref: None,
             },
         )
         .await
@@ -2706,6 +2724,8 @@ mod tests {
                 is_primary: false,
                 lawful_basis: "legitimate_interest",
                 next_follow_up_at: None,
+                origin: None,
+                origin_ref: None,
             },
         )
         .await
@@ -3294,6 +3314,8 @@ mod tests {
                 is_primary: false,
                 lawful_basis: "legitimate_interest",
                 next_follow_up_at: Some(now),
+                origin: None,
+                origin_ref: None,
             },
         )
         .await
@@ -3429,6 +3451,8 @@ mod tests {
                 is_primary: true,
                 lawful_basis: "legitimate_interest",
                 next_follow_up_at: None,
+                origin: None,
+                origin_ref: None,
             },
         )
         .await
