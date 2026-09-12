@@ -472,6 +472,7 @@ pub async fn send(
 mod tests {
     use std::sync::Arc;
 
+    use agentos_domain::action::McpTool;
     use agentos_domain::ids::{ApprovalId, EmployeeId, TenantId};
     use agentos_domain::policy::PolicyLimits;
     use agentos_domain::untrusted::Untrusted;
