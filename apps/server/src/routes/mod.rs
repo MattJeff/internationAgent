@@ -87,6 +87,7 @@ pub mod pnl; // the seat's P&L: tokens at the declared tariff against the money 
 pub mod policy;
 pub mod pool;
 pub mod sequences;
+pub mod signatures; // la signature d'un document : préparer le pli, et constater l'exemplaire exécuté
 // le social : `apps/social` est un agrégateur abouti et séparé ; ces quatre
 // chemins sont tout ce qu'il fallait pour qu'un locataire qui l'a branché
 // publie depuis le produit. Aucun octet de plateforme ne passe par ici — le

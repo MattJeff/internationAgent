@@ -14,6 +14,22 @@ note: method defined here
    |     pub async fn issue_invoice(
    |                  ^^^^^^^^^^^^^
 
+error[E0308]: mismatched types
+  --> tests/ui/effects_untrusted_action.rs:72:40
+   |
+72 |     let _ = effects.send_for_signature(ok, request).await;
+   |                     ------------------ ^^ expected `Authorized<ContractSign>`, found `Authorized<Untrusted<ContractSign>>`
+   |                     |
+   |                     arguments to this method are incorrect
+   |
+   = note: expected struct `Authorized<agentos_app::effects::ContractSign>`
+              found struct `Authorized<agentos_domain::untrusted::Untrusted<agentos_app::effects::ContractSign>>`
+note: method defined here
+  --> src/effects.rs
+   |
+   |     pub async fn send_for_signature(
+   |                  ^^^^^^^^^^^^^^^^^^
+
 error[E0271]: type mismatch resolving `<Untrusted<Action> as Subject>::Of == EmailSend`
   --> tests/ui/effects_untrusted_action.rs:21:35
    |
@@ -207,8 +223,8 @@ error[E0277]: the trait bound `Action: agentos_app::effects::Subject` is not sat
              agentos_app::effects::BrowserRead
              agentos_app::effects::BrowserWrite
              agentos_app::effects::CallPlace
+             agentos_app::effects::ContractSign
              agentos_app::effects::EmailSend
-             agentos_app::effects::InternalSend
            and $N others
 note: required by a bound in `Effects::pay`
   --> src/effects.rs

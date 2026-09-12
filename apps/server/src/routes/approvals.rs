@@ -169,8 +169,9 @@
 
 use std::sync::Arc;
 
-use agentos_app::effects::{Effects, PaymentCreate, Ports};
+use agentos_app::effects::{ContractSign, Effects, McpCaller, PaymentCreate, Ports};
 use agentos_app::gate::{PolicyGate, Principal as GatePrincipal};
+use agentos_app::signature;
 use agentos_domain::action::{Action, ActionKind};
 use agentos_domain::ids::{ApprovalId, EmployeeId};
 use agentos_domain::policy::DenyReason;
@@ -186,6 +187,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use super::mcp::Fleets;
 use crate::auth::Principal;
 use crate::error::ApiError;
 
@@ -230,10 +232,16 @@ pub struct Approvals {
     db: Db,
     gate: PolicyGate,
     ports: Arc<Ports>,
+    /// Les branchements MCP, par locataire. Un pli de signature part chez le
+    /// prestataire de **ce** client, comme une pull request est ouverte dans le
+    /// GitHub de ce client — `routes::content` porte le même champ pour la même
+    /// raison. Un `Fleets` partage sa carte, donc en tenir une copie ici n'est
+    /// pas un deuxième jeu de connexions.
+    fleets: Fleets,
 }
 
 /// Mount the approval routes.
-pub fn router(db: Db, gate: PolicyGate, ports: Arc<Ports>) -> Router {
+pub fn router(db: Db, gate: PolicyGate, ports: Arc<Ports>, fleets: Fleets) -> Router {
     Router::new()
         .route("/v1/approvals", get(list))
         .route("/v1/approvals/{id}", get(one))
@@ -241,7 +249,12 @@ pub fn router(db: Db, gate: PolicyGate, ports: Arc<Ports>) -> Router {
         .route("/v1/approvals/{id}/deny", post(deny))
         .route("/v1/capability-requests", get(capability_requests))
         .route("/v1/capability-requests/decide", post(decide_capability))
-        .with_state(Approvals { db, gate, ports })
+        .with_state(Approvals {
+            db,
+            gate,
+            ports,
+            fleets,
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -609,10 +622,17 @@ async fn approve(
     };
     let approval_id = ApprovalId::from_uuid(id);
 
-    // The one arm with an executor. Everything else is minted, reported and
-    // dropped, exactly as it always was — there is nothing on the far side of
-    // those tokens to hand them to.
+    // **Two arms with an executor now**, and the second one is the signature.
+    // Everything else is still minted, reported and dropped — there is nothing
+    // on the far side of those tokens to hand them to.
+    //
+    // The match is before the redemption and each arm redeems exactly once,
+    // which is the property this whole function rests on and which a third arm
+    // must keep.
     let Action::PaymentCreate { amount, payee } = body.action else {
+        if let Action::ContractSign { title } = body.action {
+            return sign(&state, &gate_principal, approval_id, &row, title, id).await;
+        }
         let authorized = state
             .gate
             .redeem_approval(&gate_principal, approval_id, &row.nonce, body.action)
@@ -683,6 +703,164 @@ async fn approve(
         // same vocabulary the audit row carries, so an operator reading a 502
         // and an operator reading the trail read one string.
         .with_extension("payment_error", json!(err.code()))),
+    }
+}
+
+/// What an approved signature reports on a deployment where the tenant has not
+/// connected a signature provider.
+///
+/// [`NO_PAYMENT_RAIL`]'s sibling, and written from the same argument: the
+/// approval stays `pending`, the nonce stays live, and the same button works the
+/// day the connector is bound. `501` because the honest reading is the one HTTP
+/// already has for it — this deployment does not support what the request needs,
+/// and waiting does not help.
+///
+/// The difference with a payment is which layer knows: a payment rail is a
+/// process-wide port, a signature connector is **one tenant's** row in
+/// `mcp_servers`. So the question is asked of that tenant's fleet.
+const NO_SIGNATURE_CONNECTOR: &str = "no_signature_connector";
+
+/// The envelope this approval was filed for is already out at the provider.
+///
+/// Refused **before** the redemption, so a second press does not spend a
+/// decision on a document the counterparty is already holding. It is not the
+/// ordinary replay guard — that one is `approvals::redeem`, which requires
+/// `pending` and answers `approval_already_decided` — it is the narrower case of
+/// a row that was sent by some other path.
+const ENVELOPE_ALREADY_SENT: &str = "envelope_already_sent";
+
+/// The approval is gone and the envelope is not with the provider.
+///
+/// [`PAYMENT_NOT_PERFORMED`]'s sibling, and the pair it belongs to is the same:
+/// this one says *the decision is spent and nothing left*, against
+/// [`NO_SIGNATURE_CONNECTOR`]'s *nothing was attempted and nothing was spent*.
+const ENVELOPE_NOT_SENT: &str = "envelope_not_sent";
+
+/// Spend the approval on the signature it was filed for.
+///
+/// # The order, and it is [`approve`]'s order with one lookup added
+///
+/// Read the envelope, ask whether this tenant can reach a signature provider at
+/// all, redeem, send. The first two steps write nothing, so a refusal in either
+/// leaves the approval `pending` and the queue exactly as the approver found it
+/// — which is the whole argument [`NO_PAYMENT_RAIL`] makes one function up, and
+/// it is worth more here: a signature is the one decision in this product a
+/// person cannot be asked for twice without embarrassment.
+///
+/// # No envelope is not an error
+///
+/// `revenue::Seller::propose_terms` and `sourcing::Buyer::place_order` both file
+/// `ContractSign` approvals with no document behind them — that is what
+/// "proposing a commercial term" means, and it predates this path. Approving one
+/// takes the road every non-payment approval has always taken: minted, reported,
+/// dropped. Nothing is sent, and the human's decision is recorded.
+///
+/// # Why a failed send is a 502 with the approval spent
+///
+/// [`approve`]'s paragraph, unchanged and for the same two facts that can
+/// disagree: the approval was redeemed irreversibly, and the envelope did not
+/// leave. `Effects::send_for_signature` commits a `provider_intents` row before
+/// the request leaves, so the recovery is a person reading
+/// `provisioning::unsettled_calls` against the provider's own console.
+async fn sign(
+    state: &Approvals,
+    gate_principal: &GatePrincipal,
+    approval_id: ApprovalId,
+    row: &Decidable,
+    title: String,
+    id: Uuid,
+) -> Result<Json<Value>, ApiError> {
+    let mut tx = state.db.tenant_tx(gate_principal.tenant_id).await?;
+    let envelope = signature::envelopes::of_approval(&mut tx, id).await?;
+    tx.commit().await?;
+
+    // No envelope: the approval was filed by a seat proposing a term, and there
+    // is nothing to send. The path this route has always taken.
+    let Some(envelope) = envelope else {
+        let authorized = state
+            .gate
+            .redeem_approval(
+                gate_principal,
+                approval_id,
+                &row.nonce,
+                ContractSign { title },
+            )
+            .await?;
+        return Ok(Json(json!({
+            "id": id.to_string(),
+            "state": "redeemed",
+            "decision_id": authorized.decision_id().as_uuid().to_string(),
+        })));
+    };
+
+    if envelope.sent_at.is_some() {
+        return Err(ApiError::conflict(
+            ENVELOPE_ALREADY_SENT,
+            "this envelope is already out for signature",
+        )
+        .with_extension("state", json!("pending")));
+    }
+
+    // The last instant at which nothing has been spent.
+    let fleet = state.fleets.for_tenant(gate_principal.tenant_id);
+    let bound = envelope
+        .handle()
+        .is_some_and(|server| fleet.is_bound(&server));
+    if !bound {
+        tracing::warn!(
+            approval_id = %id,
+            server = %envelope.server,
+            "an approved signature was refused: this tenant has no such connector bound"
+        );
+        return Err(ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            NO_SIGNATURE_CONNECTOR,
+            "this company has not connected the signature provider this envelope names",
+        )
+        .with_extension("state", json!("pending")));
+    }
+
+    let authorized = state
+        .gate
+        .redeem_approval(
+            gate_principal,
+            approval_id,
+            &row.nonce,
+            ContractSign { title },
+        )
+        .await?;
+    let decision_id = authorized.decision_id().as_uuid().to_string();
+
+    // Le seul port qui change : le prestataire de **ce** locataire. Les autres
+    // sont ceux du processus — `routes::content::propose_draft` fait le même
+    // remplacement pour la même raison.
+    let mcp: Arc<dyn McpCaller> = fleet;
+    let ports = Arc::new(Ports {
+        mcp,
+        ..(*state.ports).clone()
+    });
+    // The effect is attributed to the **employee** the approval names, not to
+    // the human who pressed the button — [`approve`]'s argument, and here the
+    // employee is also the seat the envelope was prepared for.
+    let effects = Effects::new(state.db.clone(), ports, gate_principal.clone());
+    match signature::send(&state.db, &effects, authorized, &envelope).await {
+        Ok(sent) => Ok(Json(json!({
+            "id": id.to_string(),
+            "state": "redeemed",
+            "decision_id": decision_id,
+            "signature": {
+                "envelope_id": envelope.id.to_string(),
+                "provider_envelope_id": sent.as_str(),
+            },
+        }))),
+        Err(err) => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            ENVELOPE_NOT_SENT,
+            "the approval was redeemed and the signature provider did not take the envelope",
+        )
+        .with_extension("state", json!("redeemed"))
+        .with_extension("decision_id", json!(decision_id))
+        .with_extension("signature_error", json!(err.to_string()))),
     }
 }
 
@@ -1203,7 +1381,18 @@ mod tests {
     }
 
     fn mount_ports(db: &Db, gate: &PolicyGate, keys: ApiKeys, ports: Ports) -> Router {
-        router(db.clone(), gate.clone(), Arc::new(ports)).layer(from_fn_with_state(
+        // Une flotte vide : aucun test de ce module ne prépare de pli, donc
+        // aucun n'atteint `sign`'s connector check. Un test qui en préparerait
+        // un aurait besoin d'un vrai binding MCP — c'est pourquoi l'effet et la
+        // gate de la signature sont éprouvés dans `agentos_app::signature`, où
+        // le port se remplace par un faux.
+        router(
+            db.clone(),
+            gate.clone(),
+            Arc::new(ports),
+            crate::routes::mcp::Fleets::new().0,
+        )
+        .layer(from_fn_with_state(
             crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
             require_api_key,
         ))

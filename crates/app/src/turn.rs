@@ -321,9 +321,22 @@ pub const UNSERVED: [(ActionKind, &str); 11] = [
     ),
     (
         ActionKind::ContractSign,
-        "the buyer proposes it and there is no effect behind it. The gate turns a signature into \
-         a human's decision and never denies one, so what is missing is not authority — it is a \
-         signing surface, a document to sign and somewhere to put the executed copy.",
+        "the buyer proposes it, **and the three things this entry used to name are no longer \
+         missing**. There is a signing surface (`Effects::send_for_signature`, through the \
+         tenant's own MCP connector), a document to sign (`signature_envelopes.document_name`, a \
+         row of the classeur) and somewhere to put the executed copy \
+         (`signature_envelopes.executed_name`, which `0105` makes the *only* way the word signed \
+         can be written). What withholds the tool is therefore a different thing, and a stronger \
+         one: **no token of this kind can be obtained inside a turn at all.** \
+         `domain::policy::evaluate`'s arm for `Action::ContractSign` is an unconditional \
+         `RequireApproval` with no threshold and no policy field, so the only producer of an \
+         `Authorized<ContractSign>` in the workspace is `PolicyGate::redeem_approval`, reached \
+         from `POST /v1/approvals/{id}/approve` after a named human pressed the button. A row \
+         here would put a tool in front of a model whose every call is `Denied::PendingApproval` \
+         — which is what `place_order` and `propose_terms` already do from Rust, with a caller \
+         that knows to read the approval id out of the refusal. The thing a model can usefully \
+         reach is the operator surface, and it does: `signatures_propose` and `signatures_record` \
+         are in `mcp_tools::commerce`.",
     ),
     (
         ActionKind::CredentialChange,
@@ -3062,7 +3075,14 @@ fn parse<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, serde_json::E
 /// one of them to accept a host the other refuses. A URL with no host —
 /// `file:`, `data:`, an IP literal — is not a domain the gate can rule on, and
 /// `Domain::parse` is what says so rather than a second opinion written here.
-fn page_at(raw: &str) -> Result<(Url, Domain), String> {
+///
+/// `pub` depuis le 2026-09-12 : `apps/server/src/routes/prospects.rs` en a
+/// besoin pour `POST /v1/prospects/discover`, qui pointe le **même** effet que
+/// `find_prospects` sur la même URL. Trois appelants, toujours une seule
+/// fonction, et c'est exactement l'argument du paragraphe au-dessus — une
+/// deuxième lecture de l'URL côté HTTP serait une deuxième chance d'accepter un
+/// hôte que le tour refuse.
+pub fn page_at(raw: &str) -> Result<(Url, Domain), String> {
     let url = Url::parse(raw).map_err(|e| format!("url: {raw:?} is not a URL: {e}"))?;
     let domain = url
         .host_str()

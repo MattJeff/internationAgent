@@ -12,7 +12,7 @@
 //! item checks the bound and nothing else, so the expected error does not move
 //! when a body's arguments change.
 
-use agentos_app::effects::{Effects, InvoiceDraft, InvoiceIssue};
+use agentos_app::effects::{ContractSign, Effects, InvoiceDraft, InvoiceIssue, SignatureRequest};
 use agentos_app::gate::Authorized;
 use agentos_domain::action::Action;
 use agentos_domain::untrusted::Untrusted;
@@ -46,7 +46,7 @@ fn main() {
     let _ = Effects::pay::<Action>;
 }
 
-/// `issue_invoice` is the one effect with no `Of =` to widen: it takes the
+/// `issue_invoice` is one of the effects with no `Of =` to widen: it takes the
 /// trusted newtype concretely, so the tainted flavour is what has to be refused
 /// here. Spelled as a call because there is no generic to instantiate.
 async fn tainted_invoice(
@@ -55,4 +55,19 @@ async fn tainted_invoice(
     draft: &InvoiceDraft,
 ) {
     let _ = effects.issue_invoice(ok, draft).await;
+}
+
+/// The same, for the effect that binds the company in front of a third party.
+///
+/// It is the one where the bound matters least and is kept anyway, which is
+/// worth saying: `Action::ContractSign` escalates, so a tainted one never
+/// reaches a token at all — `policy::evaluate` refuses every high-risk action
+/// derived from untrusted input before any arm runs. This line is what keeps
+/// that true the day somebody changes the wire, and it costs nothing.
+async fn tainted_signature(
+    effects: &Effects,
+    ok: Authorized<Untrusted<ContractSign>>,
+    request: &SignatureRequest<'_>,
+) {
+    let _ = effects.send_for_signature(ok, request).await;
 }

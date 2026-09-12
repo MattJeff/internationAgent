@@ -537,6 +537,7 @@ mod tests {
                         db.clone(),
                         gate.clone(),
                         std::sync::Arc::new(agentos_app::mocks::ports()),
+                        crate::routes::mcp::Fleets::new().0,
                     ),
                     db.clone(),
                     crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),

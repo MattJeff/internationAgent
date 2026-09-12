@@ -785,7 +785,17 @@ fn app(
                 db.clone(),
                 gate.clone(),
                 ports.clone(),
+                // Approuver une signature l'envoie, chez le prestataire de ce
+                // locataire-là — voir `approvals::sign`.
+                fleets.clone(),
             ))
+            // À côté des approbations, parce que c'est là que la décision
+            // tombe : cette unité-ci prépare le pli et constate l'exemplaire
+            // exécuté, et n'envoie rien elle-même.
+            .merge(routes::signatures::router(routes::signatures::Signatures {
+                db: db.clone(),
+                gate: gate.clone(),
+            }))
             // Four routers written by four parallel units, each of which could
             // not mount itself because this file belonged to none of them. A
             // route nobody merged is a route nobody can call, and the
@@ -827,7 +837,17 @@ fn app(
                 // donc elle a besoin de la flotte de ce locataire-là.
                 fleets: fleets.clone(),
             }))
-            .merge(routes::prospects::router(db.clone()))
+            // Et juste après, parce que c'est la même table par les deux
+            // bouts : `import` verse la liste du fondateur,
+            // `POST /v1/prospects/discover` va en chercher une. Celle-là a
+            // besoin de la gate et du même `ports` que `content` — lire un
+            // annuaire est un `BrowserRead` sur lequel la Gate statue pour un
+            // siège.
+            .merge(routes::prospects::router(
+                db.clone(),
+                gate.clone(),
+                ports.clone(),
+            ))
             .merge(routes::sequences::router(db.clone()))
             .merge(routes::quotes::router(db.clone()))
             .merge(routes::pnl::router(db.clone()))

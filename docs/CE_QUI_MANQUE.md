@@ -67,7 +67,7 @@ cannot be re-run*.
 
 | ce qu'il a dit | verdict | où ça s'arrête, en un mot |
 |---|---|---|
-| recherche de lead | **à moitié** | l'effet existe, aucun outil ne l'expose |
+| recherche de lead | **à moitié** | exposée le 2026-09-12 ; rien n'enrichit ce qu'elle trouve |
 | relève du courrier | **couvert** | — |
 | lancement de campagne | **à moitié** | la séquence promet, elle n'envoie pas elle-même |
 | publicité Google | **pas du tout** | pas une ligne |
@@ -193,19 +193,106 @@ sortie par le proxy du locataire (`0098`), vue en direct en SSE. Outils
 C'est la section qui vaut le document. Chaque ligne nomme l'endroit exact où ça
 s'arrête.
 
-### 3.1 La recherche de lead — l'effet existe, aucun outil ne l'expose
+### 3.1 La recherche de lead — exposée le 2026-09-12, et rien n'enrichit encore
 
 `Effects::discover_prospects` (`crates/app/src/effects.rs:2249`) lit un annuaire
 au navigateur, sous `max_new_contacts_per_day` relu dans les quatre couches de
 politique, et écrit des `contacts`. Le verbe existe côté modèle :
 `find_prospects`, l'un des treize de `turn.rs`.
 
-**Où ça s'arrête :** aucun des 136 outils MCP ne l'expose. Les deux seules
-lignes du domaine prospect sont `prospects_segments_list` et `prospects_import`
-— un CSV. Un humain au terminal peut donc *verser* une liste, jamais *en
-chercher une*. Et rien n'enrichit : pas de vérification d'adresse, pas de
-données firmographiques, `prospects.rs` pose `UNKNOWN_COUNTRY` (`ZZ`) parce
-qu'*une page ne dit pas où une société est immatriculée et ceci ne devine pas*.
+**Fait le 2026-09-12** : `POST /v1/prospects/discover` et l'outil
+`prospects_discover` exposent cet effet et rien d'autre — un siège nommé, la
+Gate qui statue sur un `BrowserRead`, le plafond relu par l'effet, et le même
+`prospects::discover` qui écrit, donc pas de second chemin d'écriture. Un humain
+au terminal peut désormais *chercher* une liste et plus seulement en *verser*
+une.
+
+**Où ça s'arrête toujours :** **rien n'enrichit.** Pas de vérification
+d'adresse, pas de données firmographiques, `prospects.rs` pose
+`UNKNOWN_COUNTRY` (`ZZ`) parce qu'*une page ne dit pas où une société est
+immatriculée et ceci ne devine pas*. Une liste découverte est donc une liste
+qu'on ne peut pas segmenter par pays. Les trois chemins possibles et celui qui
+est recommandé sont en § 3.1 bis ; aucun n'est codé.
+
+### 3.1 bis L'enrichissement — trois chemins, un recommandé, aucun codé
+
+Écrit le 2026-09-12, en ouvrant la recherche de lead. La question est : *une
+liste de prospects sans pays ni vérification est une liste qu'on ne peut pas
+segmenter et dont la moitié rebondit* — alors est-ce qu'enrichir est un
+chantier à part, un effet de plus, ou quelque chose que la recherche doit faire
+en même temps ?
+
+**Réponse : un chantier à part, et ce n'est pas le prochain.** Voici les
+chemins mesurés, dans l'ordre où ils se présentent.
+
+#### Chemin A — enrichir en Rust, pendant la recherche, depuis la page
+
+Déduire le pays du ccTLD (`.at` → `AT`), le site du domaine de l'adresse, le
+rôle de la partie locale (`sales@`, `ceo@`).
+
+**Rejeté, et c'est une mesure qui le rejette, pas un goût.** `prospects.rs` a
+compté sur les vraies listes du fondateur : **338 des 1 552 lignes qui portent
+les deux ont un site et une boîte sur deux domaines différents** — une
+association dont le site est `reisehaus.at` et la boîte chez `wkv.at`. Donc
+« le domaine de la boîte est le site » est faux à 22 % sur les seules données
+qu'on ait. Le ccTLD est pire : il est muet sur tout `.com`, c'est-à-dire sur la
+majorité. Et les deux contredisent frontalement la ligne la plus structurante du
+module — *« la page n'a pas le droit d'être lue **à propos** »* — qui est ce qui
+fait qu'une recherche **ne salit pas le tour** là où une lecture de page le
+salit. Un enrichisseur qui lit une fiche pour en tirer une taille d'entreprise
+rouvre ce contrat-là, et le rendement est une devinette.
+
+#### Chemin B — vérifier plutôt qu'enrichir
+
+Un MX sur le domaine de chaque adresse, avant l'écriture ou en lot après.
+
+C'est **du logiciel, pas une ressource** : une dépendance (`hickory-resolver`,
+qui serait la première du dépôt à parler DNS — aujourd'hui la seule résolution
+est `tokio::net::lookup_host` dans `mcp::resolve_and_vet`, un contrôle SSRF qui
+ne rend que des `IpAddr`, et `sending_domain` délègue toute lecture DNS au
+fournisseur). Zéro dépense, zéro compte.
+
+Et c'est le seul des trois qui vise le vrai coût : une liste qui rebondit ne
+coûte pas des contacts perdus, elle brûle **le domaine d'envoi**, et
+`outreach_health_get` ne le voit qu'après.
+
+**Recommandé — et pas maintenant.** La raison est celle que § 7 oppose déjà à
+la recherche elle-même : *ouvrir le robinet avant d'avoir mesuré, c'est ajouter
+avant de mesurer*. On n'a **aucun taux de rebond d'une semaine réelle** — les
+deux taux de `GET /v1/outreach/health` valent `null` tant que rien n'est
+revenu. Construire un vérificateur avant de connaître le nombre qu'il doit
+faire baisser, c'est construire contre une intuition. La semaine de prospection
+réelle est la même que celle de la cinquième place ; ce chantier la suit.
+
+#### Chemin C — acheter
+
+Deux entrées du catalogue le font déjà, et **elles sont nommées ici sans être
+appelées** : `lumail` porte un outil `verify_email`, `exa` sait lire le web
+public. Les deux demandent une clé, donc un compte, donc une dépense — et le
+plancher de `lumail` est `Destructive`, ce qui veut dire qu'un humain approuve
+chaque appel de toute façon. Hors catalogue, les fournisseurs de firmographie
+sont déjà refusés et argumentés (`docs/CATALOGUE.md` : Apollo pour ses envois
+sans lecture des désabonnements, HubSpot et ZoomInfo pour un OAuth qui ne dit
+pas s'il vaut pour leur serveur MCP). **Le jour où B ne suffit pas, pas avant.**
+
+#### Le chemin zéro, qui est ce que je bâtirais en premier
+
+`import` laisse l'opérateur **affirmer** un pays (`--country PH` sur la liste
+DMW) ; la recherche ne le laisse pas — `scan_directory` écrit `ZZ` en dur. Or un
+annuaire est presque toujours national : la chambre de commerce autrichienne
+liste des sociétés autrichiennes. Laisser passer un `country` à la recherche
+comme on le passe à l'import, c'est **une demi-journée**, ça ne devine rien —
+c'est un opérateur qui affirme, exactement comme à l'import — et ça règle la
+moitié du problème de segmentation sans une ligne d'enrichissement.
+
+**Pourquoi ce n'est pas fait aujourd'hui :** ça élargit
+`Effects::discover_prospects`, que le **modèle** appelle aussi par
+`find_prospects`. Un opérateur qui affirme un pays est une affirmation ; un
+modèle qui en choisit un est une devinette, et c'est précisément ce que `0033`
+refuse. Le chantier n'est donc pas une plomberie, c'est une décision sur *qui a
+le droit d'affirmer quoi* — vraisemblablement : le champ existe sur la route,
+pas dans le catalogue de tour. Elle se prend, elle ne se glisse pas dans un
+chantier qui livre autre chose.
 
 ### 3.2 La campagne — la séquence promet, elle n'envoie pas
 
@@ -387,18 +474,33 @@ une session Checkout payée et règle la facture qu'elle nomme. Rien dans ce
 dépôt ne *crée* une session Checkout ni un lien de paiement. Le client est donc
 facturé par PDF et paie par un lien fabriqué ailleurs.
 
-### 3.9 Signer — la gate escalade, il n'y a rien à signer
+### 3.9 Signer — joint le 2026-09-12, sans qu'aucun appel réel ait été fait
 
 `ActionKind::ContractSign` existe, l'acheteur le propose, la gate en fait
 toujours une décision humaine (`ApprovalReason::ContractSignature`) et ne la
 refuse jamais.
 
-**Où ça s'arrête,** dans les mots de `UNSERVED` : *« there is no effect behind
-it. What is missing is not authority — it is a signing surface, a document to
-sign and somewhere to put the executed copy »*. Les trois moitiés existent
-séparément : DocuSign est au catalogue, `quote_document` et `invoice_document`
-savent écrire un PDF, et `files` (`0067`) est l'endroit où ranger l'exemplaire
-signé. Personne ne les a jointes.
+**Ce qui manquait est là depuis le 2026-09-12** : `0105` porte
+`signature_envelopes`, `Effects::send_for_signature` parle au connecteur MCP du
+locataire, et `POST /v1/approvals/{id}/approve` a un **second bras avec un
+exécuteur** — le premier était le paiement. Trois routes (`/v1/signatures`, en
+préparation, registre et constat) et trois outils MCP
+(`signatures_propose`, `signatures_list`, `signatures_record`).
+
+**Ce que la table interdit :** `signed_at` ne s'écrit que si `executed_name`
+nomme un fichier du classeur, et cet exemplaire ne peut pas être le document
+qu'on a envoyé. Le mot « signé » ne peut donc pas mentir — c'est la discipline
+de `content_drafts.url`, tenue par un CHECK.
+
+**Où ça s'arrête maintenant,** et ce n'est plus la même phrase : *aucun appel
+n'a jamais été fait contre le vrai serveur de DocuSign.* `mcp.docusign.com/mcp`
+répond `403` à un appelant sans jeton, aucun compte n'existe ici, donc
+`tools/list` n'a jamais été lu : `effects::SEND_ENVELOPE` et les cinq noms
+d'arguments du pli sont **inventés**, et ce que les tests prouvent est le
+câblage, contre un faux serveur monté ici. Le webhook de complétion n'est pas là
+non plus, pour la raison de `SMARTLEAD_SIGNATURE_HEADER` : le nom de l'en-tête
+où DocuSign signe n'a jamais été lu sur une livraison réelle. Le constat est
+donc un geste d'opérateur, comme `POST /v1/invoices/{id}/paid`.
 
 ### 3.10 Le classeur et la connaissance — lisibles, pas écrivables par un siège
 
@@ -678,10 +780,23 @@ première chose qu'un SaaS B2B demandera après le devis. Il passe après le rô
 de console parce qu'une signature sans rôles est une signature que n'importe
 qui peut déclencher.
 
+**Fait le 2026-09-12**, et § 3.9 dit comment : `0105`,
+`Effects::send_for_signature`, un second bras d'exécuteur sur
+`POST /v1/approvals/{id}/approve`, trois routes et trois outils. **Ce qui reste
+n'est pas du code, c'est un compte** : aucun appel n'a jamais été fait contre le
+vrai DocuSign, donc le nom de l'outil et les noms d'arguments sont des
+suppositions, et le webhook de complétion attend qu'une livraison réelle ait été
+lue une fois. Ce qui est tenu par la base — qu'on ne puisse pas écrire « signé »
+sans l'exemplaire exécuté — ne dépend d'aucun compte.
+
 ### Cinquième — exposer la recherche de lead
 
-**Un jour d'agent.** Un outil MCP sur `discover_prospects`, sous le plafond
-`max_new_contacts_per_day` que l'effet relit déjà.
+**Fait le 2026-09-12.** `POST /v1/prospects/discover` et `prospects_discover`,
+sur l'effet existant, sous le plafond `max_new_contacts_per_day` que l'effet
+relit déjà. **Ce qui reste n'est pas du code, c'est la semaine** : l'argument
+ci-dessous ne disait pas de ne pas construire l'outil, il disait de ne pas
+*ouvrir le robinet* avant d'avoir mesuré. Le robinet a maintenant une poignée ;
+le pack de vente la livre à zéro, et c'est un opérateur qui la tourne.
 
 *Pourquoi cinquième :* le travail est fait à quatre-vingt-dix pour cent, mais
 `ROADMAP_CROISSANCE` § 2.2 a raison — la prospection existe de bout en bout et

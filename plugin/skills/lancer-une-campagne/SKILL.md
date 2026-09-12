@@ -52,6 +52,17 @@ au plafond pour absorber la liste qu'on va importer.
 4. Le même appel **sans** `dry_run`. Un second import du même fichier ne duplique rien : un
    compte est son domaine, un contact son adresse. Réimporter après correction est donc sûr.
 
+**Et s'il n'y a pas de fichier :** `prospects_discover` lit une page qui liste d'autres
+sociétés — l'annuaire d'une fédération, la liste d'adhérents d'une chambre — et en tire les
+mêmes lignes, par le même chemin d'écriture. Trois différences à annoncer au fondateur avant
+de l'appeler : elle **nomme un siège** (`employee_id`), parce que lire une page est une action
+sur laquelle la Gate statue, et un siège sans le canal `web` est refusé en 403 ; elle est
+plafonnée par `max_new_contacts_per_day`, que le pack de vente livre **à zéro**, donc sur un
+déploiement neuf elle lit la page et n'écrit personne tant qu'un opérateur ne l'a pas relevé ;
+et le **pays est `ZZ`**, parce qu'une page ne dit pas où une société est immatriculée — une
+liste découverte ne se segmente donc pas par pays. Il n'y a pas de `dry_run` : annuler la
+transaction n'annulerait pas la lecture de la page.
+
 ## 3. La séquence
 
 **`sequences_list`** pour voir ce qui existe déjà et ne pas en définir une deuxième sous un
