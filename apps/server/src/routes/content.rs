@@ -98,6 +98,7 @@ pub fn router(state: Content) -> Router {
         .route("/v1/content/questions/{id}", delete(remove_question))
         .route("/v1/content/questions/{id}/measure", post(measure))
         .route("/v1/content/citations", get(list_citations))
+        .route("/v1/content/places", get(list_places))
         .route("/v1/content/briefs", get(get_brief))
         .route("/v1/content/drafts", get(list_drafts))
         .route("/v1/content/drafts", post(add_draft))
@@ -304,6 +305,31 @@ async fn list_citations(
     let rows = citations::list(&mut tx, window.question_id, days).await?;
     tx.commit().await?;
     Ok(Json(json!({ "citations": rows })))
+}
+
+/// **Où nos questions vivent déjà**, d'après les mesures qu'on a déjà prises.
+///
+/// Une lecture, et la plus pauvre en droits de tout ce module : pas de siège,
+/// pas de Policy Gate, pas de réseau. Elle ne sort pas — elle relit la dernière
+/// mesure de chaque question et compte les hôtes. Tout ce qu'elle rend a été
+/// payé par un `content_questions_measure` passé.
+///
+/// Elle ne nomme **pas** qui nous cite : `agentos_app::content::places` dit
+/// pourquoi, et `docs/CONTENU.md` § 9 dit ce qu'on a le droit de faire de cette
+/// liste — et ce qu'on n'a pas le droit d'en faire.
+///
+/// Une liste vide quand rien n'a été mesuré, et pas un 409 : contrairement au
+/// brief, « aucun endroit connu » est une réponse juste, et c'est celle d'un
+/// locataire qui n'a encore rien mesuré.
+async fn list_places(
+    State(state): State<Content>,
+    principal: Principal,
+) -> Result<Json<Value>, ApiError> {
+    let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
+    let seen = citations::last_seen(&mut tx).await?;
+    let ours = content::our_domains(&mut tx).await?;
+    tx.commit().await?;
+    Ok(Json(json!({ "places": content::places(&seen, &ours) })))
 }
 
 /// De quelle question on veut le brief.

@@ -93,6 +93,7 @@ use agentos_store::db::{StoreError, TenantTx};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use url::Url;
 use uuid::Uuid;
 
@@ -630,6 +631,117 @@ pub fn brief(question: &str, citation: &Citation) -> Brief {
 }
 
 // ---------------------------------------------------------------------------
+// Où la question vit déjà
+// ---------------------------------------------------------------------------
+
+/// Ce qu'une dernière mesure dit d'une question, réduit à ce que [`places`] lit.
+///
+/// Pas un [`Citation`] : ni l'extrait, ni le moteur, ni l'heure ne servent ici,
+/// et les tirer pour cent questions serait deux cents kilo-octets d'extraits
+/// relus pour compter des hôtes.
+#[derive(Debug, Clone)]
+pub struct Seen {
+    pub question: String,
+    /// Étions-nous dans ces résultats-là.
+    pub cited: bool,
+    /// Les hôtes rendus par le moteur, dans son ordre.
+    pub competitors: Vec<String>,
+}
+
+/// Un hôte qui revient dans les résultats de nos questions.
+///
+/// **Ce n'est pas une cible de lien, et le mot est choisi.** Un `Place` dit
+/// *où la question vit déjà* : un forum, un comparatif, un annuaire, ou un
+/// concurrent. Ce qu'on en fait est une décision humaine, et `docs/CONTENU.md`
+/// § 9 dit lesquelles de ces décisions sont honnêtes.
+#[derive(Debug, Clone, Serialize)]
+pub struct Place {
+    pub host: String,
+    /// Sur combien de nos questions cet hôte sort dans les résultats.
+    pub questions: usize,
+    /// Le meilleur rang qu'il y tienne, toutes questions confondues. À partir
+    /// de 1, comme [`Citation::rank`].
+    pub best_rank: i32,
+    /// Celles de ces questions où **nous ne sommes nulle part**. C'est la seule
+    /// liste actionnable de la structure : un hôte qui répond à cinq de nos
+    /// questions sans nous est un endroit où la réponse existe et où la nôtre
+    /// n'existe pas. Vide quand on est déjà cité partout où il l'est.
+    pub without_us: Vec<String>,
+}
+
+/// Ce qu'une lecture rend au plus. Une page de résultats porte une dizaine
+/// d'hôtes ; cent questions en portent donc jusqu'à mille, dont la queue est
+/// faite d'hôtes vus une fois. Le tri met les récurrents devant, et la coupe
+/// garde la réponse lisible par un humain — qui est le seul à pouvoir en faire
+/// quelque chose.
+const PLACES_CAP: usize = 50;
+
+/// **Où la question vit déjà**, à partir des mesures qu'on a déjà.
+///
+/// Pure, sans réseau et sans source nouvelle : tout ce qu'elle lit a été écrit
+/// par [`read_results`] à partir de la seule page de résultats que ce dépôt a le
+/// droit de lire. Un hôte de plus dans cette liste ne coûte donc rien qu'une
+/// mesure n'ait déjà payé.
+///
+/// # Ce qu'elle dit, et surtout ce qu'elle ne dit pas
+///
+/// Elle dit *qui sort quand on pose nos questions*. Elle ne dit **pas** qui
+/// nous cite, ni qui cite un concurrent : un lien entrant ne se lit pas dans
+/// une page de résultats, et rien de gratuit ne le rend. `docs/CONTENU.md` § 9
+/// nomme les fournisseurs qui le vendent et dit pourquoi aucun n'est appelé.
+///
+/// Nos propres sites sont retirés — par [`covers`], la règle de la Gate, pour
+/// que « à nous » veuille dire la même chose ici qu'à la mesure. Un hôte vide
+/// (un résultat dont la ligne d'hôte n'a pas été reconnue, voir
+/// [`read_results`]) est sauté : il tient une place dans un rang, il n'est pas
+/// un endroit.
+#[must_use]
+pub fn places(seen: &[Seen], ours: &[String]) -> Vec<Place> {
+    let mut by_host: BTreeMap<String, Place> = BTreeMap::new();
+
+    for row in seen {
+        // Un même hôte peut sortir deux fois sur une question ; il ne la compte
+        // qu'une, au meilleur de ses deux rangs.
+        let mut counted: BTreeSet<&str> = BTreeSet::new();
+        for (index, host) in row.competitors.iter().enumerate() {
+            if host.is_empty() || ours.iter().any(|mine| covers(host, mine)) {
+                continue;
+            }
+            let rank = i32::try_from(index).unwrap_or(i32::MAX).saturating_add(1);
+            let place = by_host.entry(host.clone()).or_insert_with(|| Place {
+                host: host.clone(),
+                questions: 0,
+                best_rank: rank,
+                without_us: Vec::new(),
+            });
+            place.best_rank = place.best_rank.min(rank);
+            if counted.insert(host.as_str()) {
+                place.questions += 1;
+                if !row.cited {
+                    place.without_us.push(row.question.clone());
+                }
+            }
+        }
+    }
+
+    let mut places: Vec<Place> = by_host.into_values().collect();
+    // Le plus utile d'abord : là où on manque le plus souvent, puis là où
+    // l'hôte revient le plus, puis là où il est le mieux placé. Le nom tranche
+    // les égalités, pour que deux lectures des mêmes mesures rendent deux fois
+    // la même liste.
+    places.sort_by(|a, b| {
+        b.without_us
+            .len()
+            .cmp(&a.without_us.len())
+            .then(b.questions.cmp(&a.questions))
+            .then(a.best_rank.cmp(&b.best_rank))
+            .then(a.host.cmp(&b.host))
+    });
+    places.truncate(PLACES_CAP);
+    places
+}
+
+// ---------------------------------------------------------------------------
 // Les questions
 // ---------------------------------------------------------------------------
 
@@ -730,7 +842,7 @@ pub mod questions {
 
 /// La série dans le temps. En ajout seul, comme la table.
 pub mod citations {
-    use super::{Citation, DateTime, Serialize, StoreError, TenantTx, Utc, Uuid};
+    use super::{Citation, DateTime, Seen, Serialize, StoreError, TenantTx, Utc, Uuid};
 
     /// Une ligne de `content_citations`, telle qu'on la relit.
     #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -830,6 +942,38 @@ pub mod citations {
         .fetch_optional(&mut ***tx)
         .await?;
         Ok(row)
+    }
+
+    /// **La dernière mesure de chaque question**, réduite à ce que
+    /// [`super::places`] lit.
+    ///
+    /// Un `DISTINCT ON` et pas une boucle de [`latest`] : la question posée est
+    /// « qu'est-ce qui revient d'une question à l'autre », donc un aller-retour
+    /// par question serait N requêtes pour une réponse qui n'existe qu'en les
+    /// réunissant. Les colonnes lourdes — `excerpt` surtout — ne sont pas
+    /// tirées ; le brief les lit, pas les endroits.
+    ///
+    /// Une question jamais mesurée n'a pas de ligne et n'apparaît pas. C'est le
+    /// même sens que `content_briefs_get` : sans mesure, il n'y a rien à dire.
+    pub async fn last_seen(tx: &mut TenantTx<'_>) -> Result<Vec<Seen>, StoreError> {
+        let rows: Vec<(String, bool, serde_json::Value)> = sqlx::query_as(
+            "SELECT DISTINCT ON (c.question_id) q.question, c.cited, c.competitors \
+               FROM content_citations c \
+               JOIN content_questions q ON q.id = c.question_id \
+              ORDER BY c.question_id, c.checked_at DESC",
+        )
+        .fetch_all(&mut ***tx)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(question, cited, competitors)| Seen {
+                question,
+                cited,
+                // Même règle qu'au-dessus : un `jsonb` qui ne serait pas le
+                // tableau qu'on a écrit rend une liste vide, pas une panne.
+                competitors: serde_json::from_value(competitors).unwrap_or_default(),
+            })
+            .collect())
     }
 }
 
@@ -1873,6 +2017,59 @@ mod tests {
         // Absents, on nomme les trois premiers ; premiers, personne.
         assert_eq!(brief("q", &with_rank(None)).outrank.len(), 3);
         assert!(brief("q", &with_rank(Some(1))).outrank.is_empty());
+    }
+
+    /// Les endroits : ce qui revient d'une question à l'autre, ce qui est à
+    /// nous et n'est donc pas un endroit, et l'ordre qui met devant celui où
+    /// l'on manque le plus.
+    #[test]
+    fn les_endroits_comptent_les_questions_et_retirent_les_notres() {
+        let seen = |question: &str, cited: bool, hosts: &[&str]| Seen {
+            question: question.to_owned(),
+            cited,
+            competitors: hosts.iter().map(|host| (*host).to_owned()).collect(),
+        };
+        let rows = vec![
+            // Absents : le forum et le comparatif comptent contre nous.
+            seen("q1", false, &["forum.example", "", "revue.example"]),
+            // Absents encore, et le forum revient — cette fois au rang 1.
+            seen("q2", false, &["forum.example", "revue.example"]),
+            // Cités : le forum est là, mais nous aussi. Il compte une question
+            // de plus, pas un manque de plus. Et un doublon ne compte qu'une
+            // fois, au meilleur de ses rangs.
+            seen(
+                "q3",
+                true,
+                &["blog.nous.example", "revue.example", "revue.example"],
+            ),
+        ];
+        let places = places(&rows, &["nous.example".to_owned()]);
+
+        // Nos propres sites, sous-domaine compris, ne sont pas des endroits ;
+        // un hôte vide non plus.
+        assert!(
+            places
+                .iter()
+                .all(|place| place.host != "blog.nous.example" && !place.host.is_empty())
+        );
+
+        // `forum` manque deux fois, `revue` aussi — égalité ; `revue` sort
+        // devant parce qu'il revient sur trois questions contre deux.
+        let names: Vec<&str> = places.iter().map(|place| place.host.as_str()).collect();
+        assert_eq!(names, vec!["revue.example", "forum.example"]);
+
+        let revue = &places[0];
+        assert_eq!(revue.questions, 3, "un doublon ne compte pas deux fois");
+        assert_eq!(revue.best_rank, 2);
+        assert_eq!(revue.without_us, vec!["q1".to_owned(), "q2".to_owned()]);
+
+        let forum = &places[1];
+        assert_eq!(forum.questions, 2);
+        assert_eq!(forum.best_rank, 1, "le meilleur rang, pas le dernier vu");
+
+        // Cités partout où l'hôte est : rien à aller chercher.
+        let all_cited = places(&[seen("q", true, &["forum.example"])], &[]);
+        assert!(all_cited[0].without_us.is_empty());
     }
 
     // -- de bout en bout, sur un faux moteur servi en local -------------------
