@@ -58,8 +58,16 @@ arreter() {
   [ -f "$PIDFILE" ] || { dit "aucun serveur lancé par ce script."; return 0; }
   local pid; pid="$(cat "$PIDFILE")"
   # Par le pid, jamais pkill : d'autres agents et d'autres serveurs tournent.
-  if kill -0 "$pid" 2>/dev/null; then kill "$pid"; dit "serveur $pid arrêté."
-  else dit "le pid $pid ne tourne plus."; fi
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid"
+    # Attendre qu'il rende ses connexions : un `dropdb` lancé pendant que le
+    # serveur tient encore seize connexions échoue, et `--effacer` laisserait
+    # la base derrière lui en disant le contraire.
+    for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    dit "serveur $pid arrêté."
+  else
+    dit "le pid $pid ne tourne plus."
+  fi
   rm -f "$PIDFILE"
 }
 
@@ -67,8 +75,11 @@ case "$ACTION" in
   arreter) arreter; exit 0 ;;
   effacer)
     arreter
-    dropdb --if-exists -h "$PGHOST" -p "$PGPORT" "$BASE_NOM" && dit "base $BASE_NOM supprimée."
-    rm -rf "$ETAT" && dit "état $ETAT effacé."
+    dropdb --if-exists -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" "$BASE_NOM" \
+      || refuse "la base $BASE_NOM n'a pas pu être supprimée — quelque chose y est encore connecté. Rien d'autre n'a été effacé."
+    dit "base $BASE_NOM supprimée."
+    rm -rf "$ETAT"
+    dit "état $ETAT effacé (clés comprises : la prochaine ligne « claude mcp add » sera une autre)."
     exit 0 ;;
 esac
 
