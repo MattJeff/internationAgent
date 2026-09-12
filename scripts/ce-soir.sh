@@ -88,12 +88,6 @@ command -v claude >/dev/null \
 
 mkdir -p "$ETAT"; chmod 700 "$ETAT"
 
-dit "je vérifie que ton claude est connecté (un tour minuscule, sur ta session)…"
-if ! printf 'dis ok' | claude -p --max-turns 1 --setting-sources '' --strict-mcp-config >/dev/null 2>"$ETAT/sonde.log" ; then
-  refuse "ton « claude » n'a pas répondu. Lance-le une fois à la main et connecte-toi ; c'est ta session à toi, ce script n'y touche jamais. Détail : $ETAT/sonde.log"
-fi
-dit "claude répond."
-
 if [ "$REEL" = 1 ]; then
   [ -n "${EMAIL_API_KEY:-}" ] \
     || refuse "--reel sans EMAIL_API_KEY. Exporte la clé Resend d'abord ; sans elle l'adaptateur reste faux et --reel ne veut rien dire."
@@ -123,6 +117,15 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     refuse "quelque chose écoute déjà sur le port $PORT et ce n'est pas moi. Choisis-en un autre : PORT=8788 scripts/ce-soir.sh"
   fi
 fi
+
+# En dernier parmi les refus, parce que c'est le seul qui coûte quelque chose :
+# un tour minuscule sur la session du fondateur. Tout ce qui pouvait refuser
+# gratuitement a déjà refusé.
+dit "je vérifie que ton claude est connecté (un tour minuscule, sur ta session)…"
+if ! printf 'dis ok' | claude -p --max-turns 1 --setting-sources '' --strict-mcp-config >/dev/null 2>"$ETAT/sonde.log" ; then
+  refuse "ton « claude » n'a pas répondu. Lance-le une fois à la main et connecte-toi ; c'est ta session à toi, ce script n'y touche jamais. Détail : $ETAT/sonde.log"
+fi
+dit "claude répond."
 
 # ---------------------------------------------------------------------------
 # L'état : créé une fois, retrouvé ensuite. C'est ce qui rend le script idempotent
