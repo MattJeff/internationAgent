@@ -28,7 +28,13 @@ PORT="${PORT:-8787}"
 PGPORT="${PGPORT:-5432}"
 PGHOST="${PGHOST:-localhost}"
 BASE_NOM="${DB_NAME:-agentos_ce_soir}"
-BASE_URL="postgres://${PGHOST}:${PGPORT}"
+# L'utilisateur est NOMMÉ, jamais sous-entendu. Une URL sans utilisateur laisse
+# sqlx deviner, et quand la devinette échoue il essaie de se connecter en
+# « anonymous » — l'erreur qu'on lit est alors `role "anonymous" does not exist`,
+# qui ne dit rien de ce qui s'est passé. Mesuré le 2026-09-12 : le serveur
+# mourait au démarrage sur une base que psql ouvrait sans broncher.
+PGUSER="${PGUSER:-$(id -un)}"
+BASE_URL="postgres://${PGUSER}@${PGHOST}:${PGPORT}"
 
 REEL=0
 ACTION=monter
@@ -75,7 +81,7 @@ command -v psql  >/dev/null || refuse "pas de psql sur le PATH : je ne sais pas 
 command -v curl  >/dev/null || refuse "pas de curl sur le PATH."
 
 psql "$BASE_URL/postgres" -Atc 'select 1' >/dev/null 2>&1 \
-  || refuse "Postgres ne répond pas sur ${PGHOST}:${PGPORT}. (PGPORT=5442 est l'ancien port docker, mort ; le Homebrew 17 est sur 5432.)"
+  || refuse "Postgres ne répond pas à « $PGUSER » sur ${PGHOST}:${PGPORT}. (PGPORT=5442 est l'ancien port docker, mort ; le Homebrew 17 est sur 5432. PGUSER= pour un autre rôle.)"
 
 command -v claude >/dev/null \
   || refuse "pas de binaire « claude » sur le PATH. C'est LUI le modèle de ce montage : sans lui il n'y a pas de tour, donc pas d'e-mail. Aucune clé Anthropic ne remplace ça ici — c'est le chemin cli, pas le chemin api_key."
