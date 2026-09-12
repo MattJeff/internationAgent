@@ -3062,7 +3062,14 @@ fn parse<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, serde_json::E
 /// one of them to accept a host the other refuses. A URL with no host —
 /// `file:`, `data:`, an IP literal — is not a domain the gate can rule on, and
 /// `Domain::parse` is what says so rather than a second opinion written here.
-fn page_at(raw: &str) -> Result<(Url, Domain), String> {
+///
+/// `pub` depuis le 2026-09-12 : `apps/server/src/routes/prospects.rs` en a
+/// besoin pour `POST /v1/prospects/discover`, qui pointe le **même** effet que
+/// `find_prospects` sur la même URL. Trois appelants, toujours une seule
+/// fonction, et c'est exactement l'argument du paragraphe au-dessus — une
+/// deuxième lecture de l'URL côté HTTP serait une deuxième chance d'accepter un
+/// hôte que le tour refuse.
+pub fn page_at(raw: &str) -> Result<(Url, Domain), String> {
     let url = Url::parse(raw).map_err(|e| format!("url: {raw:?} is not a URL: {e}"))?;
     let domain = url
         .host_str()

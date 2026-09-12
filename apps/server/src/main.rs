@@ -827,7 +827,17 @@ fn app(
                 // donc elle a besoin de la flotte de ce locataire-là.
                 fleets: fleets.clone(),
             }))
-            .merge(routes::prospects::router(db.clone()))
+            // Et juste après, parce que c'est la même table par les deux
+            // bouts : `import` verse la liste du fondateur,
+            // `POST /v1/prospects/discover` va en chercher une. Celle-là a
+            // besoin de la gate et du même `ports` que `content` — lire un
+            // annuaire est un `BrowserRead` sur lequel la Gate statue pour un
+            // siège.
+            .merge(routes::prospects::router(
+                db.clone(),
+                gate.clone(),
+                ports.clone(),
+            ))
             .merge(routes::sequences::router(db.clone()))
             .merge(routes::quotes::router(db.clone()))
             .merge(routes::pnl::router(db.clone()))

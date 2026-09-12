@@ -192,6 +192,60 @@ pub fn tools() -> Vec<ToolDef> {
             raw_body: Some(("text/csv", "csv")),
             risk: Risk::Write,
         },
+        ToolDef {
+            name: "prospects_discover",
+            title: "Lire un annuaire et en tirer des prospects",
+            description: "Lit une page qui liste d'autres sociétés — l'annuaire des membres d'une \
+                 fédération, la liste d'adhérents d'une chambre — et range les adresses qui y sont \
+                 imprimées dans les comptes et contacts de cette entreprise. C'est l'autre porte \
+                 de `prospects_import` : celle-là verse une liste qu'on a déjà, celle-ci va en \
+                 chercher une, et les deux écrivent par le même chemin, avec la même clé d'unicité \
+                 et la même vérification de la liste de suppression. **Nomme un siège** \
+                 (`employee_id`, rendu par `employees_list`) parce que lire une page publique est \
+                 une action sur laquelle la politique statue — un siège sans le canal `web` est \
+                 refusé en 403, avec la raison, et le pack de vente livre le plafond journalier de \
+                 nouveaux contacts à zéro, ce qui fait lire la page et n'écrire personne jusqu'à \
+                 ce qu'un opérateur qui répond de la base légale le relève. Trois choses ne se \
+                 devinent pas : **rien de ce que la page écrit n'est stocké** — ni le nom des \
+                 sociétés, ni les descriptions, seulement les adresses, et le nom de compte est le \
+                 domaine de l'adresse ; **le pays est `ZZ`**, parce qu'une page ne dit pas où une \
+                 société est immatriculée et que ceci ne devine pas, donc une liste découverte ne \
+                 se segmente pas par pays ; et **il n'y a pas de mode à blanc**, parce qu'annuler \
+                 la transaction n'annulerait pas la lecture de la page. Le segment doit venir de \
+                 `prospects_segments_list`. Le rapport ne rend aucun identifiant : les contacts \
+                 créés se relisent sur `contacts_list`.",
+            method: Method::Post,
+            path: "/v1/prospects/discover",
+            schema: schema(
+                json!({
+                    "employee_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Le siège à qui la lecture est attribuée, tel que `employees_list` le rend. Sa politique doit porter le canal `web`."
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "L'adresse absolue de la page d'annuaire, `https://` compris. La page où les adresses sont imprimées, pas la page d'accueil."
+                    },
+                    "segment": {
+                        "type": "string",
+                        // La liste fermée, prise à `crate::prospects` plutôt que
+                        // recopiée : une neuvième orthographe dans un schéma
+                        // serait une valeur que la CHECK `accounts_segment`
+                        // refuse après qu'une page a été chargée.
+                        "enum": crate::prospects::SEGMENTS,
+                        "description": "Ce que cette page liste — un jugement sur l'annuaire, pas quelque chose qu'on y lit. Un segment rendu par `prospects_segments_list`."
+                    }
+                }),
+                &["employee_id", "url", "segment"],
+            ),
+            query: &[],
+            raw_body: None,
+            // Sort sur le web au nom de la société, exactement comme
+            // `content_questions_measure`, et écrit des lignes qui entreront
+            // dans une file d'approche. Ni l'un ni l'autre ne se reprend.
+            risk: Risk::Destructive,
+        },
         // -------------------------------------------------------------------
         // outreach — l'activité commerciale, pas l'administration
         // -------------------------------------------------------------------
