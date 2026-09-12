@@ -2043,27 +2043,27 @@ mod tests {
                 &["blog.nous.example", "revue.example", "revue.example"],
             ),
         ];
-        let places = places(&rows, &["nous.example".to_owned()]);
+        let found = places(&rows, &["nous.example".to_owned()]);
 
         // Nos propres sites, sous-domaine compris, ne sont pas des endroits ;
         // un hôte vide non plus.
         assert!(
-            places
+            found
                 .iter()
                 .all(|place| place.host != "blog.nous.example" && !place.host.is_empty())
         );
 
         // `forum` manque deux fois, `revue` aussi — égalité ; `revue` sort
         // devant parce qu'il revient sur trois questions contre deux.
-        let names: Vec<&str> = places.iter().map(|place| place.host.as_str()).collect();
+        let names: Vec<&str> = found.iter().map(|place| place.host.as_str()).collect();
         assert_eq!(names, vec!["revue.example", "forum.example"]);
 
-        let revue = &places[0];
+        let revue = &found[0];
         assert_eq!(revue.questions, 3, "un doublon ne compte pas deux fois");
         assert_eq!(revue.best_rank, 2);
         assert_eq!(revue.without_us, vec!["q1".to_owned(), "q2".to_owned()]);
 
-        let forum = &places[1];
+        let forum = &found[1];
         assert_eq!(forum.questions, 2);
         assert_eq!(forum.best_rank, 1, "le meilleur rang, pas le dernier vu");
 
@@ -2285,6 +2285,30 @@ mod tests {
             Some(3),
             "la première mesure a gardé son rang"
         );
+
+        // Et les endroits, lus par la même base : la DERNIÈRE mesure de chaque
+        // question, son `jsonb` décodé, notre site retiré. La seconde nous dit
+        // absents, donc les deux hôtes qui restent nous manquent.
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        let seen = citations::last_seen(&mut tx).await.expect("last_seen");
+        tx.commit().await.expect("commit");
+        assert_eq!(
+            seen.len(),
+            1,
+            "une question, sa dernière mesure et rien de plus"
+        );
+        assert!(!seen[0].cited, "c'est la seconde mesure qui compte");
+        let found = places(&seen, &ours);
+        assert_eq!(
+            found
+                .iter()
+                .map(|place| place.host.as_str())
+                .collect::<Vec<_>>(),
+            ["travel-buddy.ai", "visadb.io"],
+            "notre site n'est pas un endroit où aller"
+        );
+        assert_eq!(found[0].best_rank, 1);
+        assert_eq!(found[0].without_us, ["visa requirements api"]);
 
         // Le désarmement de l'ajout seul : `app_role` n'a pas le droit de
         // réécrire une mesure. Si le grant de `0100` glissait, ce `UPDATE`
