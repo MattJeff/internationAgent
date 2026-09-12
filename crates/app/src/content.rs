@@ -380,6 +380,13 @@ struct Hit {
 /// résultats déjà lus plus un. Ce qui reste possible est un résumé commençant
 /// exactement par le rang attendu ; on n'en a pas vu, et le jour où ça arrive
 /// la mesure de cette question-là est basse d'un cran, pas fausse ailleurs.
+///
+/// **Un résultat dont la ligne d'hôte n'est pas reconnue garde sa place et perd
+/// son nom** : le rang suivant le referme, et il entre dans `competitors` avec
+/// un hôte vide. C'est volontaire, et c'est le seul sens conservateur — le
+/// laisser tomber remonterait notre rang d'un cran pour une page qui, elle, est
+/// bien devant nous. Le dernier résultat, lui, est abandonné : rien ne le
+/// referme, donc on ne sait pas s'il existe.
 fn read_results(
     text: &str,
     ours: &[String],
@@ -448,16 +455,25 @@ fn numbered(line: &str, expected: usize) -> Option<&str> {
 /// `"visa.orizn.app/docs"` → `Some("visa.orizn.app")`, `"REST API for visas"` →
 /// `None`.
 ///
-/// La règle : aucun blanc, au moins deux étiquettes, un TLD alphabétique d'au
-/// moins deux lettres. C'est, mot pour mot, la forme que
+/// La règle : aucun blanc **dans l'hôte**, au moins deux étiquettes, un TLD
+/// alphabétique d'au moins deux lettres. C'est, mot pour mot, la forme que
 /// `tenant_domains_domain_shape` impose en base — donc ce qui est reconnu ici
 /// est ce qui peut être à nous.
+///
+/// **Le blanc se cherche avant la première barre, pas sur la ligne entière**, et
+/// la différence a été mesurée le 2026-09-12 sur « how do I check visa
+/// requirements by API » : `lite.duckduckgo.com` y affichait
+/// `zylalabs.com/api-marketplace/top-search/visa requirements` — un chemin qui
+/// porte l'espace de la requête. La ligne entière portait donc un blanc, l'hôte
+/// n'était pas reconnu, le résultat partait sans hôte (voir [`read_results`]) et
+/// **notre rang descendait d'un cran** : 4 au lieu de 3, avec une chaîne vide en
+/// troisième concurrent et dans l'`outrank` du brief. Une ligne de prose, elle,
+/// est toujours refusée : son premier segment porte le blanc de la phrase.
 fn display_host(line: &str) -> Option<String> {
-    let line = line.trim();
-    if line.is_empty() || line.chars().any(char::is_whitespace) {
+    let lowered = line.trim().split('/').next()?.to_ascii_lowercase();
+    if lowered.is_empty() || lowered.chars().any(char::is_whitespace) {
         return None;
     }
-    let lowered = line.split('/').next()?.to_ascii_lowercase();
     let host = lowered.strip_prefix("www.").unwrap_or(lowered.as_str());
     let labels: Vec<&str> = host.split('.').collect();
     if labels.len() < 2 {
@@ -1574,6 +1590,55 @@ mod tests {
         assert_eq!(display_host("visa"), None);
         assert_eq!(display_host("e.g"), None);
         assert_eq!(display_host("..."), None);
+        // **Un blanc dans le chemin n'est pas un blanc dans l'hôte.** Relevé
+        // sur le vrai moteur le 2026-09-12 : la requête affichée entre dans
+        // l'adresse, espace compris.
+        assert_eq!(
+            display_host("zylalabs.com/api-marketplace/top-search/visa requirements"),
+            Some("zylalabs.com".into())
+        );
+        // Et une phrase qui porte une barre reste une phrase : le blanc est
+        // avant elle.
+        assert_eq!(display_host("Check visa rules and/or entry rules"), None);
+    }
+
+    /// **Un hôte non reconnu coûtait un rang.**
+    ///
+    /// La page mesurée le 2026-09-12 sur « how do I check visa requirements by
+    /// API » affichait le troisième résultat comme
+    /// `zylalabs.com/api-marketplace/top-search/visa requirements`. La ligne
+    /// portait un blanc, l'hôte n'était pas lu, le résultat se refermait sans
+    /// nom — et nous sortions 4ᵉ avec une chaîne vide devant nous, qui
+    /// remontait telle quelle dans l'`outrank` du brief.
+    #[test]
+    fn un_hote_dont_le_chemin_porte_un_blanc_reste_un_hote() {
+        let text = "1. Global Visa Check API | Zyla API Hub\n\
+                    Real-time visa requirements for tourists.\n\
+                    zylalabs.com/api-marketplace/global-visa-check\n\
+                    2. Best Visa requirements APIs | Zyla API Hub\n\
+                    The Global Visa Check is an API.\n\
+                    zylalabs.com/api-marketplace/top-search/visa requirements\n\
+                    3. Visa Requirements API | Orizn\n\
+                    47,362 pairs across 199 passports.\n\
+                    visa.orizn.app\n";
+        let scanned = read_results(
+            text,
+            &["orizn.app".to_owned()],
+            Engine::DuckDuckGoLite,
+            Utc::now(),
+        );
+        assert_eq!(scanned.rank, Some(3), "{:?}", scanned.competitors);
+        assert!(
+            !scanned.competitors.iter().any(String::is_empty),
+            "un concurrent sans nom est un hôte qu'on n'a pas su lire : {:?}",
+            scanned.competitors
+        );
+        // Et le résumé du deuxième n'a pas avalé sa propre ligne d'adresse.
+        assert!(
+            !scanned.excerpt.contains("top-search"),
+            "l'adresse est restée dans le résumé : {:?}",
+            scanned.excerpt
+        );
     }
 
     /// Le rang doit suivre, sinon un résumé numéroté ouvre un faux résultat.
@@ -2094,6 +2159,34 @@ mod tests {
             corrected.published_at,
             Some(first),
             "une typo n'est pas une publication"
+        );
+
+        // **Et l'omission dépublie.** C'est la convention de la maison — un
+        // `set` efface ce qu'on ne lui redonne pas — mais sur cette
+        // colonne-là elle coûte la date à laquelle l'article est entré en
+        // ligne, c'est-à-dire le seul instant auquel la série de
+        // `content_citations` peut être comparée. Testé parce que la
+        // description de `content_drafts_amend` promettait l'inverse jusqu'au
+        // 2026-09-12 : « la date de publication est posée la première fois et
+        // ne bouge plus » se lisait comme une garantie, et elle ne vaut
+        // qu'avec l'`url`.
+        let undone = drafts::update(
+            &mut tx,
+            draft.id,
+            &drafts::Revision {
+                title: "Titre corrigé",
+                body: "Corps corrigé",
+                url: None,
+            },
+        )
+        .await
+        .expect("update")
+        .expect("le brouillon existe");
+        assert_ne!(undone.state, "published", "l'omission a laissé un publié");
+        assert!(undone.url.is_none());
+        assert!(
+            undone.published_at.is_none(),
+            "la date a survécu à l'effacement de l'adresse qu'elle date"
         );
         tx.commit().await.expect("commit");
 

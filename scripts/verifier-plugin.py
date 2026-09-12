@@ -52,12 +52,30 @@ noise = {"dry_run", "user_config", "last_failure_detail", "outstanding_minor", "
          "policy_widens", "reporting_cycle", "draft_is_not_resumable", "turns_taken",
          "contacts_held_back", "acts_on_its_own", "set_by", "reports_to", "team_id",
          "employee_id", "action_kind", "deny_reason", "role_name", "max_turns_per_day",
-         "interval_secs", "section_id", "plugin_root", "cle_api", "base_url", "next_since"}
+         "interval_secs", "section_id", "plugin_root", "cle_api", "base_url", "next_since",
+         # Champs de reponse et valeurs d'enum que `point-du-jour` cite par leur
+         # nom, parce qu'un geste qui dit « lis le verdict » sans dire lequel ne
+         # se relit pas. Ils ont la meme forme qu'un nom d'outil et n'en sont pas.
+         "last_success_at", "last_failure_employee_slug", "expires_at",
+         "to_next_rate", "no_target", "on_track", "raised_after_denials"}
 missing = sorted(t for t in cited - noise if t not in registry)
 if missing:
     bad.append(f"outils cites et absents du registre : {missing}")
 else:
     print(f"OK {len(cited - noise)} outils cites, tous presents dans le registre")
+
+# 2b. et le compte que la doc en annonce. Meme regle que
+# `every_written_count_is_the_registry_s_own` cote Rust : un nombre tape dans de
+# la prose est vrai le jour ou il est ecrit. Celui-ci disait 55 pendant que les
+# gestes en citaient 60.
+attendu = f"chacun des {len(cited - noise)} outils nommes par les quatre gestes"
+plugin_md = open("docs/PLUGIN.md", encoding="utf-8").read()
+plugin_md_sans_accents = (plugin_md.replace("\u00e9", "e").replace("\u00e8", "e")
+                          .replace("\u00ea", "e").replace("\u00e0", "a"))
+if attendu.replace("\n", " ") not in " ".join(plugin_md_sans_accents.split()):
+    bad.append(f"docs/PLUGIN.md n'annonce plus le bon compte : {attendu!r}")
+else:
+    print(f"OK docs/PLUGIN.md annonce {len(cited - noise)} outils cites")
 
 # 3. aucun secret
 for p in sorted(glob.glob("plugin/**/*", recursive=True) + [".claude-plugin/marketplace.json", "docs/PLUGIN.md"]):

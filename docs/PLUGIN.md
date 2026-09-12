@@ -69,13 +69,26 @@ phrase de garde.
 | **`repondre-aux-demandes`** | vider la file humaine | Ne jamais reformuler l'action d'une approbation ; ne jamais approuver sa propre demande. |
 | **`embaucher`** | un siège, sa place, sa charte, ses limites | `policy_role_set` est un document entier : un champ manquant est un retrait. |
 
-**`point-du-jour`** — `company_health_get` **d'abord et toujours** (un `stopped`
-arrête la lecture et renvoie vers `model_get` ; une société au repos rend
-`working`, pas `degraded`), puis `approvals_list` + `capability_requests_list` +
-`work_items_list` pour ce qui attend une décision — les lignes de plus de 24 h
-comptées à part, parce que rien ne sort de cette file tout seul —, puis
-`outreach_summary_get` et `outreach_health_get` pour la prospection, puis `pnl_get` et
-`invoices_list` pour l'argent. Finit par trois phrases et une question.
+**`point-du-jour`** — **six appels, parcourus pour la première fois le
+2026-09-12** sur une société neuve, une qui tourne et une à l'arrêt. Il en
+faisait huit et ne lisait jamais `growth_get`, la seule réponse du produit qui
+porte un verdict ; `outreach_summary_get`, `pnl_get` et `invoices_list` en sont
+sortis parce que `growth_get` les rend sur une seule fenêtre, et sont devenus
+des suites nommées. L'ordre est : `company_health_get` **d'abord et toujours**
+(un `stopped` saute la prospection et l'argent — ils datent d'avant l'arrêt —
+et renvoie vers `model_get` ; une société au repos rend `working`, pas
+`degraded`), puis `growth_get` pour l'entonnoir contre sa cible, puis
+`outreach_health_get` pour ce qui est **réellement parti**, puis
+`approvals_list` + `capability_requests_list` + `work_items_list` pour ce qui
+attend une décision — les lignes périmées comptées à part, parce que rien ne
+sort de cette file tout seul. Finit par trois phrases et une question, choisie
+dans un ordre de priorité écrit. Trois lectures que le geste impose et que
+personne ne faisait : `last_success_at`, qui est le seul champ distinguant une
+société neuve (`null`) d'une société arrêtée (une date) puisque les deux rendent
+`stopped` ; `last_failure_employee_slug`, parce qu'un verdict qui ne nomme pas
+son siège est une enquête ; et l'écart entre `contacted` et `sent`, qui est du
+travail réservé et jamais parti et que ni l'un ni l'autre de ces deux nombres ne
+dit seul.
 
 **`lancer-une-campagne`** — le domaine en premier parce que c'est la seule étape
 qu'on ne rattrape pas (`domains_list` → `domains_dns_publish` → `domains_verify`), sa
@@ -172,7 +185,7 @@ python3 scripts/verifier-plugin.py
 
 Vérifié par ce script : chaque JSON parse, chaque `SKILL.md` porte un
 frontmatter délimité dont tous les champs sont documentés et dont le `name`
-correspond à son dossier, **chacun des 55 outils nommés par les quatre gestes
+correspond à son dossier, **chacun des 60 outils nommés par les quatre gestes
 existe encore dans `crates/app/src/mcp_tools/`**, aucun fichier ne contient
 `sk-`, `re_`, `whsec_` ni un `Bearer ` suivi d'un jeton, et la `source` du
 marketplace mène à un manifeste dont le nom correspond.
@@ -182,6 +195,20 @@ les 140 lignes du registre sont éditées par d'autres chantiers, et un outil
 renommé rend un geste faux **sans rien casser d'autre**. Le script a été vu
 rougir — renommer `company_health_get` dans `point-du-jour` le fait échouer — parce
 qu'une vérification qui n'a jamais échoué ne prouve rien.
+
+**Vérifié depuis le 2026-09-12, et ça ne l'était pas :** `point-du-jour` a été
+**parcouru**, appel par appel, sur une instance locale et par `POST
+/v1/mcp/server` seul, sur trois sociétés — une neuve où rien n'existe, une qui
+tourne, une à l'arrêt sans modèle. Un geste que personne n'a joué est une
+supposition sur un produit, pas une interface : celui-ci demandait huit appels,
+n'appelait jamais `growth_get`, et rendait le même paragraphe pour une société
+neuve et pour une société morte depuis six jours. La marche a aussi rendu trois
+défauts qui n'étaient pas dans le geste mais dans le produit, corrigés au
+sha de cette branche (`outreach_health_get` annonçait une livraison parfaite sur
+quarante envois dont aucune trace n'était revenue ; `company_health_get` ne
+nommait pas le siège qui venait d'échouer ; `capability_requests_list` rendait
+un seuil sous un nom de date). Les deux autres gestes de lecture n'ont toujours
+été joués par personne.
 
 **Non vérifié, et ça ne peut pas l'être depuis un worktree :** l'installation
 elle-même. Le marketplace n'est atteignable qu'une fois la branche poussée sur

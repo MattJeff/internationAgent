@@ -2,8 +2,8 @@
 //! et vers quoi.
 //!
 //! Trois lignes pour une seule route, et c'est délibéré. `commerce` rend les
-//! sept nombres de l'entonnoir un par un — `outreach_summary` les approches,
-//! `quotes_register` les devis, `invoices_register` les factures, `pnl_summary`
+//! sept nombres de l'entonnoir un par un — `outreach_summary_get` les approches,
+//! `quotes_list` les devis, `invoices_list` les factures, `pnl_get`
 //! ce que ça brûle — et un modèle qui veut répondre « est-ce qu'on y arrive »
 //! doit aujourd'hui appeler quatre outils, aligner quatre fenêtres et faire six
 //! divisions. `growth_get` fait les six divisions sur une seule fenêtre.
@@ -48,8 +48,8 @@ pub fn tools() -> Vec<ToolDef> {
                  passage à la suivante**, puis la recette (facturé, encaissé, dû, et ce qui a \
                  été encaissé sur trente jours glissants), le coût du modèle, la cible posée et \
                  un verdict (`ahead`, `on_track`, `behind`, `no_target`). C'est la seule lecture \
-                 qui dise si l'entreprise *progresse* : `outreach_summary` compte les approches, \
-                 `pnl_summary` ce qu'un siège brûle, `invoices_register` ce qui est dû, aucune \
+                 qui dise si l'entreprise *progresse* : `outreach_summary_get` compte les approches, \
+                 `pnl_get` ce qu'un siège brûle, `invoices_list` ce qui est dû, aucune \
                  ne met les sept bout à bout ni ne calcule les taux. \
                  **`null` n'est jamais zéro** : un taux sans dénominateur n'existe pas, un coût \
                  `null` est un tarif non déclaré (ou un abonnement CLI, qui n'a pas de facture \

@@ -827,7 +827,11 @@ async fn capability_requests(
 
     Ok(Json(json!({
         "requests": requests,
-        "raised_at": capability::RAISED_AT,
+        // Pas `raised_at` : le champ portait un nom de date et un seuil de
+        // comptage. Mesuré le 2026-09-12 en jouant `point-du-jour` sur une
+        // société vide, la réponse était `{"requests": [], "raised_at": 3}`, ce
+        // qui se lit « trois demandes levées » et se rapporte comme tel.
+        "raised_after_denials": capability::RAISED_AT,
     })))
 }
 
@@ -1857,7 +1861,12 @@ mod tests {
         assert_eq!(requests[0]["action_kind"], json!("mcp_call"));
         assert_eq!(requests[0]["deny_reason"], json!("no_rule"));
         assert_eq!(requests[0]["denials"], json!(3));
-        assert_eq!(body["raised_at"], json!(3));
+        assert_eq!(
+            body["raised_after_denials"],
+            json!(3),
+            "le seuil porte un nom de seuil : `raised_at` se lisait comme une date"
+        );
+        assert!(body.get("raised_at").is_none(), "{body}");
 
         // **Nothing a third party named is in the text.** The tool this employee
         // was refused came from an MCP server's `tools/list`; the request says

@@ -117,6 +117,14 @@ accès non humain : il y a un humain devant un terminal. C'est ce que ce module
 rend possible, et c'est la seule forme qui tienne sans avoir à interpréter une
 phrase.
 
+**Et le modèle peut venir du même endroit.** `model_connect {"path":"cli"}`
+dépense la session du `claude` de l'hôte : sur la machine du fondateur, l'hôte
+est le fondateur, et la phrase « nor does it prevent an end user from signing in
+to the unmodified Claude Code binary with their own Claude subscription » citée
+plus haut couvre exactement ça. Le montage complet — une commande, ce qu'elle
+refuse, et pourquoi ce mode n'a rien à faire sur le VPS — est dans
+`docs/CE_SOIR.md` ; le script est `scripts/ce-soir.sh`.
+
 ---
 
 ## 2. L'installer

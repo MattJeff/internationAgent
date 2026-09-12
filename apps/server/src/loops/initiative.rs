@@ -1026,18 +1026,38 @@ async fn assignment_for(
     // taking; a seller's whole vertical is one prospect's flow or one unanswered
     // note, and with neither there is nothing for the model to write about that
     // it did not invent.
+    // **Une promesse de séquence porte déjà son travail**, et ce refus n'est pas
+    // pour elle. `sequence::advance` a réservé ce rendez-vous parce qu'un pas
+    // `email` est dû sur un run précis ; le brief de ce pas est lu plus bas
+    // (`kept.sequence_run_id`) et il dit quoi écrire, à qui. Le chercher une
+    // seconde fois dans le vertical, et refuser le tour quand le vertical ne le
+    // trouve pas, tuait la marche entière de `docs/PLUGIN.md` §
+    // `lancer-une-campagne` sur un siège `sales-development` : le run réveillait
+    // le siège, le tour rendait `no_work`, et vingt-quatre heures plus tard le
+    // run s'arrêtait en `not_sent`. Mesuré le 2026-09-12, de bout en bout.
+    //
+    // Le refus reste entier pour ce qu'il vise : un tour de **cadence**, qui
+    // doit trouver son travail tout seul et ne doit pas payer un appel au modèle
+    // pour découvrir qu'il n'y en a pas.
+    let on_sequence = due
+        .kept
+        .as_ref()
+        .is_some_and(|kept| kept.sequence_run_id.is_some());
     let sales = match &charter {
-        Charter::Sales { objective, .. } => match sales_work_for(db, due, objective, now).await? {
-            Some(work) => Some(work),
-            None => {
-                return Err(Outcome::NoWork(
-                    "nobody is due: no prospect in this segment has a booking flow described for \
-                     it, and nobody who was written to is due a follow-up; import prospects, \
-                     describe a flow, or wait for the follow-up window"
-                        .to_owned(),
-                ));
+        Charter::Sales { objective, .. } if !on_sequence => {
+            match sales_work_for(db, due, objective, now).await? {
+                Some(work) => Some(work),
+                None => {
+                    return Err(Outcome::NoWork(
+                        "nobody is due: no prospect in this segment has a booking flow described \
+                         for it, and nobody who was written to is due a follow-up; import \
+                         prospects, describe a flow, or wait for the follow-up window"
+                            .to_owned(),
+                    ));
+                }
             }
-        },
+        }
+        Charter::Sales { objective, .. } => sales_work_for(db, due, objective, now).await?,
         _ => None,
     };
 
@@ -5405,6 +5425,119 @@ pub(crate) mod tests {
             .expect("taken today");
         tx.rollback().await.expect("rollback");
         assert_eq!(spent, 0, "a turn with no work reserved one anyway");
+
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// **Le même vendeur, sans rien à travailler, mais réveillé par une
+    /// séquence : il prend son tour.**
+    ///
+    /// Le test au-dessus dit qu'un vendeur sans travail ne dépense pas de tour,
+    /// et il a raison — pour une **cadence**, qui doit trouver son travail toute
+    /// seule. Une promesse de séquence n'est pas ça : `sequence::advance` l'a
+    /// réservée parce qu'un pas `email` est dû, le brief de ce pas dit quoi
+    /// écrire et à qui, et le vertical n'a rien à trouver.
+    ///
+    /// Sans la garde, ce tour rendait `no_work`, le run attendait
+    /// `SEND_DEADLINE` puis s'arrêtait en `not_sent`, et **la marche entière de
+    /// `docs/PLUGIN.md` § `lancer-une-campagne` était morte sur un siège
+    /// `sales-development`** — sans qu'aucune réponse d'outil ne le dise.
+    /// Mesuré de bout en bout le 2026-09-12 ; ce test est ce qui reste de la
+    /// mesure.
+    #[tokio::test]
+    async fn a_seller_woken_by_a_sequence_takes_its_turn_even_with_no_prospect_described() {
+        use agentos_app::sequence::{self, Step};
+
+        let Some(db) = db().await else { return };
+        let _guard = LOOP_LOCK.lock().await;
+        clear_schedules(&db).await;
+        let tenant = seed_tenant(&db).await;
+        let employee = seed_due(&db, tenant, "sequenced-seller", Some(selling())).await;
+        sales_limits(&db, tenant, 5).await;
+
+        // Un compte et un contact, et **aucun flux décrit** : exactement l'état
+        // que le test au-dessus appelle `no_work`.
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let account = Uuid::now_v7();
+        agentos_store::revenue::insert_account(
+            &mut tx,
+            account,
+            &agentos_store::revenue::NewAccount {
+                legal_name: "Undescribed Airline",
+                domain: "undescribed.example",
+                segment: "airline",
+                country: "FR",
+                location: None,
+                website: None,
+                employee_id: Some(employee),
+            },
+        )
+        .await
+        .expect("insert account");
+        let contact = Uuid::now_v7();
+        agentos_store::revenue::insert_contact(
+            &mut tx,
+            contact,
+            &agentos_store::revenue::NewContact {
+                account_id: account,
+                full_name: "Somebody",
+                email: Some("somebody@undescribed.example"),
+                phone: None,
+                role: None,
+                language: None,
+                is_primary: true,
+                lawful_basis: "legitimate_interest",
+                next_follow_up_at: None,
+            },
+        )
+        .await
+        .expect("insert contact");
+
+        // La séquence, l'enrôlement, et le tick qui réserve le rendez-vous. Pas
+        // un `book_on` à la main : ce qui est sous test est la couture entre ce
+        // que la séquence réserve et ce que la boucle en fait.
+        let now = Utc::now();
+        let seq = sequence::define(
+            &mut tx,
+            "une-marche",
+            &[Step::Email {
+                brief: "dire bonjour".to_owned(),
+            }],
+        )
+        .await
+        .expect("define");
+        let run = sequence::enroll(&mut tx, seq, contact, employee, now)
+            .await
+            .expect("enroll");
+        sequence::advance(&mut tx, run, now)
+            .await
+            .expect("advance books the appointment");
+        tx.commit().await.expect("commit");
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let counter = started.clone();
+        let take = move |_: Assignment| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        };
+        let cancel = CancellationToken::new();
+
+        assert!(
+            tick(&db, &take, &cancel, now + chrono::TimeDelta::seconds(1))
+                .await
+                .expect("tick")
+                >= 1,
+            "le rendez-vous de la séquence était dû"
+        );
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "un siège réveillé par une séquence n'a pas pris son tour : le refus \
+             `no_work` du vertical a mangé une promesse qui portait déjà son travail"
+        );
 
         drop_tenant(&db, tenant).await;
     }

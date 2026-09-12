@@ -434,7 +434,7 @@ async fn list_repos(
 #[derive(Debug, Deserialize)]
 struct NewRepo {
     /// Le handle sous lequel ce locataire a branché son GitHub — celui
-    /// qu'`integrations_list` rend, pas le nom du connecteur.
+    /// qu'`integrations_servers_list` rend, pas le nom du connecteur.
     server: String,
     /// `propriétaire/nom`.
     repo: String,
@@ -481,7 +481,7 @@ async fn set_repo(
         )
         .with_detail(
             "branchez GitHub d'abord avec `integrations_connect`, puis reprenez le handle \
-             que `integrations_list` rend.",
+             que `integrations_servers_list` rend.",
         ));
     };
     Ok(Json(json!({ "repo": row })))
@@ -624,6 +624,28 @@ fn propose_failed(err: ProposeError) -> ApiError {
             "no_review_url",
             "the pull request may be open, but the answer carried no address inside this repository",
         ),
+        // **Ces deux-là ne sont pas une panne chez le client : c'est nous qui
+        // n'avons pas appelé.** `agentos_app::mcp` refuse avant le transport un
+        // outil que personne n'a déclaré — un outil non déclaré est classé
+        // destructif, donc il réclame un humain — et un outil qu'aucun
+        // branchement ne sert. Les deux remontaient en 502 « the repository host
+        // did not answer », qui envoie chercher une panne réseau chez GitHub
+        // pour une ligne de configuration qui manque ici. Mesuré le 2026-09-12
+        // en marchant la boucle : la Gate laissait passer, la déclaration
+        // manquait, et la réponse accusait GitHub.
+        ProposeError::Effect(err) if matches!(err.code(), TOOL_REFUSED | TOOL_UNKNOWN) => {
+            ApiError::conflict(
+                "tool_unavailable",
+                "one of the three GitHub tools cannot be called from this binding",
+            )
+            .with_extension("tool_error", json!(err.code()))
+            .with_detail(
+                "rien n'est parti chez le client. `integrations_discover` sur ce branchement \
+                 rend les trois outils avec leur `digest` ; un outil que \
+                 `integrations_tools_declare` n'a pas classé est traité comme destructif et \
+                 refusé ici, et un outil absent de cette liste n'est pas servi sous ce nom.",
+            )
+        }
         ProposeError::Effect(err) => ApiError::new(
             StatusCode::BAD_GATEWAY,
             "repo_unreachable",
@@ -632,6 +654,12 @@ fn propose_failed(err: ProposeError) -> ApiError {
         .with_extension("tool_error", json!(err.code())),
     }
 }
+
+/// Ce que `agentos_app::mcp` rend quand la classe d'un outil réclame un humain —
+/// c'est-à-dire, en pratique, quand personne ne l'a déclaré.
+const TOOL_REFUSED: &str = "refused";
+/// Ce qu'il rend quand aucun branchement ne sert ce nom.
+const TOOL_UNKNOWN: &str = "unknown_tool";
 
 #[cfg(test)]
 mod tests {
@@ -1074,6 +1102,59 @@ mod tests {
         assert_eq!(
             body["code"], "no_rule",
             "le refus doit venir de l'allowlist d'outils : {body}"
+        );
+
+        // **Et la Gate passée, un outil que personne n'a déclaré n'est pas une
+        // panne chez le client.** La politique nomme maintenant les trois
+        // outils, donc le refus ne peut plus venir d'elle ; ce qui refuse est
+        // `agentos_app::mcp`, avant le transport, parce que la flotte de ce
+        // harnais ne sert rien sous ce handle. Jusqu'au 2026-09-12 la réponse
+        // était un 502 « the repository host did not answer », qui envoie
+        // chercher une panne réseau pour une ligne de configuration absente.
+        agentos_store::policy::install(
+            &h.db,
+            h.a,
+            agentos_store::policy::Scope::Tenant,
+            &agentos_domain::policy::PolicyLimits {
+                allowed_mcp_tools: [
+                    "create-branch",
+                    "create-or-update-file",
+                    "create-pull-request",
+                ]
+                .into_iter()
+                .map(|tool| {
+                    agentos_domain::action::McpTool::new(
+                        agentos_domain::ids::Slug::parse("github").expect("slug"),
+                        agentos_domain::ids::Slug::parse(tool).expect("slug"),
+                    )
+                })
+                .collect(),
+                max_turns_per_day: 10,
+                ..agentos_domain::policy::PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("install policy");
+
+        let (status, body) = h
+            .call(
+                "POST",
+                &format!("/v1/content/drafts/{draft_id}/propose"),
+                SECRET_A,
+                Some(json!({ "employee_id": employee })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body["code"], "tool_unavailable",
+            "un outil non servi n'est pas un hôte qui ne répond pas : {body}"
+        );
+        assert_eq!(body["tool_error"], "unknown_tool", "{body}");
+        assert!(
+            body["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("integrations_tools_declare")),
+            "le détail doit nommer ce qui répare : {body}"
         );
 
         // Le brouillon n'a pas bougé : ni proposé, ni publié.

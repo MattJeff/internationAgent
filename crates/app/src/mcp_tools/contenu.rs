@@ -7,9 +7,15 @@
 //!
 //! # Ce que les descriptions portent, et pourquoi
 //!
-//! Un modèle choisit un outil sur sa `description` seule, et les trois pièges
+//! Un modèle choisit un outil sur sa `description` seule, et les quatre pièges
 //! d'ici ne se devinent pas depuis un nom de route :
 //!
+//! * **`content_drafts_propose` a trois préalables, dont deux invisibles.** Un
+//!   dépôt (`content_repos_set`), une politique qui nomme les trois outils de
+//!   GitHub, et — celui que la boucle marchée le 2026-09-12 a trouvé —
+//!   `integrations_tools_declare` sur chacun des trois. Un outil qu'aucune
+//!   déclaration ne classe est traité comme destructif, donc refusé avant le
+//!   transport ; la description le dit parce qu'aucun schéma ne le porte.
 //! * **`content_questions_measure` nomme un siège.** La mesure est une lecture de page
 //!   publique, donc une action sur laquelle la Policy Gate statue pour un
 //!   employé. Un siège sans `web` ne mesure pas, et le refus est un 403 avec
@@ -249,9 +255,13 @@ pub fn tools() -> Vec<ToolDef> {
             "Remplace le titre et le texte — **ce qui est omis est perdu**, envoyer les deux à chaque fois. \
              Passer une `url` marque le brouillon comme publié à cette adresse ; ne la passer que si \
              l'article y est réellement, parce que cette colonne est un constat — `content_drafts_propose` \
-             ouvre une pull request et ne remplit jamais celle-ci. La date de publication est posée la \
-             première fois et ne bouge plus : corriger une typo ne republie pas. Corriger un brouillon déjà \
-             proposé le laisse `proposed` et ne repousse rien dans la pull request ouverte.",
+             ouvre une pull request et ne remplit jamais celle-ci. **`url` est omise comme le reste : la \
+             réenvoyer à chaque correction.** Un article publié qu'on corrige sans elle retombe à \
+             `proposed` (ou à `draft`), perd son adresse **et sa date de publication** — et une adresse \
+             remise ensuite porte une date neuve, donc la série de citations n'a plus rien à quoi comparer \
+             un avant et un après. Avec elle, la date de la première publication ne bouge pas : corriger \
+             une typo ne republie pas. Corriger un brouillon proposé mais non publié le laisse `proposed` \
+             et ne repousse rien dans la pull request ouverte.",
             Method::Put,
             "/v1/content/drafts/{id}",
             schema(
@@ -265,7 +275,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "body": { "type": "string", "description": "Le texte, en entier." },
                     "url": {
                         "type": "string",
-                        "description": "L'adresse où l'article a été publié. Omise, le brouillon redevient un brouillon."
+                        "description": "L'adresse où l'article a été publié. **Omise, elle est effacée** : le brouillon cesse d'être publié et perd sa date. La réenvoyer à chaque correction d'un article en ligne."
                     }
                 }),
                 &["id", "title", "body"],
@@ -289,7 +299,7 @@ pub fn tools() -> Vec<ToolDef> {
             "content_repos_set",
             "Attacher un dépôt à un siège, ou remplacer le sien",
             "Dit où ce siège pousse ses articles. **Remplace la ligne en entier** : les quatre champs sont \
-             obligatoires à chaque appel. `server` est le handle du branchement, celui qu'`integrations_list` \
+             obligatoires à chaque appel. `server` est le handle du branchement, celui qu'`integrations_servers_list` \
              rend — pas le nom du connecteur — et rien n'est écrit si aucun branchement ne porte ce handle. \
              `branch` est la branche **qui sert le site**, c'est-à-dire la cible de la pull request : celle \
              qui porte l'article est créée par `content_drafts_propose` et n'a pas à être configurée.",
@@ -304,7 +314,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "server": {
                         "type": "string",
-                        "description": "Le handle du branchement GitHub de ce locataire, tel qu'`integrations_list` le rend."
+                        "description": "Le handle du branchement GitHub de ce locataire, tel qu'`integrations_servers_list` le rend."
                     },
                     "repo": {
                         "type": "string",
@@ -330,11 +340,17 @@ pub fn tools() -> Vec<ToolDef> {
             "Pousse l'article dans le dépôt du siège, sur une branche à lui, et ouvre une pull request vers \
              la branche qui sert le site. **Ça ne publie pas** : le brouillon passe à `proposed`, pas à \
              `published`, et ce qui met l'article en ligne est une personne qui fusionne la demande — c'est \
-             elle, la relecture. Le siège nommé doit avoir un dépôt (`content_repos_set`) et une politique \
-             qui l'autorise à appeler `create-branch`, `create-or-update-file` et `create-pull-request` sur \
-             son branchement GitHub ; chacun des trois est un verdict de la Policy Gate, et un refus est un \
-             403 avec sa raison. Seul un brouillon se propose : rappeler cet outil sur un brouillon déjà \
-             proposé rend `not_a_draft` plutôt qu'une deuxième pull request.",
+             elle, la relecture. **Trois choses doivent être en place avant le premier appel, et deux ne se \
+             devinent pas** : le siège a un dépôt (`content_repos_set`) ; sa politique l'autorise à appeler \
+             `create-branch`, `create-or-update-file` et `create-pull-request` — chacun des trois est un \
+             verdict de la Policy Gate, et un refus est un 403 `no_rule` ; et ces trois outils ont été \
+             **déclarés** sur le branchement GitHub par `integrations_tools_declare`, avec le `digest` que \
+             rend `integrations_discover`. Un outil non déclaré est traité comme destructif, donc refusé \
+             avant qu'un octet parte, et la réponse est un 409 `tool_unavailable` — pas une panne chez le \
+             client. Seul un brouillon se propose : rappeler cet outil sur un brouillon déjà proposé rend \
+             `not_a_draft` plutôt qu'une deuxième pull request. Et un article déjà fusionné sous le même \
+             titre rend `github_refused` sur `create-or-update-file` : le chemin existe, et republier \
+             demanderait le `sha` de la version remplacée, que rien ici ne lit.",
             Method::Post,
             "/v1/content/drafts/{id}/propose",
             schema(
