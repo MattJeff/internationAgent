@@ -79,7 +79,6 @@
 //! direction d'échec sûre, et c'est pourquoi le document est vérifié avant que
 //! la Gate soit appelée plutôt qu'après.
 
-use agentos_domain::action::McpTool;
 use agentos_domain::ids::Slug;
 use agentos_providers::email::ProviderMessageId;
 use agentos_store::db::{Db, StoreError, TenantTx};
@@ -465,19 +464,6 @@ pub async fn send(
     }
 }
 
-/// L'outil du prestataire, nommé pour un pli donné.
-///
-/// Public parce que c'est ce qu'un test monte un faux serveur pour répondre, et
-/// parce qu'un lecteur qui cherche « quel outil DocuSign » doit tomber sur
-/// [`crate::effects::SEND_ENVELOPE`] et son avertissement.
-#[must_use]
-pub fn send_tool(server: &Slug) -> McpTool {
-    McpTool::new(
-        server.clone(),
-        Slug::parse(crate::effects::SEND_ENVELOPE).expect("une constante du module des effets"),
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -486,7 +472,6 @@ pub fn send_tool(server: &Slug) -> McpTool {
 mod tests {
     use std::sync::Arc;
 
-    use agentos_domain::action::McpTool;
     use agentos_domain::ids::{ApprovalId, EmployeeId, TenantId};
     use agentos_domain::policy::PolicyLimits;
     use agentos_domain::untrusted::Untrusted;

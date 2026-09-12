@@ -267,8 +267,20 @@ create policy tenant_isolation on signature_envelopes
   using (tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid)
   with check (tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid);
 
--- Pas de `delete`, et c'est le seul écart avec `content_repos` : un pli ne
+-- **Les privilèges d'`invoices` et de `sales_quotes`, à la colonne près**, et
+-- pas ceux de `content_repos` : un dépôt se change et se retire, un document qui
+-- engage l'entreprise ne fait ni l'un ni l'autre. `0066` accorde
+-- `update (paid_at)` et rien d'autre ; `0090` accorde
+-- `update (accepted_at, declined_at)`. Ici ce sont les quatre colonnes des deux
+-- transitions, et aucune autre — le titre, le signataire et le document ne sont
+-- pas seulement immuables par déclencheur, ils sont **hors du privilège**. Le
+-- déclencheur reste, parce qu'il tient l'autre moitié : une transition ne se
+-- rejoue pas.
+--
+-- Pas de `delete` non plus, comme `files` (`0067`) et pour sa raison : un pli ne
 -- s'efface pas. La disparition d'un locataire ou d'un siège cascade depuis la
 -- table parente, ce qui se fait en tant que propriétaire et n'a pas besoin de ce
 -- privilège-ci.
-grant select, insert, update on signature_envelopes to app_role;
+grant select, insert on signature_envelopes to app_role;
+grant update (provider_envelope_id, sent_at, executed_name, signed_at)
+  on signature_envelopes to app_role;
