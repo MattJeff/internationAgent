@@ -146,6 +146,8 @@ avec un jeton de la Gate.
 `approvals_deny` ; `halt_place` arrête toute la société, `halt_release` la \
 relance.
 5. Être cité quand on demande à un modèle ce que cette société vend — \
+`content_repos_set` d'abord, parce que son champ `site` est ce que « nous » \
+veut dire dans une mesure (sans lui, `no_domain_of_ours`) ; puis \
 `content_questions_add`, puis `content_questions_measure` (elle nomme un siège, \
 dont la politique doit porter le canal `web`), puis `content_briefs_get`, qui \
 rend ce qu'il faut couvrir et jamais de prose : l'article, c'est vous qui \
@@ -155,7 +157,7 @@ GitHub du client (`integrations_connect`), lire ses outils \
 (`integrations_discover`), puis **déclarer** `create-branch`, \
 `create-or-update-file` et `create-pull-request` en `write` avec leur `digest` \
 (`integrations_tools_declare`) — un outil non déclaré est traité comme \
-destructif et refusé. Ensuite `content_repos_set`, et `content_drafts_propose` \
+destructif et refusé. Ensuite `content_drafts_propose` \
 ouvre une pull request. **Ça ne publie pas** : une personne fusionne, et c'est \
 `content_drafts_amend` avec l'`url` constatée qui l'enregistre.
 

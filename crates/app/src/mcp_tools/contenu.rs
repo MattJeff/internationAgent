@@ -161,7 +161,10 @@ pub fn tools() -> Vec<ToolDef> {
              est refusé, avec la raison. Un seul moteur est lisible par ce déploiement, `duckduckgo_lite` : \
              les réponses de ChatGPT, de Claude ou de Gemini demandent un compte et ne sont pas mesurables \
              ici, et Google, Bing, Brave, Mojeek et Startpage refusent leurs pages de résultats dans leur \
-             `robots.txt`. À appeler régulièrement : une mesure isolée ne dit rien, c'est la série qui parle.",
+             `robots.txt`. **Un préalable qui ne se devine pas** : « nous » est le `site` déclaré par \
+             `content_repos_set`, et pas un domaine d'envoi d'e-mail — un locataire dont aucun dépôt ne \
+             porte de `site` rend 409 `no_domain_of_ours` plutôt qu'une mesure. À appeler régulièrement : \
+             une mesure isolée ne dit rien, c'est la série qui parle.",
             Method::Post,
             "/v1/content/questions/{id}/measure",
             schema(
@@ -298,11 +301,15 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "content_repos_set",
             "Attacher un dépôt à un siège, ou remplacer le sien",
-            "Dit où ce siège pousse ses articles. **Remplace la ligne en entier** : les quatre champs sont \
-             obligatoires à chaque appel. `server` est le handle du branchement, celui qu'`integrations_servers_list` \
+            "Dit où ce siège pousse ses articles, et où ils ressortent. **Remplace la ligne en entier** : les \
+             quatre premiers champs sont obligatoires à chaque appel, et `site` omis est `site` effacé. `server` \
+             est le handle du branchement, celui qu'`integrations_servers_list` \
              rend — pas le nom du connecteur — et rien n'est écrit si aucun branchement ne porte ce handle. \
              `branch` est la branche **qui sert le site**, c'est-à-dire la cible de la pull request : celle \
-             qui porte l'article est créée par `content_drafts_propose` et n'a pas à être configurée.",
+             qui porte l'article est créée par `content_drafts_propose` et n'a pas à être configurée. \
+             **`site` est ce que « nous » veut dire pour `content_questions_measure`** : sans lui, la mesure \
+             ne sait pas reconnaître le client dans les résultats et rend 409 `no_domain_of_ours`. C'est \
+             l'hôte public du site, pas un domaine d'envoi d'e-mail — ceux-là sont une autre liste.",
             Method::Put,
             "/v1/content/repos/{employee_id}",
             schema(
@@ -327,6 +334,10 @@ pub fn tools() -> Vec<ToolDef> {
                     "folder": {
                         "type": "string",
                         "description": "Le dossier que le générateur lit, p. ex. `content/blog` ou `_posts`. Relatif, sans `..` ni barre de tête."
+                    },
+                    "site": {
+                        "type": "string",
+                        "description": "L'hôte public où les articles de ce dépôt ressortent, p. ex. `visa.orizn.app`. L'hôte seul, en minuscules, sans `https://` ni chemin. C'est lui que la mesure de citation cherche dans les résultats."
                     }
                 }),
                 &["employee_id", "server", "repo", "branch", "folder"],

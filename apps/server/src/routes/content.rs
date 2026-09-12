@@ -250,7 +250,12 @@ fn measure_failed(err: MeasureError) -> ApiError {
         MeasureError::Store(err) => err.into(),
         MeasureError::NoDomainOfOurs => ApiError::conflict(
             NO_DOMAIN_OF_OURS,
-            "this tenant has no domain of its own, so there is nothing to look for",
+            "this tenant declares no site of its own, so there is nothing to look for",
+        )
+        .with_detail(
+            "« nous » est le champ `site` d'un dépôt (`content_repos_set`) : l'hôte public \
+             où les articles ressortent, p. ex. `visa.orizn.app`. Ce n'est pas un domaine \
+             d'envoi d'e-mail — `domains_list` en rend d'autres, et ce ne sont pas ceux-là.",
         ),
         // Le mot du port, comme `routes::approvals` le rend pour un paiement :
         // un opérateur qui lit ce 502 et un opérateur qui lit le journal lisent
@@ -442,6 +447,13 @@ struct NewRepo {
     branch: String,
     /// Le dossier que le générateur lit.
     folder: String,
+    /// L'hôte public où les articles ressortent, p. ex. `visa.orizn.app`.
+    /// Facultatif, et **remplacé comme le reste** : la ligne entière est
+    /// réécrite à chaque appel, donc l'omettre l'efface. C'est lui que
+    /// `content::our_domains` lit pour savoir ce que « nous » veut dire dans
+    /// une mesure de citation — `migrations/0106`.
+    #[serde(default)]
+    site: Option<String>,
 }
 
 /// Poser ou remplacer le dépôt d'un siège.
@@ -467,6 +479,7 @@ async fn set_repo(
         &body.repo,
         &body.branch,
         &body.folder,
+        body.site.as_deref(),
     )
     .await
     // Un siège qui n'est pas à ce locataire n'existe pas dans cette
@@ -1021,12 +1034,34 @@ mod tests {
                     "server": "github",
                     "repo": "acme/site",
                     "branch": "main",
-                    "folder": "content/blog"
+                    "folder": "content/blog",
+                    "site": "blog.acme.example"
                 })),
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["repo"]["repo"], "acme/site");
+        // `site` est ce que « nous » veut dire dans une mesure — voir
+        // `migrations/0106`, et le test de `agentos_app::content` qui tient
+        // qu'un domaine d'envoi n'y entre pas.
+        assert_eq!(body["repo"]["site"], "blog.acme.example");
+
+        // Un hôte mal formé est une faute de l'appelant, comme le dossier.
+        let (status, _) = h
+            .call(
+                "PUT",
+                &format!("/v1/content/repos/{employee}"),
+                SECRET_A,
+                Some(json!({
+                    "server": "github",
+                    "repo": "acme/site",
+                    "branch": "main",
+                    "folder": "content/blog",
+                    "site": "https://blog.acme.example/"
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
 
         // Le voisin ne voit pas le dépôt d'à côté.
         let (_, body) = h.call("GET", "/v1/content/repos", SECRET_B, None).await;
