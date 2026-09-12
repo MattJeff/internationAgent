@@ -88,6 +88,11 @@ compte des créneaux réservés, `sent` compte des messages que nous avons écri
 C'est le genre de phrase qu'un fondateur ne peut pas déduire d'un seul de ces deux nombres, et
 personne d'autre ne la dira.
 
+**Les deux fenêtres ne coïncident pas tout à fait** : `growth_get` compte des jours UTC pleins,
+bornes incluses, quand `outreach_health_get` compte à rebours depuis maintenant. À `days=7` cela
+fait jusqu'à une journée d'écart à chaque bout. Dis l'écart comme un ordre de grandeur — « deux
+tiers des créneaux ne sont jamais partis » — jamais comme une soustraction exacte.
+
 Les deux taux sont **en pour mille des envois**, l'unité des seuils publics (0,3 % de plaintes =
 3 ‰), et ils valent `null` tant que rien n'est parti **ou que rien n'est revenu** : `sent` est
 compté sur nos lignes, les livraisons et les rebonds n'arrivent que par le rappel du
