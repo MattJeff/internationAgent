@@ -2160,6 +2160,34 @@ mod tests {
             Some(first),
             "une typo n'est pas une publication"
         );
+
+        // **Et l'omission dépublie.** C'est la convention de la maison — un
+        // `set` efface ce qu'on ne lui redonne pas — mais sur cette
+        // colonne-là elle coûte la date à laquelle l'article est entré en
+        // ligne, c'est-à-dire le seul instant auquel la série de
+        // `content_citations` peut être comparée. Testé parce que la
+        // description de `content_drafts_amend` promettait l'inverse jusqu'au
+        // 2026-09-12 : « la date de publication est posée la première fois et
+        // ne bouge plus » se lisait comme une garantie, et elle ne vaut
+        // qu'avec l'`url`.
+        let undone = drafts::update(
+            &mut tx,
+            draft.id,
+            &drafts::Revision {
+                title: "Titre corrigé",
+                body: "Corps corrigé",
+                url: None,
+            },
+        )
+        .await
+        .expect("update")
+        .expect("le brouillon existe");
+        assert_ne!(undone.state, "published", "l'omission a laissé un publié");
+        assert!(undone.url.is_none());
+        assert!(
+            undone.published_at.is_none(),
+            "la date a survécu à l'effacement de l'adresse qu'elle date"
+        );
         tx.commit().await.expect("commit");
 
         drop_tenant(&db, principal.tenant_id).await;

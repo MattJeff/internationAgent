@@ -255,9 +255,13 @@ pub fn tools() -> Vec<ToolDef> {
             "Remplace le titre et le texte — **ce qui est omis est perdu**, envoyer les deux à chaque fois. \
              Passer une `url` marque le brouillon comme publié à cette adresse ; ne la passer que si \
              l'article y est réellement, parce que cette colonne est un constat — `content_drafts_propose` \
-             ouvre une pull request et ne remplit jamais celle-ci. La date de publication est posée la \
-             première fois et ne bouge plus : corriger une typo ne republie pas. Corriger un brouillon déjà \
-             proposé le laisse `proposed` et ne repousse rien dans la pull request ouverte.",
+             ouvre une pull request et ne remplit jamais celle-ci. **`url` est omise comme le reste : la \
+             réenvoyer à chaque correction.** Un article publié qu'on corrige sans elle retombe à \
+             `proposed` (ou à `draft`), perd son adresse **et sa date de publication** — et une adresse \
+             remise ensuite porte une date neuve, donc la série de citations n'a plus rien à quoi comparer \
+             un avant et un après. Avec elle, la date de la première publication ne bouge pas : corriger \
+             une typo ne republie pas. Corriger un brouillon proposé mais non publié le laisse `proposed` \
+             et ne repousse rien dans la pull request ouverte.",
             Method::Put,
             "/v1/content/drafts/{id}",
             schema(
@@ -271,7 +275,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "body": { "type": "string", "description": "Le texte, en entier." },
                     "url": {
                         "type": "string",
-                        "description": "L'adresse où l'article a été publié. Omise, le brouillon redevient un brouillon."
+                        "description": "L'adresse où l'article a été publié. **Omise, elle est effacée** : le brouillon cesse d'être publié et perd sa date. La réenvoyer à chaque correction d'un article en ligne."
                     }
                 }),
                 &["id", "title", "body"],
