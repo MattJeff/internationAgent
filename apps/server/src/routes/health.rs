@@ -93,6 +93,23 @@ struct CompanyHealth {
     last_failure_at: Option<DateTime<Utc>>,
     last_failure_code: Option<String>,
     last_failure_detail: Option<String>,
+    /// **Lequel.** `0099` porte `employee_id` en disant pourquoi — *« la
+    /// première question après "laquelle est arrêtée" est "lequel" »* — et
+    /// cette route a laissé la colonne dans la table pendant toute sa première
+    /// vie. Mesuré le 2026-09-12 en jouant `point-du-jour` sur une société à
+    /// deux sièges dont un seul cassait : la réponse disait `degraded` et « le
+    /// siège n'a pas de charte lisible », et il n'y avait aucun moyen de savoir
+    /// duquel des deux il s'agissait sans relire `GET /v1/events`. Un verdict
+    /// qui ne nomme pas son coupable n'est pas une décision, c'est une enquête.
+    ///
+    /// Les deux ensemble, et pas l'uuid seul : le slug est ce qu'un humain
+    /// lit, l'uuid est ce que la ligne suivante réclame (`initiatives_get`,
+    /// `employees_get`). Ils sont `null` ensemble, et exactement quand
+    /// `last_failure_code` l'est — `turn_outcomes.employee_id` est `NOT NULL`
+    /// avec une cascade sur `employees`, donc une ligne d'issue qui existe a
+    /// toujours son siège.
+    last_failure_employee_id: Option<uuid::Uuid>,
+    last_failure_employee_slug: Option<String>,
     /// Des effets de bord qui n'auront pas lieu. Voir [`dead_lettered`] pour ce
     /// que « aujourd'hui » veut dire sur une table sans date de rebut.
     dead_lettered_today: i64,
@@ -216,9 +233,14 @@ const COUNTS_SQL: &str = "\
 /// Le dernier échec, sans borne : une société arrêtée depuis quatre jours doit
 /// pouvoir nommer ce qui l'a arrêtée même si le premier refus est plus vieux
 /// que la fenêtre du jour.
+/// La jointure sur `employees` est ici plutôt que dans une seconde requête :
+/// deux lectures rendraient le siège d'un *autre* échec le jour où une ligne
+/// arrive entre les deux, et les deux tables portent la même RLS.
 const LAST_FAILURE_SQL: &str = "\
-    SELECT at, code, detail FROM turn_outcomes \
-     WHERE code <> $1 ORDER BY at DESC LIMIT 1";
+    SELECT o.at, o.code, o.detail, o.employee_id, e.slug \
+      FROM turn_outcomes o \
+      LEFT JOIN employees e ON e.id = o.employee_id \
+     WHERE o.code <> $1 ORDER BY o.at DESC LIMIT 1";
 
 /// Combien d'effets de bord ont été abandonnés aujourd'hui.
 ///
@@ -259,7 +281,13 @@ async fn get(State(db): State<Db>, principal: Principal) -> Result<Response, Api
         .fetch_one(&mut **tx)
         .await
         .map_err(StoreError::from)?;
-    let failure: Option<(DateTime<Utc>, String, Option<String>)> = sqlx::query_as(LAST_FAILURE_SQL)
+    let failure: Option<(
+        DateTime<Utc>,
+        String,
+        Option<String>,
+        uuid::Uuid,
+        Option<String>,
+    )> = sqlx::query_as(LAST_FAILURE_SQL)
         .bind(TURN)
         .fetch_optional(&mut **tx)
         .await
@@ -273,15 +301,25 @@ async fn get(State(db): State<Db>, principal: Principal) -> Result<Response, Api
     let model = agentos_store::model_access::load(&mut tx).await?;
     tx.rollback().await?;
 
-    let (last_failure_at, last_failure_code, last_failure_detail) = match failure {
-        Some((at, code, detail)) => (Some(at), Some(code), detail),
-        // Pas de tour raté, mais pas de modèle non plus : le verdict est
-        // `stopped` et sa cause doit être lisible. On ne date pas cet échec —
-        // il n'a pas eu lieu, c'est l'absence qui parle — et on n'écrase jamais
-        // un vrai dernier échec, qui est plus informatif.
-        None if model.is_none() => (None, Some("no_model".to_owned()), Some(NO_MODEL.to_owned())),
-        None => (None, None, None),
-    };
+    let (last_failure_at, last_failure_code, last_failure_detail, failed_by, failed_by_slug) =
+        match failure {
+            Some((at, code, detail, employee_id, slug)) => {
+                (Some(at), Some(code), detail, Some(employee_id), slug)
+            }
+            // Pas de tour raté, mais pas de modèle non plus : le verdict est
+            // `stopped` et sa cause doit être lisible. On ne date pas cet échec —
+            // il n'a pas eu lieu, c'est l'absence qui parle — et on n'écrase jamais
+            // un vrai dernier échec, qui est plus informatif. Aucun siège n'est
+            // nommé non plus : la cause est la société entière, pas l'un d'eux.
+            None if model.is_none() => (
+                None,
+                Some("no_model".to_owned()),
+                Some(NO_MODEL.to_owned()),
+                None,
+                None,
+            ),
+            None => (None, None, None, None, None),
+        };
 
     Ok(axum::Json(CompanyHealth {
         turns_attempted_today: counts.attempted_today,
@@ -290,6 +328,8 @@ async fn get(State(db): State<Db>, principal: Principal) -> Result<Response, Api
         last_failure_at,
         last_failure_code,
         last_failure_detail,
+        last_failure_employee_id: failed_by,
+        last_failure_employee_slug: failed_by_slug,
         dead_lettered_today: dead_lettered,
         verdict: verdict(counts, model.is_some(), now),
         model: model.map(|connection| connection.access),
@@ -624,6 +664,67 @@ mod tests {
         // Aucune connexion au modèle sur ce locataire de test, et c'est dit
         // plutôt qu'omis.
         assert!(body["model"].is_null());
+        h.teardown().await;
+    }
+
+    /// **Lequel des sièges.** Deux sièges, un seul qui casse : la réponse le
+    /// nomme, par son slug et par son uuid. Sans cette ligne, `degraded` et sa
+    /// phrase envoyaient le fondateur relire `GET /v1/events` pour savoir à qui
+    /// parler, et `migrations/0099` porte la colonne depuis le premier jour en
+    /// disant exactement pourquoi.
+    #[tokio::test]
+    async fn le_dernier_echec_nomme_le_siege_qui_la_produit() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        connect_model(&h.db, h.a).await;
+        let qui_marche = employee(&h.db, h.a, "vendeuse").await;
+        let qui_casse = employee(&h.db, h.a, "redacteur").await;
+        let at = Utc::now()
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .expect("midi existe")
+            .and_utc();
+        trace(&h.db, h.a, qui_marche, at - Duration::minutes(30), TURN, None).await;
+        trace(
+            &h.db,
+            h.a,
+            qui_casse,
+            at - Duration::minutes(10),
+            "unreadable_charter",
+            Some("le siège n'a pas de charte lisible"),
+        )
+        .await;
+
+        let (status, body) = h.health(SECRET_A).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["verdict"], "degraded", "{body}");
+        assert_eq!(
+            body["last_failure_employee_slug"], "redacteur",
+            "un verdict qui ne nomme pas son siège est une enquête : {body}"
+        );
+        assert_eq!(
+            body["last_failure_employee_id"],
+            serde_json::Value::from(qui_casse.as_uuid().to_string()),
+            "{body}"
+        );
+        h.teardown().await;
+    }
+
+    /// Et l'inverse : sans échec, aucun siège n'est nommé. Une société sans
+    /// modèle rend `stopped` sur une cause qui n'est celle d'aucun siège en
+    /// particulier, donc les deux champs restent `null`.
+    #[tokio::test]
+    async fn sans_echec_aucun_siege_nest_nomme() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        employee(&h.db, h.a, "vendeuse").await;
+        let (_, body) = h.health(SECRET_A).await;
+        assert_eq!(body["verdict"], "stopped", "{body}");
+        assert_eq!(body["last_failure_code"], "no_model", "{body}");
+        assert!(body["last_failure_employee_id"].is_null(), "{body}");
+        assert!(body["last_failure_employee_slug"].is_null(), "{body}");
         h.teardown().await;
     }
 

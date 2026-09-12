@@ -250,16 +250,21 @@ pub fn tools() -> Vec<ToolDef> {
             "company_health_get",
             "Est-ce que cette société travaille encore ?",
             "Rend, en un appel, si les employés prennent leurs tours ou non : combien tentés et \
-             combien ratés aujourd'hui, la date du dernier qui a réussi, le code et la phrase du \
-             dernier échec, et un verdict — `working`, `degraded`, `stopped`. **C'est le premier \
+             combien ratés aujourd'hui, la date du dernier qui a réussi, le code, la phrase et \
+             **le siège** du dernier échec (`last_failure_employee_slug` pour le lire, \
+             `last_failure_employee_id` pour la ligne d'après), et un verdict — `working`, \
+             `degraded`, `stopped`. **C'est le premier \
              outil à appeler quand quelque chose semble immobile** : un employé qui ne répond pas, \
              une campagne qui n'avance pas, une demande sans suite. Une société au repos rend \
              `working` et pas `degraded` : ne rien avoir à faire n'est pas une panne. `stopped` \
              nomme la cause dans `last_failure_detail`, et c'est presque toujours la connexion au \
-             modèle. Trois suites selon le verdict : `stopped` va voir `model_get` puis \
-             `halt_get`, `degraded` va lire `refusals_get` et `events_list`, et un `working` sur \
-             une société qui n'avance quand même pas va voir `initiatives_list` — un siège sans \
-             cadence ne se réveille jamais tout seul.",
+             modèle. **`last_success_at` est ce qui distingue une société neuve d'une société \
+             arrêtée** — les deux rendent `stopped` sans modèle, mais l'une n'a jamais réussi un \
+             tour (`null`) et l'autre porte une date, qui dit depuis combien de temps ça dure. \
+             Trois suites selon le verdict : `stopped` va voir `model_get` puis \
+             `halt_get`, `degraded` va lire `initiatives_get` sur le siège nommé, et un `working` \
+             sur une société qui n'avance quand même pas va voir `initiatives_list` — un siège \
+             sans cadence ne se réveille jamais tout seul.",
             Method::Get,
             "/v1/health/company",
             nothing(),

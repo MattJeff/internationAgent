@@ -336,13 +336,27 @@ struct HealthView {
     clicked: u32,
     bounced: u32,
     complained: u32,
-    /// `complained * 1000 / sent`, deux décimales, **`null` si rien n'est parti**.
+    /// `complained * 1000 / sent`, deux décimales, **`null` si rien n'est parti
+    /// ou si rien n'est revenu** — voir [`per_mille`].
     complaint_rate_per_mille: Option<f64>,
-    /// `bounced * 1000 / sent`, deux décimales, **`null` si rien n'est parti**.
+    /// `bounced * 1000 / sent`, deux décimales, **`null` si rien n'est parti
+    /// ou si rien n'est revenu** — voir [`per_mille`].
     bounce_rate_per_mille: Option<f64>,
 }
 
-/// `n` pour mille de `sent`, arrondi à deux décimales — **`None` sans envoi**.
+/// Les traces qui disent quelque chose du sort d'un envoi.
+///
+/// `opened` et `clicked` n'y sont pas : ils n'arrivent qu'après un `delivered`
+/// et n'ajoutent donc aucune information sur « a-t-on eu des nouvelles ».
+fn heard_back(health: &traces::Health) -> u32 {
+    health
+        .delivered
+        .saturating_add(health.bounced)
+        .saturating_add(health.complained)
+}
+
+/// `n` pour mille de `sent`, arrondi à deux décimales — **`None` sans envoi, et
+/// `None` quand aucune trace n'est revenue**.
 ///
 /// Zéro sur zéro envoi n'est pas un taux de rebond nul, c'est l'absence de
 /// mesure, et les deux se lisent de façon opposée : « aucun rebond » est une
@@ -351,10 +365,30 @@ struct HealthView {
 /// un taux sans dénominateur n'existe pas. Un déploiement qui la tient à un
 /// endroit et pas à l'autre apprend à son lecteur à ne croire ni l'un ni
 /// l'autre.
-fn per_mille(n: u32, sent: u32) -> Option<f64> {
-    match sent {
-        0 => None,
-        sent => Some((f64::from(n) * 1000.0 / f64::from(sent) * 100.0).round() / 100.0),
+///
+/// # Le dénominateur existait, et la mesure n'existait pas
+///
+/// Mesuré le 2026-09-12 sur une instance locale, en jouant `point-du-jour` :
+/// quarante envois dans la fenêtre, **zéro trace de retour**, et cette route
+/// rendait `bounce_rate_per_mille: 0,0` et `complaint_rate_per_mille: 0,0`.
+/// C'est le même mensonge que le zéro sur zéro envoi corrigé la veille, un cran
+/// plus loin : le dénominateur est vrai, et c'est le **numérateur** qui n'a pas
+/// de source. `sent` est compté sur nos propres lignes de `messages` ; les six
+/// autres comptes viennent de `message_events` et de `suppressions`, que seul
+/// un rappel du fournisseur écrit. Un déploiement dont `AGENTOS_WEBHOOK_SECRETS`
+/// est vide — le défaut, et l'état d'Orizn aujourd'hui — a donc un
+/// dénominateur, aucun numérateur possible, et annonçait une livraison
+/// parfaite.
+///
+/// La borne est *une* trace, pas un quorum : une seule livraison constatée
+/// prouve que le canal de retour parle, et à partir de là un zéro est une
+/// mesure. `delivered + bounced + complained` plutôt que `delivered` seul,
+/// parce qu'une campagne qui rebondit en entier a `delivered = 0` et un taux de
+/// rebond qu'il faut absolument montrer.
+fn per_mille(n: u32, sent: u32, heard: u32) -> Option<f64> {
+    match (sent, heard) {
+        (0, _) | (_, 0) => None,
+        (sent, _) => Some((f64::from(n) * 1000.0 / f64::from(sent) * 100.0).round() / 100.0),
     }
 }
 
@@ -384,8 +418,8 @@ async fn health(
         clicked: health.clicked,
         bounced: health.bounced,
         complained: health.complained,
-        complaint_rate_per_mille: per_mille(health.complained, health.sent),
-        bounce_rate_per_mille: per_mille(health.bounced, health.sent),
+        complaint_rate_per_mille: per_mille(health.complained, health.sent, heard_back(&health)),
+        bounce_rate_per_mille: per_mille(health.bounced, health.sent, heard_back(&health)),
     })
     .into_response())
 }
@@ -963,15 +997,45 @@ mod tests {
     /// Les deux taux, sur des comptes posés à la main : 1 plainte et 2 rebonds
     /// sur 8 envoyés font 125 ‰ et 250 ‰ ; 1 sur 3 arrondit à 333,33.
     ///
-    /// Et les deux zéros qui ne veulent pas dire la même chose : zéro rebond
-    /// **sur trois envois** est une mesure, et c'est `0.0` ; zéro envoi n'en
-    /// est pas une, et c'est `None`.
+    /// Et les trois zéros qui ne veulent pas dire la même chose : zéro rebond
+    /// **sur trois envois dont on a eu des nouvelles** est une mesure, et c'est
+    /// `0.0` ; zéro envoi n'en est pas une, et c'est `None` ; trois envois dont
+    /// aucune trace n'est revenue n'en est pas une non plus, et c'est `None`.
     #[test]
     fn les_taux_sont_en_pour_mille_sur_les_envoyes() {
-        assert_eq!(per_mille(1, 8), Some(125.0));
-        assert_eq!(per_mille(2, 8), Some(250.0));
-        assert_eq!(per_mille(1, 3), Some(333.33));
-        assert_eq!(per_mille(0, 3), Some(0.0));
-        assert_eq!(per_mille(3, 0), None, "rien de parti : aucune mesure");
+        assert_eq!(per_mille(1, 8, 8), Some(125.0));
+        assert_eq!(per_mille(2, 8, 8), Some(250.0));
+        assert_eq!(per_mille(1, 3, 3), Some(333.33));
+        assert_eq!(per_mille(0, 3, 3), Some(0.0));
+        assert_eq!(per_mille(3, 0, 0), None, "rien de parti : aucune mesure");
+        assert_eq!(
+            per_mille(0, 40, 0),
+            None,
+            "quarante partis et aucune trace revenue : le dénominateur existe, \
+             la mesure non — un 0,0 ici se lit « livraison parfaite »"
+        );
+        // Une campagne qui rebondit en entier n'a aucun `delivered`, et son
+        // taux de rebond est précisément ce qu'il faut montrer.
+        assert_eq!(per_mille(40, 40, 40), Some(1000.0));
+    }
+
+    /// [`heard_back`] ne compte que les trois traces qui disent quelque chose
+    /// du sort d'un envoi : une ouverture n'arrive qu'après une livraison et
+    /// n'ajoute rien à « a-t-on eu des nouvelles ».
+    #[test]
+    fn une_ouverture_seule_ne_prouve_pas_quon_a_eu_des_nouvelles() {
+        let health = traces::Health {
+            sent: 40,
+            delivered: 0,
+            opened: 7,
+            clicked: 2,
+            bounced: 0,
+            complained: 0,
+        };
+        assert_eq!(heard_back(&health), 0);
+        assert_eq!(
+            per_mille(health.bounced, health.sent, heard_back(&health)),
+            None
+        );
     }
 }
