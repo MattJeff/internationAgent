@@ -52,7 +52,12 @@ noise = {"dry_run", "user_config", "last_failure_detail", "outstanding_minor", "
          "policy_widens", "reporting_cycle", "draft_is_not_resumable", "turns_taken",
          "contacts_held_back", "acts_on_its_own", "set_by", "reports_to", "team_id",
          "employee_id", "action_kind", "deny_reason", "role_name", "max_turns_per_day",
-         "interval_secs", "section_id", "plugin_root", "cle_api", "base_url", "next_since"}
+         "interval_secs", "section_id", "plugin_root", "cle_api", "base_url", "next_since",
+         # Champs de reponse et valeurs d'enum que `point-du-jour` cite par leur
+         # nom, parce qu'un geste qui dit « lis le verdict » sans dire lequel ne
+         # se relit pas. Ils ont la meme forme qu'un nom d'outil et n'en sont pas.
+         "last_success_at", "last_failure_employee_slug", "expires_at",
+         "to_next_rate", "no_target", "on_track", "raised_after_denials"}
 missing = sorted(t for t in cited - noise if t not in registry)
 if missing:
     bad.append(f"outils cites et absents du registre : {missing}")

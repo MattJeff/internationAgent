@@ -10,17 +10,20 @@
 //! `routes::invoices`
 //!
 //! **La seule façon qu'un devis existe est qu'un employé le propose**, avec un
-//! jeton que la Policy Gate a émis pour lui — la forme exacte est dans le
-//! rapport de cette vague, à poser dans `agentos_app::effects` à côté de
-//! `issue_invoice`. Une route d'opérateur qui émettrait serait une seconde voie
-//! sans décision derrière elle : un document commercial parti au nom de
-//! l'entreprise, indiscernable dans la table d'un document qu'un employé était
-//! autorisé à envoyer. `work_items` a accepté exactement cette ambiguïté et l'a
-//! payée avec la colonne `posted_by` de `0064` ; cette table la refuse d'entrée.
+//! jeton que la Policy Gate a émis pour lui : `agentos_app::effects::propose_quote`,
+//! écrit le 2026-09-11 à côté d'`issue_invoice`. Une route d'opérateur qui
+//! émettrait serait une seconde voie sans décision derrière elle : un document
+//! commercial parti au nom de l'entreprise, indiscernable dans la table d'un
+//! document qu'un employé était autorisé à envoyer. `work_items` a accepté
+//! exactement cette ambiguïté et l'a payée avec la colonne `posted_by` de
+//! `0064` ; cette table la refuse d'entrée.
 //!
-//! Le coût est réel et il est nommé : tant que l'effet n'est pas écrit, le
-//! registre ne se remplit que depuis Rust. Le point d'accès qui masquerait cela
-//! est celui que ce module refuse d'être.
+//! Le coût était réel et il était nommé — *tant que l'effet n'est pas écrit, le
+//! registre ne se remplit que depuis Rust* — et il ne l'est plus. Ce qui reste
+//! est une ligne de catalogue de tour et un pack qui propose
+//! `ActionKind::QuoteIssue` : `agentos_app::turn::UNSERVED` porte l'entrée, sa
+//! raison et sa procédure. Le point d'accès qui masquerait tout cela est celui
+//! que ce module refuse d'être.
 //!
 //! # Pourquoi la réponse du client est un acte d'opérateur, jamais d'employé
 //!

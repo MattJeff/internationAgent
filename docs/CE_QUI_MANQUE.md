@@ -11,6 +11,11 @@ colonnes et pas une de plus : **couvert**, **à moitié**, **pas du tout**. Il s
 termine par un ordre — pas des priorités, un ordre, avec la raison de chaque
 place.
 
+**Relu le 2026-09-12**, en parcourant `point-du-jour` sur une instance locale.
+Les trois premières places de § 7 sont bâties ; § 3.3 et § 3.4 portent ce qui
+leur reste, § 7 porte les dates et une sixième place. Rien d'autre n'a été
+revérifié : ce qui n'est pas daté du 2026-09-12 date toujours du 2026-09-11.
+
 ---
 
 ## 0. Comment il a été établi, et ce qu'il ne prétend pas
@@ -223,19 +228,35 @@ défendable — un seul chemin d'envoi, un seul endroit où les refus s'applique
 `crates/app/src/quote_document.rs`, les outils `quotes_list`, `quotes_accept`,
 `quotes_decline`.
 
-**Où ça s'arrête, et c'est la ligne la plus coûteuse du document :** il n'y a
-pas de `POST /v1/quotes` et **il n'y a pas non plus d'effet**.
-`apps/server/src/routes/quotes.rs` l'écrit en toutes lettres : *« tant que
-l'effet n'est pas écrit, le registre ne se remplit que depuis Rust »*. La
-liste des méthodes publiques d'`Effects` contient `issue_invoice` et aucun
-`issue_quote`.
+**Bâti le 2026-09-11, et ce paragraphe est ce qu'il disait** : il n'y avait
+pas de `POST /v1/quotes` et **pas d'effet non plus** ;
+`apps/server/src/routes/quotes.rs` l'écrivait en toutes lettres, et les deux
+étapes `quotes_issued` / `quotes_accepted` de `GET /v1/growth` étaient
+structurellement à zéro quoi que fasse l'entreprise.
 
-Pourquoi c'est cher : `GET /v1/growth` compte `quotes_issued` et
-`quotes_accepted` sur `sales_quotes`. **Deux des sept étapes de l'entonnoir de
-croissance sont donc structurellement à zéro**, et les taux de passage autour
-d'elles sont indéfinis. Le tableau de bord qui doit prouver le ×10 a un trou au
-milieu, et le trou n'est pas dans la mesure — il est dans le fait que personne
-ne peut produire la ligne.
+`Effects::propose_quote` (`14d7b32`) est la moitié qui manquait, écrite sur le
+modèle d'`issue_invoice` : la Gate statue pour un siège nommé sur un
+`ActionKind::QuoteIssue` neuf — et non `InvoiceIssue` réutilisé, parce
+qu'`rolepack_sales` refuse celui-là en toutes lettres et qu'emprunter le verbe
+de facturation ferait du vendeur le seul siège capable d'accorder un prix *et*
+d'en exiger le paiement. La ligne et son PDF commitent ensemble ; l'audit part
+dans une seconde transaction. Il n'y a toujours **aucune route d'opérateur**, et
+c'est le refus argumenté de `routes::quotes`, pas un manque.
+
+**Ce qui reste, et c'est une ligne, pas une vague :** aucune ligne de catalogue
+de tour, donc aucun siège ne se voit encore offrir le schéma — `turn::UNSERVED`
+porte l'entrée `QuoteIssue` avec sa raison (une ligne de catalogue déplace
+`cost::DIGEST`, dont la remesure demande un appel de modèle réel) et la
+procédure. Et **aucun pack ne le propose** : `rolepack_sales` est le porteur
+évident, et élargir l'ensemble `proposable` d'un pack est une décision qui
+appartient au commit qui livre l'outil. Tant que ces deux lignes n'existent pas,
+l'entonnoir reste à zéro au milieu **en production**, mais plus par construction
+— `Effects::propose_quote` a ses tests et la table se remplit.
+
+Le module `routes::quotes` n'a pas été relu depuis : son en-tête dit encore
+*« tant que l'effet n'est pas écrit »* et *« la forme exacte est dans le rapport
+de cette vague, à poser dans `agentos_app::effects` »*. C'est faux depuis le
+2026-09-11, et c'est le genre de prose qu'un lecteur croit.
 
 ### 3.4 Les articles — rien ne publie
 
@@ -243,11 +264,25 @@ ne peut produire la ligne.
 (`0100`), neuf outils `content_*`, la mesure sur `duckduckgo_lite` par un siège
 qui porte `Channel::Web`.
 
-**Où ça s'arrête :** `docs/CONTENU.md` § 5 le dit mieux que je ne le ferais —
-`content_drafts.url` est une adresse **constatée** et le `CHECK` de `0100`
-refuse un `published` sans adresse ni date, pour que le mot ne puisse pas être
-menti. Les deux chemins pour lever ça (dépôt GitHub du client ; sous-domaine
-servi par nous) sont écrits et **aucun des deux n'est codé**.
+**Le chemin A a été codé le 2026-09-11** (`0043dde`), et le titre de cette
+section reste vrai au mot près : **rien ne publie**, parce que proposer n'est
+pas publier. `content_repos` (`0102`) tient un dépôt par siège ;
+`POST /v1/content/drafts/{id}/propose` et l'outil `content_drafts_propose`
+poussent l'article dans le dépôt qui sert le site du client et ouvrent une pull
+request, par trois `Action::McpCall` sur le connecteur GitHub déjà au catalogue
+(`create-branch`, `create-or-update-file`, `create-pull-request`), chacun avec
+son verdict de Gate et sa ligne d'audit. Un troisième état, `proposed`, et une
+colonne `review_url` — dont l'adresse est **rebâtie** à partir de nos chaînes et
+d'un entier lu chez GitHub, pour qu'un serveur compromis n'envoie pas le
+relecteur ailleurs.
+
+`content_drafts.url` reste une adresse **constatée** et le `CHECK` de `0100`
+refuse toujours un `published` sans adresse ni date : c'est un humain qui fusionne
+la pull request, et c'est lui qui constate. Le chemin B (sous-domaine servi par
+nous) n'est toujours pas codé, et `docs/CONTENU.md` § 5 dit pourquoi il ne
+devrait pas l'être avant le chemin A. **Aucun appel n'a été fait contre le vrai
+serveur de GitHub** — les tests parlent à un faux monté au port —, donc le
+premier article proposé pour de bon reste à voir.
 
 Et la mesure a son propre plafond, nommé : un seul moteur lisible, parce que
 tous les autres exigent un compte ou le refusent dans leur `robots.txt`
@@ -545,6 +580,13 @@ Pas des priorités : un ordre. La question à chaque place est celle de
 `docs/ROADMAP_CROISSANCE.md` — *190 $/mois vers 1 900 $ en trois à quatre
 mois* — et **rien ne rapporte tant que rien ne tourne**.
 
+> **Relu le 2026-09-12.** Les **trois premières places sont bâties**, toutes les
+> trois dans les vingt-quatre heures qui ont suivi l'écriture de ce document, et
+> chacune porte ci-dessous sa date et ce qui lui reste. La quatrième
+> (signature), la cinquième (recherche de lead) et la suite sont intactes. Ce
+> qui s'est ajouté à la liste entre-temps est en fin de section, sous
+> *Sixième*.
+
 ### Zéro — allumer ce qui existe
 
 Pas un chantier, donc pas une place numérotée : la clé Anthropic, le serveur
@@ -568,6 +610,14 @@ un client conclut qu'il pourrait le faire sans nous.
 passe par là ; et c'est la seule ligne de ce document qui rend les six autres
 mesurables.
 
+**Fait le 2026-09-11** (`14d7b32`), et § 3.3 dit comment : `Effects::propose_quote`
+existe, gaté et audité, sur un `ActionKind::QuoteIssue` neuf. **Ce qui reste est
+une ligne, pas une vague** : aucune ligne de catalogue de tour (elle déplace
+`cost::DIGEST`, dont la remesure demande un appel de modèle réel — `turn::UNSERVED`
+porte la procédure) et aucun pack ne le propose. Donc l'entonnoir est toujours à
+zéro au milieu *en production*, et il ne l'est plus *par construction* : la seule
+chose qui manque est mesurable en une vague, et elle est nommée.
+
 ### Deuxième — publier un article, par le chemin A
 
 **Une vague.** Le chemin A de `docs/CONTENU.md` § 5 : une ligne
@@ -586,6 +636,13 @@ produit à tenir : un site public qui tombe est une panne client.
 sur `visa requirements api` est le chiffre de départ, et c'est lui qu'on fait
 bouger. C'est aussi la démonstration la plus vendable aux cinq SaaS suivants,
 parce que c'est un résultat qu'ils peuvent lire sans nous croire sur parole.
+
+**Fait le 2026-09-11** (`0043dde`), et § 3.4 dit comment : `content_repos`
+(`0102`), `POST /v1/content/drafts/{id}/propose`, l'outil
+`content_drafts_propose`, un état `proposed` et une `review_url` rebâtie.
+**La boucle ne tourne plus à vide** — elle s'arrête sur une pull request ouverte,
+qui est un humain, pas un trou. Ce qui reste : le chemin B, toujours refusé ; et
+le fait qu'aucun appel n'a jamais été fait contre le vrai serveur de GitHub.
 
 ### Troisième — un rôle sur `console_accounts`
 
@@ -631,6 +688,32 @@ qui peut déclencher.
 **n'a jamais tourné une semaine**. Ouvrir le robinet d'entrée avant d'avoir
 mesuré le taux d'ouverture, de réponse et de rendez-vous, c'est ajouter avant
 de mesurer. Cette place est celle de « après la première semaine réelle ».
+
+### Sixième — un siège qui ne travaille plus doit être nommé sans qu'on le cherche
+
+**Ajouté le 2026-09-12**, après avoir parcouru `point-du-jour` pour la première
+fois (`plugin/skills/point-du-jour/SKILL.md`) sur trois sociétés montées à la
+main. Deux tiers de la place ont été pris dans la même marche et sont déjà là :
+`GET /v1/health/company` rend désormais `last_failure_employee_slug`, et les deux
+taux de `GET /v1/outreach/health` valent `null` tant qu'aucune trace n'est
+revenue au lieu d'annoncer une livraison parfaite sur quarante envois muets.
+
+*Ce qui reste, et c'est la place :* **rien ne dit pourquoi une société qui
+travaille n'avance pas.** Le fondateur lit `contacted: 120` d'un côté et
+`sent: 40` de l'autre, et aucune lecture ne joint les deux — le geste doit lui
+apprendre que l'une compte des créneaux dans `outreach_buckets` et l'autre des
+lignes de `messages`, et que l'écart est un fichier exporté et jamais chargé
+chez le prestataire. C'est l'état d'Orizn aujourd'hui, c'est la phrase qui
+déciderait de sa journée, et le produit ne sait pas la dire : il sait rendre les
+deux nombres.
+
+*Pourquoi ici et pas plus haut :* parce que ce n'est **peut-être pas une route**.
+Une huitième étape à l'entonnoir (`outreach_buckets` réservés moins `messages`
+écrits) est un chantier de mesure sur une surface que la console lit déjà, et
+`GET /v1/growth` argumente à sept. La décision à prendre est celle-là, et elle
+demande une semaine de prospection réelle pour savoir si l'écart est une panne
+ou une méthode. Elle passe donc après la cinquième place, qui est la même
+semaine.
 
 ### Et ensuite, dans l'ordre décroissant de ce qu'on en sait
 

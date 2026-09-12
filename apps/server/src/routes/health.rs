@@ -685,7 +685,15 @@ mod tests {
             .and_hms_opt(12, 0, 0)
             .expect("midi existe")
             .and_utc();
-        trace(&h.db, h.a, qui_marche, at - Duration::minutes(30), TURN, None).await;
+        trace(
+            &h.db,
+            h.a,
+            qui_marche,
+            at - Duration::minutes(30),
+            TURN,
+            None,
+        )
+        .await;
         trace(
             &h.db,
             h.a,
