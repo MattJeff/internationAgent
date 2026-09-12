@@ -336,7 +336,7 @@ telle, et le premier client à s'en apercevoir aurait raison de partir.
 |---|---|
 | `migrations/0100_une_question_merite_une_reponse.sql` | les trois tables, leur RLS, et l'argument de l'ajout seul |
 | `migrations/0102_une_pull_request_nest_pas_une_publication.sql` | le dépôt d'un siège, le troisième état, et pourquoi ce n'est pas `employee_resources` |
-| `migrations/0105_un_site_nest_pas_un_expediteur.sql` | le site où l'on publie, et pourquoi ce n'est pas le domaine d'où l'on envoie |
+| `migrations/0106_un_site_nest_pas_un_expediteur.sql` | le site où l'on publie, et pourquoi ce n'est pas le domaine d'où l'on envoie |
 | `crates/app/src/content.rs` | la mesure, le scan, le brief, la proposition, et les limites de chacun |
 | `apps/server/src/routes/content.rs` | les douze routes, et pourquoi la mesure comme la proposition nomment un siège |
 | `crates/app/src/mcp_tools/contenu.rs` | les douze outils, un par route |
