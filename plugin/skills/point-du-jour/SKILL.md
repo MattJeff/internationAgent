@@ -59,9 +59,10 @@ j'y arrive » plutôt qu'à « combien ». Elle rend les sept étapes qui mènen
 facture réglée avec leurs taux de passage, la recette, le coût du modèle, la cible et un
 **`verdict`** (`ahead`, `on_track`, `behind`, `no_target`).
 
-N'appelle **pas** `outreach_summary_get`, ni `pnl_get`, ni `invoices_list` : les trois sont dans
-celui-ci, sur une seule fenêtre, et aucun des trois ne porte de verdict. Ils sont des suites, pas
-des étapes — voir §5.
+N'appelle **pas** `outreach_summary_get`, ni `pnl_get`, ni `invoices_list` : ce qu'ils ont
+d'utile ici est dans celui-ci, sur une seule fenêtre, et aucun des trois ne porte de verdict. Ils
+sont des suites, pas des étapes — voir §5, qui dit aussi les deux chiffres que `growth_get` ne
+porte pas.
 
 Les trois pièges de cette réponse, et ils sont dans l'ordre où on les commet :
 
@@ -125,7 +126,7 @@ fondateur a posé la question, jamais à tout hasard.
 |---|---|
 | pourquoi ça coûte ce que ça coûte | `pnl_get`, puis `usage_get` — le détail siège par siège |
 | quelle facture relancer | `invoices_list` en `state=outstanding` — `growth_get` donne le total dû, pas les lignes |
-| si quelqu'un a pris rendez-vous | `outreach_summary_get` — **`booked` n'est dans aucune étape de l'entonnoir**, c'est le seul chiffre de la prospection que `growth_get` ne porte pas |
+| si quelqu'un a pris rendez-vous, ou combien d'adresses ont été retirées | `outreach_summary_get` — **`booked` et `suppressed` ne sont dans aucune étape de l'entonnoir**, ce sont les deux chiffres de la prospection que `growth_get` ne porte pas |
 | pourquoi un siège nommé au §1 ne travaille pas | `initiatives_get` sur ce siège |
 
 ## 6. La sortie
