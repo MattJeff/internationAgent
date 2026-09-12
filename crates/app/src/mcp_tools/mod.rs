@@ -537,6 +537,99 @@ mod tests {
         );
     }
 
+    /// **La règle de chaînage, tenue plutôt qu'écrite.**
+    ///
+    /// L'en-tête de ce module la pose : *« toute description qui réclame un
+    /// identifiant nomme l'outil qui le fournit »*. Rien ne vérifiait que
+    /// l'outil nommé existe, et le 2026-09-12 il y en avait un qui n'existait
+    /// pas : `content_repos_set` renvoyait à `integrations_list` pour trouver
+    /// le handle d'un branchement — la vraie ligne est
+    /// `integrations_servers_list`. Une description qui envoie un modèle vers
+    /// un outil absent est pire qu'une description muette : elle lui fait
+    /// perdre un appel, puis la confiance dans la table.
+    ///
+    /// Ce qui est cherché est étroit exprès : un nom entre accents graves qui
+    /// passe [`name_is_domain_then_verb`], c'est-à-dire dont le dernier segment
+    /// est un verbe de [`VERBS`]. Un code d'erreur (`no_repo`, `not_a_draft`),
+    /// une colonne (`review_url`, `published_at`) ou une valeur d'énumération
+    /// (`duckduckgo_lite`) n'en portent pas, donc ils ne sont pas regardés.
+    #[test]
+    fn every_tool_a_description_names_exists() {
+        let all = registry();
+        let known: std::collections::BTreeSet<&str> = all.iter().map(|tool| tool.name).collect();
+        let domains = domains_of(&all);
+        for tool in &all {
+            // Le schéma compte autant que la description : c'est là que vivent
+            // la moitié des « tel que X le rend ».
+            let prose = format!("{} {}", tool.description, tool.schema);
+            for cited in backticked_tool_names(&prose, &domains) {
+                assert!(
+                    known.contains(cited.as_str()),
+                    "{} renvoie à `{cited}`, qui n'est pas un outil de cette table",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    /// Les premiers segments que porte au moins un outil de la table.
+    fn domains_of(all: &[ToolDef]) -> std::collections::BTreeSet<&str> {
+        all.iter()
+            .filter_map(|tool| tool.name.split('_').next())
+            .collect()
+    }
+
+    /// Les noms entre accents graves qui ressemblent à un outil de cette table :
+    /// un premier segment que la table porte, un dernier qui est un verbe.
+    ///
+    /// Les deux conditions sont nécessaires. Sans le domaine, `payment_create`
+    /// — un `ActionKind`, pas un outil — passerait pour un nom manquant ; sans
+    /// le verbe, `policy_widens`, qui est un code d'erreur, passerait aussi.
+    fn backticked_tool_names(
+        prose: &str,
+        domains: &std::collections::BTreeSet<&str>,
+    ) -> Vec<String> {
+        prose
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|token| {
+                token
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    && name_is_domain_then_verb(token)
+                    && token
+                        .split('_')
+                        .next()
+                        .is_some_and(|domain| domains.contains(domain))
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// **La garde, désarmée.** Le nom qui manquait est reconnu comme un nom
+    /// d'outil, et ni un code d'erreur ni un `ActionKind` ne le sont.
+    #[test]
+    fn the_citation_guard_bites_on_the_name_that_did_not_exist() {
+        let all = registry();
+        let domains = domains_of(&all);
+        assert_eq!(
+            backticked_tool_names("le handle que `integrations_list` rend", &domains),
+            ["integrations_list"]
+        );
+        // Ce qui ne doit pas être pris pour un outil : un code, une colonne,
+        // une valeur d'énumération, un `ActionKind`, un outil MCP d'un tiers.
+        assert!(
+            backticked_tool_names(
+                "`no_repo`, `not_a_draft`, `review_url`, `published_at`, `duckduckgo_lite`, \
+                 `create_or_update_file`, `allowed_mcp_tools`, `dry_run`, `payment_create`, \
+                 `policy_widens`",
+                &domains
+            )
+            .is_empty()
+        );
+    }
+
     /// Un nom d'outil est lu par un modèle et tapé par un humain.
     #[test]
     fn every_name_is_lower_snake_case() {

@@ -289,7 +289,7 @@ pub fn tools() -> Vec<ToolDef> {
             "content_repos_set",
             "Attacher un dépôt à un siège, ou remplacer le sien",
             "Dit où ce siège pousse ses articles. **Remplace la ligne en entier** : les quatre champs sont \
-             obligatoires à chaque appel. `server` est le handle du branchement, celui qu'`integrations_list` \
+             obligatoires à chaque appel. `server` est le handle du branchement, celui qu'`integrations_servers_list` \
              rend — pas le nom du connecteur — et rien n'est écrit si aucun branchement ne porte ce handle. \
              `branch` est la branche **qui sert le site**, c'est-à-dire la cible de la pull request : celle \
              qui porte l'article est créée par `content_drafts_propose` et n'a pas à être configurée.",
@@ -304,7 +304,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "server": {
                         "type": "string",
-                        "description": "Le handle du branchement GitHub de ce locataire, tel qu'`integrations_list` le rend."
+                        "description": "Le handle du branchement GitHub de ce locataire, tel qu'`integrations_servers_list` le rend."
                     },
                     "repo": {
                         "type": "string",
