@@ -200,12 +200,99 @@ au navigateur, sous `max_new_contacts_per_day` relu dans les quatre couches de
 politique, et écrit des `contacts`. Le verbe existe côté modèle :
 `find_prospects`, l'un des treize de `turn.rs`.
 
-**Où ça s'arrête :** aucun des 136 outils MCP ne l'expose. Les deux seules
-lignes du domaine prospect sont `prospects_segments_list` et `prospects_import`
-— un CSV. Un humain au terminal peut donc *verser* une liste, jamais *en
-chercher une*. Et rien n'enrichit : pas de vérification d'adresse, pas de
-données firmographiques, `prospects.rs` pose `UNKNOWN_COUNTRY` (`ZZ`) parce
-qu'*une page ne dit pas où une société est immatriculée et ceci ne devine pas*.
+**Fait le 2026-09-12** : `POST /v1/prospects/discover` et l'outil
+`prospects_discover` exposent cet effet et rien d'autre — un siège nommé, la
+Gate qui statue sur un `BrowserRead`, le plafond relu par l'effet, et le même
+`prospects::discover` qui écrit, donc pas de second chemin d'écriture. Un humain
+au terminal peut désormais *chercher* une liste et plus seulement en *verser*
+une.
+
+**Où ça s'arrête toujours :** **rien n'enrichit.** Pas de vérification
+d'adresse, pas de données firmographiques, `prospects.rs` pose
+`UNKNOWN_COUNTRY` (`ZZ`) parce qu'*une page ne dit pas où une société est
+immatriculée et ceci ne devine pas*. Une liste découverte est donc une liste
+qu'on ne peut pas segmenter par pays. Les trois chemins possibles et celui qui
+est recommandé sont en § 3.1 bis ; aucun n'est codé.
+
+### 3.1 bis L'enrichissement — trois chemins, un recommandé, aucun codé
+
+Écrit le 2026-09-12, en ouvrant la recherche de lead. La question est : *une
+liste de prospects sans pays ni vérification est une liste qu'on ne peut pas
+segmenter et dont la moitié rebondit* — alors est-ce qu'enrichir est un
+chantier à part, un effet de plus, ou quelque chose que la recherche doit faire
+en même temps ?
+
+**Réponse : un chantier à part, et ce n'est pas le prochain.** Voici les
+chemins mesurés, dans l'ordre où ils se présentent.
+
+#### Chemin A — enrichir en Rust, pendant la recherche, depuis la page
+
+Déduire le pays du ccTLD (`.at` → `AT`), le site du domaine de l'adresse, le
+rôle de la partie locale (`sales@`, `ceo@`).
+
+**Rejeté, et c'est une mesure qui le rejette, pas un goût.** `prospects.rs` a
+compté sur les vraies listes du fondateur : **338 des 1 552 lignes qui portent
+les deux ont un site et une boîte sur deux domaines différents** — une
+association dont le site est `reisehaus.at` et la boîte chez `wkv.at`. Donc
+« le domaine de la boîte est le site » est faux à 22 % sur les seules données
+qu'on ait. Le ccTLD est pire : il est muet sur tout `.com`, c'est-à-dire sur la
+majorité. Et les deux contredisent frontalement la ligne la plus structurante du
+module — *« la page n'a pas le droit d'être lue **à propos** »* — qui est ce qui
+fait qu'une recherche **ne salit pas le tour** là où une lecture de page le
+salit. Un enrichisseur qui lit une fiche pour en tirer une taille d'entreprise
+rouvre ce contrat-là, et le rendement est une devinette.
+
+#### Chemin B — vérifier plutôt qu'enrichir
+
+Un MX sur le domaine de chaque adresse, avant l'écriture ou en lot après.
+
+C'est **du logiciel, pas une ressource** : une dépendance (`hickory-resolver`,
+qui serait la première du dépôt à parler DNS — aujourd'hui la seule résolution
+est `tokio::net::lookup_host` dans `mcp::resolve_and_vet`, un contrôle SSRF qui
+ne rend que des `IpAddr`, et `sending_domain` délègue toute lecture DNS au
+fournisseur). Zéro dépense, zéro compte.
+
+Et c'est le seul des trois qui vise le vrai coût : une liste qui rebondit ne
+coûte pas des contacts perdus, elle brûle **le domaine d'envoi**, et
+`outreach_health_get` ne le voit qu'après.
+
+**Recommandé — et pas maintenant.** La raison est celle que § 7 oppose déjà à
+la recherche elle-même : *ouvrir le robinet avant d'avoir mesuré, c'est ajouter
+avant de mesurer*. On n'a **aucun taux de rebond d'une semaine réelle** — les
+deux taux de `GET /v1/outreach/health` valent `null` tant que rien n'est
+revenu. Construire un vérificateur avant de connaître le nombre qu'il doit
+faire baisser, c'est construire contre une intuition. La semaine de prospection
+réelle est la même que celle de la cinquième place ; ce chantier la suit.
+
+#### Chemin C — acheter
+
+Deux entrées du catalogue le font déjà, et **elles sont nommées ici sans être
+appelées** : `lumail` porte un outil `verify_email`, `exa` sait lire le web
+public. Les deux demandent une clé, donc un compte, donc une dépense — et le
+plancher de `lumail` est `Destructive`, ce qui veut dire qu'un humain approuve
+chaque appel de toute façon. Hors catalogue, les fournisseurs de firmographie
+sont déjà refusés et argumentés (`docs/CATALOGUE.md` : Apollo pour ses envois
+sans lecture des désabonnements, HubSpot et ZoomInfo pour un OAuth qui ne dit
+pas s'il vaut pour leur serveur MCP). **Le jour où B ne suffit pas, pas avant.**
+
+#### Le chemin zéro, qui est ce que je bâtirais en premier
+
+`import` laisse l'opérateur **affirmer** un pays (`--country PH` sur la liste
+DMW) ; la recherche ne le laisse pas — `scan_directory` écrit `ZZ` en dur. Or un
+annuaire est presque toujours national : la chambre de commerce autrichienne
+liste des sociétés autrichiennes. Laisser passer un `country` à la recherche
+comme on le passe à l'import, c'est **une demi-journée**, ça ne devine rien —
+c'est un opérateur qui affirme, exactement comme à l'import — et ça règle la
+moitié du problème de segmentation sans une ligne d'enrichissement.
+
+**Pourquoi ce n'est pas fait aujourd'hui :** ça élargit
+`Effects::discover_prospects`, que le **modèle** appelle aussi par
+`find_prospects`. Un opérateur qui affirme un pays est une affirmation ; un
+modèle qui en choisit un est une devinette, et c'est précisément ce que `0033`
+refuse. Le chantier n'est donc pas une plomberie, c'est une décision sur *qui a
+le droit d'affirmer quoi* — vraisemblablement : le champ existe sur la route,
+pas dans le catalogue de tour. Elle se prend, elle ne se glisse pas dans un
+chantier qui livre autre chose.
 
 ### 3.2 La campagne — la séquence promet, elle n'envoie pas
 
