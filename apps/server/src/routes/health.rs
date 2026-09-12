@@ -249,6 +249,7 @@ const COUNTS_SQL: &str = "\
 /// Le dernier échec, sans borne : une société arrêtée depuis quatre jours doit
 /// pouvoir nommer ce qui l'a arrêtée même si le premier refus est plus vieux
 /// que la fenêtre du jour.
+///
 /// La jointure sur `employees` est ici plutôt que dans une seconde requête :
 /// deux lectures rendraient le siège d'un *autre* échec le jour où une ligne
 /// arrive entre les deux, et les deux tables portent la même RLS.
