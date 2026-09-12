@@ -1140,7 +1140,7 @@ mod tests {
         );
 
         // **Et la Gate passée, un outil que personne n'a déclaré n'est pas une
-        // panne chez le client.** La politique nomme maintenant les trois
+        // panne chez le client.** La politique nomme maintenant les quatre
         // outils, donc le refus ne peut plus venir d'elle ; ce qui refuse est
         // `agentos_app::mcp`, avant le transport, parce que la flotte de ce
         // harnais ne sert rien sous ce handle. Jusqu'au 2026-09-12 la réponse
@@ -1152,6 +1152,7 @@ mod tests {
             agentos_store::policy::Scope::Tenant,
             &agentos_domain::policy::PolicyLimits {
                 allowed_mcp_tools: [
+                    "get-file-contents",
                     "create-branch",
                     "create-or-update-file",
                     "create-pull-request",
