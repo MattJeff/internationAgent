@@ -112,6 +112,18 @@ Posée à la main, avant d'écrire une ligne de ce module, sur
 C'est le chiffre de départ, et c'est exactement ce que la boucle ci-dessous sert
 à faire bouger.
 
+### La même mesure, par la boucle, le 2026-09-12
+
+Rejouée le lendemain sur la même question et par le produit cette fois —
+`content_questions_measure`, un siège, le vrai moteur : `travel-buddy.ai`,
+`visadb.io`, puis **`visa.orizn.app` au rang 3**. Un cran plus bas qu'à la main
+la veille, sur une page qui bouge d'un jour à l'autre : c'est précisément
+pourquoi `content_citations` empile et ne réécrit pas, et pourquoi une mesure
+isolée ne dit rien.
+
+Et c'est cette marche-là qui a trouvé qu'une ligne d'hôte portant un espace dans
+son chemin faisait perdre un rang de plus — voir § 7.
+
 ---
 
 ## 3. La boucle, de bout en bout
@@ -180,7 +192,28 @@ GET /v1/content/briefs?question_id={id}
 # 4. l'employé écrit, et le range
 POST /v1/content/drafts   { "question_id": "…", "title": "…", "body": "…" }
 
-# 4bis. le dépôt qui sert le site du client, attaché à un siège (une fois)
+# 4bis. ce qu'il faut avoir posé UNE FOIS avant la première proposition.
+#       Les trois premières lignes ne se devinent pas, et c'est ce qui a
+#       arrêté la première marche de bout en bout, le 2026-09-12.
+POST /v1/mcp/connect            { "connector": "github", "server": "github", … }
+POST /v1/mcp/servers/github/discover
+→ chaque outil avec son `digest` : c'est ce qu'un humain lit avant d'accorder.
+PUT  /v1/mcp/servers/github/tools/{create-branch|create-or-update-file|create-pull-request}
+  { "risk": "write", "digest": "…" }
+→ SANS CES TROIS LIGNES, un outil est classé destructif (il n'est déclaré par
+  personne), la Gate le refuse avant le transport, et la proposition rend
+  409 `tool_unavailable`.
+
+# …et la politique du siège doit nommer les trois outils. Ce n'est PAS
+# `policy_role_set` : ajouter un outil à une allowlist est un élargissement,
+# qu'une clé de locataire ne peut pas faire (409 `policy_widens`). C'est
+# l'opérateur, sur son propre DATABASE_URL :
+#   agentos-server policy install --tenant <uuid> --role <rôle> <couche.json>
+# et le plafond de la plateforme doit les nommer aussi — la Gate intersecte,
+# donc un outil absent de `docs/orizn-ceiling.json` est inatteignable même
+# nommé par le rôle.
+
+# 4ter. le dépôt qui sert le site du client, attaché à un siège (une fois)
 PUT  /v1/content/repos/{employee_id}
   { "server": "github", "repo": "orizn/site",
     "branch": "main", "folder": "content/blog" }
@@ -233,6 +266,13 @@ sur une branche à lui, et une pull request demande à une personne de le lire.
   la Gate savait déjà statuer là-dessus, pour un siège nommé, avec sa ligne
   d'`audit_log`. Un siège dont la politique ne nomme pas les trois outils
   n'ouvre rien, et le refus arrive avant que quoi que ce soit sorte.
+* **Et un quatrième verrou, qui n'est pas la Gate** : `agentos_app::mcp`
+  classe *destructif* tout outil qu'aucune déclaration ne couvre, et refuse un
+  destructif sans approbation — donc les trois outils doivent avoir été
+  déclarés (`PUT /v1/mcp/servers/{server}/tools/{tool}`, § 4) même quand la
+  politique les nomme. Les deux verrous sont indépendants et se lisent
+  différemment : la politique manquante est un 403 `no_rule`, la déclaration
+  manquante un 409 `tool_unavailable`.
 * **La relecture humaine est la pull request**, et rien n'a été inventé à côté.
   Ce dépôt ne sait pas fusionner.
 * **`proposed` n'est pas `published`.** Le brouillon passe à `proposed` et porte
@@ -283,3 +323,121 @@ telle, et le premier client à s'en apercevoir aurait raison de partir.
 | `apps/server/src/routes/content.rs` | les douze routes, et pourquoi la mesure comme la proposition nomment un siège |
 | `crates/app/src/mcp_tools/contenu.rs` | les douze outils, un par route |
 | `docs/ROADMAP_CROISSANCE.md` § 2.1 | pourquoi ce levier passe devant les autres |
+
+---
+
+## 7. La marche de bout en bout du 2026-09-12, et ce qu'elle a trouvé
+
+La boucle n'avait jamais été parcourue d'un bout à l'autre depuis un terminal.
+Elle l'a été ce jour-là, sur une instance locale, contre le **vrai**
+`lite.duckduckgo.com` pour la mesure et contre un **faux serveur MCP de GitHub**
+monté pour l'occasion — HTTP/1.1 sur le loopback, corps JSON-RPC, un dépôt en
+mémoire, `server/discover` répondu en `-32601` comme le font les SDK de
+référence. Aucun vrai dépôt n'a été touché et aucun compte n'a été créé.
+
+**Les sept étapes passent.** Question → mesure → citations → brief → brouillon →
+pull request chez le client → adresse constatée. Le fichier arrive au bon
+chemin, sur une branche à lui, avec son en-tête ; le brouillon sort `proposed`
+et pas `published`.
+
+### Ce qui a cassé, et qui est réparé
+
+* **La mesure inventait un concurrent et nous coûtait un rang.** Sur « how do I
+  check visa requirements by API », le moteur affichait un résultat comme
+  `zylalabs.com/api-marketplace/top-search/visa requirements` — la requête
+  affichée met un espace dans le chemin. `display_host` refusait toute ligne
+  portant un blanc, l'hôte n'était pas lu, le résultat se refermait sans nom, et
+  `visa.orizn.app` sortait **4ᵉ au lieu de 3ᵉ**, avec une chaîne vide en
+  troisième concurrent — qui remontait telle quelle dans l'`outrank` du brief.
+  Le blanc se cherche maintenant avant la première barre, pas sur la ligne
+  entière.
+* **Une déclaration d'outil manquante accusait GitHub.** Un outil que
+  `integrations_tools_declare` n'a pas classé est destructif par défaut et refusé
+  *avant le transport* ; la route rendait « the repository host did not answer ».
+  C'est maintenant un 409 `tool_unavailable` qui nomme les deux outils à
+  rejouer.
+* **`content_repos_set` renvoyait à `integrations_list`, qui n'existe pas** (la
+  vraie ligne est `integrations_servers_list`). Un test relit toute la table
+  d'outils et refuse un nom cité qui n'en est pas un ; il en a trouvé un second
+  tout seul, dans un autre domaine.
+* **La carte d'entrée (`INSTRUCTIONS`) ne parlait pas du contenu.** Elle portait
+  quatre enchaînements et aucun n'était celui-ci — donc un modèle qui lit
+  `tools/list` et rien d'autre ne pouvait pas mener la boucle. Il y en a cinq, et
+  un test refuse que la carte nomme un outil absent.
+
+### Ce que la marche a confirmé sans le réparer
+
+* **Le brief n'a pas de table, et ça tient.** `content_citations` porte tout ce
+  que `brief` lit (`excerpt`, `rank`, `competitors`), et `content_citations_list`
+  les rend — donc le brief d'une mesure de mars se recalcule en mars prochain.
+  Une seule nuance : `GET /v1/content/briefs` bâtit sur la **dernière** mesure et
+  ne sait pas viser une mesure précise. Recalculer un ancien brief se fait à la
+  main depuis la ligne, pas par la route. Une table serait toujours une
+  deuxième vérité ; un `citation_id` optionnel sur la route serait, lui, une
+  ligne — le jour où quelqu'un le demande.
+* **Republier un article corrigé échoue toujours**, et le chemin exact est :
+  proposer, faire fusionner, puis proposer un second brouillon **du même titre**.
+  `file_stem` rend le même chemin, la nouvelle branche part de `main` qui porte
+  désormais le fichier, et `create-or-update-file` répond `isError` faute de
+  `sha`. Mesuré : `github_refused` sur le deuxième des trois appels, avec une
+  branche orpheline laissée chez le client. Le coût de la réparation est un
+  quatrième appel (`get-file-contents`) et un quatrième verdict de la Gate ; ce
+  n'est pas une vague, c'est une demi-journée, et elle n'est due que le jour où
+  un article revient corrigé de relecture.
+
+### Ce qui manque encore pour qu'un article du client soit réellement en ligne
+
+1. **Personne n'est prévenu quand un humain a fusionné.** C'est le trou nommé au
+   § 5, et la marche le confirme : entre `proposed` et `published`, il n'y a que
+   quelqu'un qui pense à regarder la pull request. Le chaînon est un webhook
+   GitHub `pull_request.closed`, et **c'est une vague, pas une ligne** — le
+   détail est au § 8.
+2. **La politique d'un siège ne s'élargit pas depuis le terminal.** Ajouter les
+   trois outils de GitHub à une allowlist est un élargissement : `policy_role_set`
+   répond 409 `policy_widens`, et il faut `agentos-server policy install` sur le
+   `DATABASE_URL` de l'opérateur — **deux fois**, parce que le plafond de la
+   plateforme (`docs/orizn-ceiling.json`) porte `allowed_mcp_tools: []` et que la
+   Gate intersecte. Tant que c'est vrai, aucun client ne peut ouvrir sa première
+   pull request sans que l'opérateur touche la base. Le fichier livré devrait
+   nommer les trois outils.
+3. **`tenant_domains` est la liste des domaines d'envoi**, et c'est elle que la
+   mesure interroge pour savoir ce que « nous » veut dire (`our_domains`). Un
+   client dont le site vit sur un domaine que ses courriels n'utilisent pas est
+   mesuré comme jamais cité. Pour Orizn, le site est `visa.orizn.app` : la ligne
+   `orizn.app` doit être dans `tenant_domains`, sinon la boucle mesure juste et
+   répond faux.
+
+---
+
+## 8. Le webhook de fusion : ce qu'il coûte, et ce qu'il achète
+
+Le chaînon manquant du § 7.1, chiffré plutôt que supposé.
+
+**Ce qui existe déjà** : `POST /v1/webhooks/{path}` (`routes::webhooks`) lit le
+corps brut avant toute désérialisation, vérifie la signature dessus et écrit une
+ligne ; `webhook_endpoints` (`migrations/0053`) tient un secret par locataire et
+par fournisseur, derrière un chemin opaque ; `POST /v1/platform/webhooks` émet
+l'adresse à coller. GitHub signe `X-Hub-Signature-256: sha256=<hex>` en
+HMAC-SHA256 sur le corps brut — **exactement** le schéma de Smartlead, déjà
+compilé.
+
+**Ce qu'il faudrait** : une migration qui élargit
+`webhook_endpoints_provider_is_wired` à `'github'` (0081 est le modèle, six
+lignes) ; une branche de vérification dans `routes::webhooks` (une vingtaine) ;
+et — c'est la moitié qui coûte — **un lecteur**, parce que 0053 interdit de
+nommer un fournisseur dont aucun ingest ne lit les livraisons.
+
+**Et surtout, ce que le lecteur peut écrire, qui est moins qu'on ne croit.** Une
+pull request fusionnée ne dit pas à quelle adresse l'article est en ligne : le
+générateur du client décide de l'URL, et il la publie quand son déploiement
+passe. Donc le webhook **ne peut pas** remplir `content_drafts.url` — le § 5
+tient toujours, `url` est un constat. Ce qu'il peut faire est réveiller
+quelqu'un : une ligne de `work_items` (`migrations/0061`) sur le siège qui a
+proposé, « la demande est fusionnée, va constater l'adresse ». Et ça demande de
+retrouver le brouillon depuis la livraison, c'est-à-dire un `SELECT` sur
+`content_drafts.review_url` — qui est la colonne indexée pour ça, et la seule
+chose de tout ce chantier qui existe déjà telle quelle.
+
+**Verdict** : une vague, pas une ligne, et son gain est un rappel — pas une
+publication. Ce qui achète plus pour moins cher est de mettre le
+`review_url` sous les yeux de qui décide, ce que `content_drafts_list` fait déjà.

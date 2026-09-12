@@ -130,7 +130,7 @@ Les noms se lisent `domaine_objet_verbe`, verbe en dernier : `list` rend \
 plusieurs lignes, `get` une seule, `set` remplace le document entier — un champ \
 omis est effacé, jamais conservé.
 
-Quatre enchaînements couvrent presque tout :
+Cinq enchaînements couvrent presque tout :
 1. Monter la société — `company_create`, `model_connect`, puis `initiatives_set` \
 siège par siège ; sans objectif ni cadence, un employé ne se réveille jamais seul.
 2. Faire partir du courrier — `domains_register`, `domains_dns_publish`, \
@@ -145,6 +145,19 @@ avec un jeton de la Gate.
 4. Reprendre la main — `approvals_list`, puis `approvals_approve` ou \
 `approvals_deny` ; `halt_place` arrête toute la société, `halt_release` la \
 relance.
+5. Être cité quand on demande à un modèle ce que cette société vend — \
+`content_questions_add`, puis `content_questions_measure` (elle nomme un siège, \
+dont la politique doit porter le canal `web`), puis `content_briefs_get`, qui \
+rend ce qu'il faut couvrir et jamais de prose : l'article, c'est vous qui \
+l'écrivez, et `content_drafts_add` qui le range. Le sortir d'ici demande trois \
+gestes **avant** `content_drafts_propose`, et aucun ne se devine : brancher le \
+GitHub du client (`integrations_connect`), lire ses outils \
+(`integrations_discover`), puis **déclarer** `create-branch`, \
+`create-or-update-file` et `create-pull-request` en `write` avec leur `digest` \
+(`integrations_tools_declare`) — un outil non déclaré est traité comme \
+destructif et refusé. Ensuite `content_repos_set`, et `content_drafts_propose` \
+ouvre une pull request. **Ça ne publie pas** : une personne fusionne, et c'est \
+`content_drafts_amend` avec l'`url` constatée qui l'enregistre.
 
 Un refus n'est pas une panne : `pending_approval` veut dire qu'un humain doit \
 valider, `halted` que la société est à l'arrêt, `daily_limit` qu'un plafond est \
@@ -1126,6 +1139,46 @@ mod tests {
             Risk::Write,
         );
         assert!(loop_tool.path.starts_with(PATH));
+    }
+
+    /// **La carte d'entrée ne nomme que des outils qui existent.**
+    ///
+    /// [`INSTRUCTIONS`] est le seul texte qu'un modèle lit *avant* la table, et
+    /// il en cite une vingtaine de lignes par leur nom. Un nom faux ici coûte
+    /// plus cher que dans une description : il est lu en premier, par tout le
+    /// monde, et il est la première chose qu'un client essaie. C'est la même
+    /// garde qu'`every_tool_a_description_names_exists` côté `agentos_app`, un
+    /// étage plus haut — sauf qu'ici le texte est en prose et que le filtre peut
+    /// donc être exact : tout ce qui est entre accents graves et ressemble à un
+    /// nom d'outil (`domaine_..._verbe`) doit être dans le registre.
+    #[test]
+    fn every_tool_the_entry_map_names_exists() {
+        let known: std::collections::BTreeSet<&str> =
+            registry().iter().map(|line| line.name).collect();
+        let cited: Vec<&str> = INSTRUCTIONS
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|token| {
+                token.contains('_')
+                    && token
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    && known
+                        .iter()
+                        .any(|name| name.split('_').next() == token.split('_').next())
+            })
+            .collect();
+        assert!(
+            cited.len() > 15,
+            "la carte ne nomme plus d'outils : {cited:?}"
+        );
+        for name in cited {
+            assert!(
+                known.contains(name),
+                "la carte d'entrée envoie vers `{name}`, qui n'est pas un outil de cette table"
+            );
+        }
     }
 
     // -- le transport -------------------------------------------------------
