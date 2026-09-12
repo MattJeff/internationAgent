@@ -67,7 +67,7 @@ cannot be re-run*.
 
 | ce qu'il a dit | verdict | où ça s'arrête, en un mot |
 |---|---|---|
-| recherche de lead | **à moitié** | l'effet existe, aucun outil ne l'expose |
+| recherche de lead | **à moitié** | exposée le 2026-09-12 ; rien n'enrichit ce qu'elle trouve |
 | relève du courrier | **couvert** | — |
 | lancement de campagne | **à moitié** | la séquence promet, elle n'envoie pas elle-même |
 | publicité Google | **pas du tout** | pas une ligne |
@@ -193,7 +193,7 @@ sortie par le proxy du locataire (`0098`), vue en direct en SSE. Outils
 C'est la section qui vaut le document. Chaque ligne nomme l'endroit exact où ça
 s'arrête.
 
-### 3.1 La recherche de lead — l'effet existe, aucun outil ne l'expose
+### 3.1 La recherche de lead — exposée le 2026-09-12, et rien n'enrichit encore
 
 `Effects::discover_prospects` (`crates/app/src/effects.rs:2249`) lit un annuaire
 au navigateur, sous `max_new_contacts_per_day` relu dans les quatre couches de
@@ -767,8 +767,12 @@ qui peut déclencher.
 
 ### Cinquième — exposer la recherche de lead
 
-**Un jour d'agent.** Un outil MCP sur `discover_prospects`, sous le plafond
-`max_new_contacts_per_day` que l'effet relit déjà.
+**Fait le 2026-09-12.** `POST /v1/prospects/discover` et `prospects_discover`,
+sur l'effet existant, sous le plafond `max_new_contacts_per_day` que l'effet
+relit déjà. **Ce qui reste n'est pas du code, c'est la semaine** : l'argument
+ci-dessous ne disait pas de ne pas construire l'outil, il disait de ne pas
+*ouvrir le robinet* avant d'avoir mesuré. Le robinet a maintenant une poignée ;
+le pack de vente la livre à zéro, et c'est un opérateur qui la tourne.
 
 *Pourquoi cinquième :* le travail est fait à quatre-vingt-dix pour cent, mais
 `ROADMAP_CROISSANCE` § 2.2 a raison — la prospection existe de bout en bout et
