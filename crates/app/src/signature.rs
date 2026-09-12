@@ -474,3 +474,463 @@ pub fn send_tool(server: &Slug) -> McpTool {
         Slug::parse(crate::effects::SEND_ENVELOPE).expect("une constante du module des effets"),
     )
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use agentos_domain::action::McpTool;
+    use agentos_domain::ids::{ApprovalId, TenantId};
+    use agentos_domain::policy::PolicyLimits;
+    use agentos_domain::untrusted::Untrusted;
+    use agentos_providers::ProviderError;
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::effects::{McpCaller, Ports, SEND_ENVELOPE};
+
+    /// Le handle sous lequel ces tests branchent le prestataire.
+    const HANDLE: &str = "docusign";
+
+    /// **Un faux prestataire de signature**, au port plutôt qu'au fil.
+    ///
+    /// `crate::content`'s `FauxGithub` argues the shape and every word applies:
+    /// the protocol is already held by an in-process MCP server in `crate::mcp`'s
+    /// tests, and what is held nowhere is what **we** send — which tool, with
+    /// which arguments, and what is made of the answer.
+    ///
+    /// The one thing it cannot be is faithful. GitHub publishes its tool list to
+    /// an anonymous caller, so `FauxGithub` answers to names that are facts;
+    /// `mcp.docusign.com` answers `403` without a token and there is no account
+    /// here, so this double answers to a name this workspace invented. What it
+    /// proves is the wiring, and `crate::effects::SEND_ENVELOPE` says so at the
+    /// one place somebody would be misled.
+    struct FauxDocuSign {
+        seen: std::sync::Mutex<Vec<(String, Value)>>,
+        /// Le numéro de pli qu'il s'attribue, en texte — pour qu'un test puisse
+        /// en mettre un qui n'est pas un UUID.
+        envelope: String,
+        /// Répondre `isError` : une réponse *réussie* qui dit non.
+        refusing: bool,
+    }
+
+    impl FauxDocuSign {
+        fn new(envelope: &str) -> Arc<Self> {
+            Arc::new(Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+                envelope: envelope.to_owned(),
+                refusing: false,
+            })
+        }
+
+        fn refusing() -> Arc<Self> {
+            Arc::new(Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+                envelope: String::new(),
+                refusing: true,
+            })
+        }
+
+        fn calls(&self) -> Vec<(String, Value)> {
+            self.seen.lock().expect("pas empoisonné").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl McpCaller for FauxDocuSign {
+        async fn call(
+            &self,
+            tool: &McpTool,
+            arguments: &Value,
+        ) -> Result<Untrusted<Value>, ProviderError> {
+            let name = tool.name.as_str().to_owned();
+            self.seen
+                .lock()
+                .expect("pas empoisonné")
+                .push((name.clone(), arguments.clone()));
+            if name != SEND_ENVELOPE {
+                return Err(ProviderError::Terminal {
+                    code: "unknown_tool",
+                });
+            }
+            let text = if self.refusing {
+                "The document could not be read".to_owned()
+            } else {
+                json!({ "envelopeId": self.envelope, "status": "sent" }).to_string()
+            };
+            Ok(Untrusted::new(json!({
+                "content": [{ "type": "text", "text": text }],
+                "isError": self.refusing,
+            })))
+        }
+    }
+
+    fn ports_signing(provider: Arc<FauxDocuSign>) -> Arc<Ports> {
+        Arc::new(Ports {
+            mcp: provider,
+            ..crate::mocks::ports()
+        })
+    }
+
+    async fn db() -> Option<Db> {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!(
+                "SKIP: DATABASE_URL is unset; les tests de signature veulent un vrai Postgres"
+            );
+            return None;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+        Some(db)
+    }
+
+    /// Un locataire, un siège actif, une politique large, et un document dans le
+    /// classeur.
+    ///
+    /// **La politique est délibérément la plus permissive que `PolicyLimits`
+    /// sache écrire.** C'est ce qui fait dire quelque chose au premier test : si
+    /// la signature était escaladée parce qu'un plafond manquait, le test
+    /// passerait pour la mauvaise raison.
+    async fn seed(db: &Db) -> (Principal, String) {
+        let now = Utc::now();
+        let tenant = TenantId::new_v7(now);
+        let employee = EmployeeId::new_v7(now);
+        let label = format!("signe-{}", employee.as_uuid().simple());
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
+            .bind(tenant.as_uuid())
+            .bind(&label)
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, 'lena', 'lena', 'active')",
+        )
+        .bind(employee.as_uuid())
+        .bind(tenant.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert employee");
+        tx.commit().await.expect("commit seed");
+
+        agentos_store::policy::install(
+            db,
+            tenant,
+            agentos_store::policy::Scope::Tenant,
+            &PolicyLimits {
+                allowed_channels: agentos_domain::action::Channel::ALL
+                    .iter()
+                    .copied()
+                    .collect(),
+                allow_credential_change: true,
+                allow_data_delete: true,
+                max_turns_per_day: 50,
+                ..PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("install policy");
+
+        let name = format!("contrat-{}.pdf", employee.as_uuid().simple());
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let bytes = b"%PDF-1.4 le contrat".to_vec();
+        files::deposit(
+            &mut tx,
+            &name,
+            "application/pdf",
+            &bytes,
+            &crate::files::digest_of(&bytes),
+        )
+        .await
+        .expect("deposit the document");
+        tx.commit().await.expect("commit the classeur");
+
+        (Principal::employee(tenant, employee), name)
+    }
+
+    fn asked(document: &str) -> Request {
+        Request {
+            employee_id: EmployeeId::new_v7(Utc::now()),
+            title: "abonnement annuel Orizn, 12 000 EUR".to_owned(),
+            signatory: "acheteur@client.example".to_owned(),
+            server: HANDLE.to_owned(),
+            document_name: document.to_owned(),
+        }
+    }
+
+    async fn nonce_of(db: &Db, tenant: TenantId, id: ApprovalId) -> String {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let nonce: String =
+            sqlx::query_scalar("SELECT action->>'nonce' FROM approvals WHERE id = $1")
+                .bind(id.as_uuid())
+                .fetch_one(&mut **tx)
+                .await
+                .expect("the approval carries a nonce");
+        tx.rollback().await.expect("rollback");
+        nonce
+    }
+
+    async fn drop_tenant(db: &Db, tenant: TenantId) {
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("DELETE FROM tenants WHERE id = $1")
+            .bind(tenant.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .expect("delete tenant");
+        tx.commit().await.expect("commit");
+    }
+
+    /// **Promesse 1 : un siège ne signe jamais seul.**
+    ///
+    /// La politique du locataire est la plus large que ce produit sache écrire —
+    /// tous les canaux, les secrets, l'effacement — et la signature monte quand
+    /// même chez un humain. C'est le plus petit test qui retombe si quelqu'un
+    /// ajoute une condition au bras de `evaluate`, un seuil, ou un champ de
+    /// `PolicyLimits` qui laisserait passer : il n'y a rien à élargir ici pour
+    /// le faire échouer autrement.
+    #[tokio::test]
+    async fn une_signature_monte_toujours_chez_un_humain() {
+        let Some(db) = db().await else { return };
+        let (principal, document) = seed(&db).await;
+
+        let envelope = prepare(&db, &gate(&db), &principal, &asked(&document))
+            .await
+            .expect("le pli est préparé");
+
+        assert!(
+            envelope.sent_at.is_none() && envelope.provider_envelope_id.is_none(),
+            "préparer a envoyé quelque chose"
+        );
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let state: String = sqlx::query_scalar("SELECT state FROM approvals WHERE id = $1")
+            .bind(envelope.approval_id)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("l'approbation existe");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(state, "pending", "la décision n'attend personne");
+
+        drop_tenant(&db, principal.tenant_id).await;
+    }
+
+    /// **Promesses 3 et 4 : rien ne part sans la Gate, et ce qui part revient
+    /// avec le numéro du prestataire.**
+    ///
+    /// Le jeton ne se fabrique pas : `Authorized<ContractSign>` ne sort que de
+    /// `redeem_approval`, donc ce test *doit* passer par l'approbation pour
+    /// pouvoir appeler `send`. C'est la preuve à la compilation, rejouée à
+    /// l'exécution.
+    #[tokio::test]
+    async fn le_pli_part_sur_la_decision_humaine_et_note_le_numero() {
+        let Some(db) = db().await else { return };
+        let (principal, document) = seed(&db).await;
+        let gate = gate(&db);
+
+        let envelope = prepare(&db, &gate, &principal, &asked(&document))
+            .await
+            .expect("préparé");
+        let approval = ApprovalId::from_uuid(envelope.approval_id);
+        let nonce = nonce_of(&db, principal.tenant_id, approval).await;
+
+        let ok = gate
+            .redeem_approval(
+                &principal,
+                approval,
+                &nonce,
+                ContractSign {
+                    title: envelope.title.clone(),
+                },
+            )
+            .await
+            .expect("l'humain approuve");
+
+        let provider = FauxDocuSign::new("3f6b9c2e-4d5a-4b1e-9f8a-0c1d2e3f4a5b");
+        let effects = Effects::new(
+            db.clone(),
+            ports_signing(provider.clone()),
+            principal.clone(),
+        );
+        let sent = send(&db, &effects, ok, &envelope).await.expect("envoyé");
+
+        // Ce que **nous** avons prononcé : un outil, une fois, avec le document.
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, SEND_ENVELOPE);
+        assert_eq!(calls[0].1["signerEmail"], json!("acheteur@client.example"));
+        assert!(
+            calls[0].1["documentBase64"]
+                .as_str()
+                .is_some_and(|b| !b.is_empty()),
+            "le document n'est pas parti avec le pli"
+        );
+
+        assert_eq!(sent.as_str(), "3f6b9c2e-4d5a-4b1e-9f8a-0c1d2e3f4a5b");
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let row = envelopes::find(&mut tx, envelope.id)
+            .await
+            .expect("read")
+            .expect("la ligne existe");
+        // La ligne d'audit est celle de la signature, pas celle d'un appel
+        // d'outil : c'est la signature qui engage l'entreprise.
+        let kind: String = sqlx::query_scalar(
+            "SELECT action_kind FROM audit_log WHERE tenant_id = $1 \
+               AND action_kind = 'contract_sign' LIMIT 1",
+        )
+        .bind(principal.tenant_id.as_uuid())
+        .fetch_one(&mut **tx)
+        .await
+        .expect("une ligne d'audit de signature");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(kind, "contract_sign");
+        assert_eq!(
+            row.provider_envelope_id.as_deref(),
+            Some("3f6b9c2e-4d5a-4b1e-9f8a-0c1d2e3f4a5b")
+        );
+        assert!(row.sent_at.is_some());
+
+        drop_tenant(&db, principal.tenant_id).await;
+    }
+
+    /// **Le `isError` de MCP est une réponse réussie qui dit non**, et rien ne
+    /// doit être enregistré comme parti sur la foi d'un message d'erreur.
+    #[tokio::test]
+    async fn un_refus_du_prestataire_ne_marque_rien_comme_parti() {
+        let Some(db) = db().await else { return };
+        let (principal, document) = seed(&db).await;
+        let gate = gate(&db);
+
+        let envelope = prepare(&db, &gate, &principal, &asked(&document))
+            .await
+            .expect("préparé");
+        let approval = ApprovalId::from_uuid(envelope.approval_id);
+        let nonce = nonce_of(&db, principal.tenant_id, approval).await;
+        let ok = gate
+            .redeem_approval(
+                &principal,
+                approval,
+                &nonce,
+                ContractSign {
+                    title: envelope.title.clone(),
+                },
+            )
+            .await
+            .expect("approuvé");
+
+        let effects = Effects::new(
+            db.clone(),
+            ports_signing(FauxDocuSign::refusing()),
+            principal.clone(),
+        );
+        let failed = send(&db, &effects, ok, &envelope).await;
+        assert!(failed.is_err(), "un refus est passé pour un envoi");
+
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let row = envelopes::find(&mut tx, envelope.id)
+            .await
+            .expect("read")
+            .expect("la ligne existe");
+        tx.rollback().await.expect("rollback");
+        assert!(
+            row.sent_at.is_none() && row.provider_envelope_id.is_none(),
+            "le pli est noté parti alors que le prestataire a dit non"
+        );
+
+        drop_tenant(&db, principal.tenant_id).await;
+    }
+
+    /// **Promesse 2 : on ne peut pas mentir sur le mot « signé ».**
+    ///
+    /// Le plus petit test qui retombe si la contrainte de `0105` disparaît, et
+    /// il attaque la base **directement** plutôt que par `mark_signed` : ce qui
+    /// est promis n'est pas qu'une fonction Rust soit prudente, c'est qu'aucun
+    /// chemin ne puisse écrire la date sans l'artefact. Un test qui passerait
+    /// par le code ne prouverait que le code.
+    #[tokio::test]
+    async fn la_base_refuse_de_mentir_sur_le_mot_signe() {
+        let Some(db) = db().await else { return };
+        let (principal, document) = seed(&db).await;
+        let envelope = prepare(&db, &gate(&db), &principal, &asked(&document))
+            .await
+            .expect("préparé");
+
+        // Le pli est parti — sans quoi le refus ci-dessous pourrait venir de
+        // `signature_envelopes_signed_after_sent` et le test dirait autre chose.
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        envelopes::mark_sent(&mut tx, envelope.id, "pli-1", Utc::now())
+            .await
+            .expect("parti");
+        tx.commit().await.expect("commit");
+
+        // 1. Une date sans exemplaire exécuté.
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let bare = sqlx::query("UPDATE signature_envelopes SET signed_at = now() WHERE id = $1")
+            .bind(envelope.id)
+            .execute(&mut **tx)
+            .await;
+        let _ = tx.rollback().await;
+        assert!(
+            bare.is_err(),
+            "« signé » s'est écrit sans que personne ait l'exemplaire signé"
+        );
+
+        // 2. L'exemplaire exécuté qui serait le document qu'on a envoyé.
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let same = envelopes::mark_signed(&mut tx, envelope.id, &document, Utc::now()).await;
+        let _ = tx.rollback().await;
+        assert!(
+            same.is_err(),
+            "le PDF non signé qu'on a envoyé est passé pour l'exemplaire exécuté"
+        );
+
+        // Et le chemin honnête marche : déposer les octets signés, puis
+        // constater.
+        let signed = format!("signe-{document}");
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let bytes = b"%PDF-1.4 le contrat, signe".to_vec();
+        files::deposit(
+            &mut tx,
+            &signed,
+            "application/pdf",
+            &bytes,
+            &crate::files::digest_of(&bytes),
+        )
+        .await
+        .expect("deposit");
+        let row = envelopes::mark_signed(&mut tx, envelope.id, &signed, Utc::now())
+            .await
+            .expect("constaté")
+            .expect("la ligne existe");
+        tx.commit().await.expect("commit");
+        assert_eq!(row.executed_name.as_deref(), Some(signed.as_str()));
+        assert!(row.signed_at.is_some());
+
+        drop_tenant(&db, principal.tenant_id).await;
+    }
+
+    fn gate(db: &Db) -> PolicyGate {
+        PolicyGate::new(db.clone())
+    }
+
+    /// **Le seul `expect` de ce chemin, et ce qui l'empêche d'être une panne.**
+    ///
+    /// `Effects::send_for_signature` parse [`SEND_ENVELOPE`] en [`Slug`] et
+    /// `expect`e — ce qui est juste tant que la constante est un slug, et qui
+    /// est un panic en production le jour où quelqu'un la corrige contre la
+    /// vraie liste de DocuSign en écrivant `send_envelope`. C'est exactement ce
+    /// qui est arrivé à l'écriture : `Slug` refuse `_`, et seul un test à la
+    /// base l'a dit. Sans base, il ne dit rien — celui-ci n'en veut pas.
+    #[test]
+    fn le_nom_de_loutil_est_un_slug() {
+        assert!(
+            Slug::parse(SEND_ENVELOPE).is_ok(),
+            "{SEND_ENVELOPE} n'est pas un slug : un tiret, jamais un souligné"
+        );
+    }
+}

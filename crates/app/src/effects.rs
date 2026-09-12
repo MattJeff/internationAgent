@@ -325,7 +325,13 @@ pub const INVOICE_DOCUMENT_CORRUPT: &str = "invoice_document_corrupt";
 /// The procedure to make it a fact is one session: connect the `docusign`
 /// connector through `crate::oauth`, call `tools/list` once, and correct this
 /// constant plus the five argument names below it.
-pub const SEND_ENVELOPE: &str = "send_envelope";
+///
+/// **A dash and not an underscore**, because this is parsed into a
+/// [`Slug`](agentos_domain::ids::Slug) and that type refuses `_`. The three
+/// GitHub tool names in `crate::content` have the same shape for the same
+/// reason. `crate::signature`'s `le_nom_de_loutil_est_un_slug` is the test that
+/// keeps the `expect` below from being a panic in production.
+pub const SEND_ENVELOPE: &str = "send-envelope";
 
 /// The signature port, for [`PAYMENT_PORT`]'s reasons: an envelope that left
 /// this process and was never recorded is a document in front of a counterparty
