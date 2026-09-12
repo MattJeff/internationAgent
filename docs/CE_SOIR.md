@@ -121,6 +121,22 @@ Il s'arrête là. Créer la société, poser les chartes, importer, enrôler —
 le geste que le fondateur veut faire depuis son terminal, et un script qui le
 ferait à sa place lui retirerait la démonstration.
 
+**Une quatrième étape reste hors de portée du terminal MCP, et le script ne la
+fait pas non plus** : `agentos-server flow set` / `flow confirm`, les sélecteurs
+du parcours de réservation d'un prospect. `0032_prospect_flows.sql` n'accorde à
+`app_role` ni INSERT ni UPDATE sur cette table : il n'existe **aucun** chemin
+depuis le serveur vers une de ses lignes, et c'est délibéré — un employé qui
+pourrait écrire un flux pourrait pointer un sélecteur sur n'importe quel élément
+d'un domaine que sa politique le laisse déjà lire, puis produire un constat
+reproductible et capturé à propos de ce que cet élément disait. La confirmation
+est le fait qu'**une personne a ouvert la page**, et le script ne peut pas
+l'ouvrir à sa place.
+
+Ce que ça coûte ce soir : un siège `sales-development` qui se réveille sur sa
+**cadence** ne trouve rien à faire tant qu'aucun flux n'est confirmé, et rend
+`no_work`. Une **séquence**, elle, n'en a pas besoin : la promesse porte déjà son
+brief, et le tour part.
+
 ## 6. La marche, une fois la ligne collée
 
 `docs/PLUGIN.md` § `lancer-une-campagne` donne l'ordre complet. Le minimum, et
