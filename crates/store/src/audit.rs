@@ -362,6 +362,24 @@ pub enum AuditKind {
     /// reason: a document that binds the company has two possible authors and
     /// the row has to say which.
     QuoteAnswered,
+    /// Un contrat est revenu signé, et voici l'exemplaire exécuté. Écrit par
+    /// `routes::signatures::signed`, dans la transaction qui pose `signed_at` —
+    /// donc la colonne et le journal ne peuvent pas être en désaccord.
+    ///
+    /// Le payload nomme le pli, le numéro de pli du prestataire, le fichier du
+    /// classeur qui porte les octets signés, et sa `source` : `"operator"`
+    /// aujourd'hui, le nom d'un prestataire le jour où son webhook le pousse.
+    /// C'est la forme exacte d'[`AuditKind::InvoicePaid`] et de
+    /// [`AuditKind::QuoteAnswered`], pour leur raison — un document qui engage
+    /// l'entreprise a deux auteurs possibles et la ligne doit dire lequel.
+    ///
+    /// **Sa propre valeur, et pas `AuditKind::Action(ActionKind::ContractSign)`**,
+    /// qui est déjà écrite ailleurs et ne dit pas la même chose : celle-là est
+    /// *nous avons mis le document devant quelqu'un*, écrite par `app::effects`
+    /// avec le `decision_id` de la rédemption. Celle-ci est *il a signé*, ce que
+    /// personne ici n'a fait et ce qu'aucun `ActionKind` ne nomme. C'est
+    /// l'admission d'[`AuditKind::CallCompleted`], mot pour mot.
+    ContractSigned,
 }
 
 impl AuditKind {
@@ -389,6 +407,7 @@ impl AuditKind {
             AuditKind::InvoicePaid => "invoice_paid",
             AuditKind::QuoteAnswered => "quote_answered",
             AuditKind::InvoicePaymentMismatch => "invoice_payment_mismatch",
+            AuditKind::ContractSigned => "contract_signed",
         }
     }
 }

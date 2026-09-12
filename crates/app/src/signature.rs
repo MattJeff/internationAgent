@@ -130,10 +130,10 @@ impl Envelope {
 pub mod envelopes {
     use super::{DateTime, Envelope, StoreError, TenantTx, Utc, Uuid};
 
-    /// Les colonnes, épelées à chaque requête plutôt que composées : `sqlx`
-    /// refuse une chaîne construite (`dynamic SQL strings should be audited`),
-    /// et un `SELECT *` laisserait une colonne neuve arriver sans que personne
-    /// la nomme. C'est la forme de `agentos_store::quotes`.
+    // Les colonnes sont épelées à chaque requête plutôt que composées : `sqlx`
+    // refuse une chaîne construite (`dynamic SQL strings should be audited`), et
+    // un `SELECT *` laisserait une colonne neuve arriver sans que personne la
+    // nomme. C'est la forme de `agentos_store::quotes`.
 
     /// Ce qu'il faut pour écrire une ligne. Tout est déjà décidé à ce
     /// moment-là : la Gate a statué et l'approbation est déposée.
@@ -155,7 +155,7 @@ pub mod envelopes {
                (tenant_id, id, employee_id, approval_id, title, signatory, server, document_name) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              RETURNING id, employee_id, approval_id, title, signatory, server, document_name, \
-             provider_envelope_id, sent_at, executed_name, signed_at, created_at"
+             provider_envelope_id, sent_at, executed_name, signed_at, created_at",
         )
         .bind(tx.tenant_id().as_uuid())
         .bind(draft.id)

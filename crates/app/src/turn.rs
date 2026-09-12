@@ -321,9 +321,22 @@ pub const UNSERVED: [(ActionKind, &str); 11] = [
     ),
     (
         ActionKind::ContractSign,
-        "the buyer proposes it and there is no effect behind it. The gate turns a signature into \
-         a human's decision and never denies one, so what is missing is not authority — it is a \
-         signing surface, a document to sign and somewhere to put the executed copy.",
+        "the buyer proposes it, **and the three things this entry used to name are no longer \
+         missing**. There is a signing surface (`Effects::send_for_signature`, through the \
+         tenant's own MCP connector), a document to sign (`signature_envelopes.document_name`, a \
+         row of the classeur) and somewhere to put the executed copy \
+         (`signature_envelopes.executed_name`, which `0105` makes the *only* way the word signed \
+         can be written). What withholds the tool is therefore a different thing, and a stronger \
+         one: **no token of this kind can be obtained inside a turn at all.** \
+         `domain::policy::evaluate`'s arm for `Action::ContractSign` is an unconditional \
+         `RequireApproval` with no threshold and no policy field, so the only producer of an \
+         `Authorized<ContractSign>` in the workspace is `PolicyGate::redeem_approval`, reached \
+         from `POST /v1/approvals/{id}/approve` after a named human pressed the button. A row \
+         here would put a tool in front of a model whose every call is `Denied::PendingApproval` \
+         — which is what `place_order` and `propose_terms` already do from Rust, with a caller \
+         that knows to read the approval id out of the refusal. The thing a model can usefully \
+         reach is the operator surface, and it does: `signatures_propose` and `signatures_record` \
+         are in `mcp_tools::commerce`.",
     ),
     (
         ActionKind::CredentialChange,

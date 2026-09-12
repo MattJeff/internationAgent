@@ -1230,6 +1230,63 @@ pub fn tools() -> Vec<ToolDef> {
             raw_body: None,
             risk: Risk::Read,
         },
+        // -------------------------------------------------------------------
+        // signatures — le pli qu'on prépare, et l'exemplaire qu'on constate
+        // -------------------------------------------------------------------
+        ToolDef {
+            name: "signatures_list",
+            title: "Les documents envoyés en signature, et ceux qui sont revenus signés",
+            description: "Rend le registre des plis, le plus récent d'abord : le document du                  classeur qui est parti, à qui, par quel branchement, le numéro de pli du                  prestataire, et l'exemplaire exécuté quand il y en a un. Les trois états se                  lisent sur les dates plutôt que sur une colonne : `sent_at` nul veut dire que le                  pli attend encore une approbation humaine, `signed_at` nul qu'il est parti sans                  réponse, et `executed_name` nomme le fichier signé. C'est la source de l'`id` de                  `signatures_record`, et `approvals_list` est l'autre moitié — un pli qui n'est                  pas parti y a une ligne, et c'est elle qui l'envoie. Pour ce que le client a                  répondu à une **offre**, c'est `quotes_list` : un devis accepté au téléphone                  n'est pas un contrat signé.",
+            method: Method::Get,
+            path: "/v1/signatures",
+            schema: nothing(),
+            query: &[],
+            raw_body: None,
+            risk: Risk::Read,
+        },
+        ToolDef {
+            name: "signatures_propose",
+            title: "Poser une demande de signature dans la file d'une personne",
+            description: "Prépare un pli — un document du classeur, une adresse à qui le                  présenter, le branchement du prestataire — et le soumet à la Policy Gate pour le                  siège nommé, qui en fait **toujours** une décision humaine : rien ne part de cet                  appel, et la réponse porte l'`awaiting_approval_id` qu'il faut approuver avec                  `approvals_approve` pour que le document parte réellement. Il n'existe aucun                  outil qui envoie directement, et c'est délibéré : signer engage l'entreprise                  devant un tiers, et une signature ne se retire pas. Le `document_name` vient de                  `files_list` et doit déjà être déposé (`files_create`) ; le `server` vient                  d'`integrations_list` et doit être branché, sinon l'approbation est refusée en                  501 sans être dépensée ; le `title` est la phrase que la personne lira dans sa                  file et sur laquelle le hachage de l'approbation est pris, donc il faut le                  restituer mot pour mot à `approvals_approve`.",
+            method: Method::Post,
+            path: "/v1/signatures",
+            schema: schema(
+                json!({
+                    "employee_id": { "type": "string", "format": "uuid", "description": "Le siège au nom de qui la signature est demandée, tel qu'`employees_list` le rend." },
+                    "title": { "type": "string", "description": "Ce qui est signé, en une ligne. C'est ce que la personne lit dans sa file d'approbation." },
+                    "signatory": { "type": "string", "description": "L'adresse de qui doit signer." },
+                    "server": { "type": "string", "description": "Le handle du branchement de signature, tel qu'`integrations_list` le rend — `docusign` au catalogue." },
+                    "document_name": { "type": "string", "description": "Le document à signer, par son nom dans le classeur (`files_list`)." }
+                }),
+                &[
+                    "employee_id",
+                    "title",
+                    "signatory",
+                    "server",
+                    "document_name",
+                ],
+            ),
+            query: &[],
+            raw_body: None,
+            risk: Risk::Destructive,
+        },
+        ToolDef {
+            name: "signatures_record",
+            title: "Enregistrer qu'un contrat est revenu signé, avec l'exemplaire exécuté",
+            description: "Écrit que le pli a été signé, à l'instant du serveur — il n'y a pas de                  date à fournir, comme pour `invoices_payment_record`. **Le corps ne porte pas un                  booléen mais un fichier** : `executed_name` doit nommer un document déjà déposé                  par `files_create`, et il ne peut pas être celui qu'on a envoyé ; sans exemplaire                  exécuté, la base refuse d'écrire le mot « signé ». Déposer les octets signés                  d'abord, appeler ceci ensuite. Cela ne s'écrit qu'une fois et ne se retire pas ;                  404 couvre les quatre refus (pas à cette entreprise, inexistant, jamais parti,                  déjà signé). L'`id` vient de `signatures_list`.",
+            method: Method::Post,
+            path: "/v1/signatures/{id}/signed",
+            schema: schema(
+                json!({
+                    "id": { "type": "string", "format": "uuid", "description": "Le pli, tel que `signatures_list` le rend." },
+                    "executed_name": { "type": "string", "description": "L'exemplaire signé, par son nom dans le classeur. Déposé avant avec `files_create`." }
+                }),
+                &["id", "executed_name"],
+            ),
+            query: &[],
+            raw_body: None,
+            risk: Risk::Destructive,
+        },
     ]
 }
 

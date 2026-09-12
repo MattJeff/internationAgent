@@ -785,7 +785,17 @@ fn app(
                 db.clone(),
                 gate.clone(),
                 ports.clone(),
+                // Approuver une signature l'envoie, chez le prestataire de ce
+                // locataire-là — voir `approvals::sign`.
+                fleets.clone(),
             ))
+            // À côté des approbations, parce que c'est là que la décision
+            // tombe : cette unité-ci prépare le pli et constate l'exemplaire
+            // exécuté, et n'envoie rien elle-même.
+            .merge(routes::signatures::router(routes::signatures::Signatures {
+                db: db.clone(),
+                gate: gate.clone(),
+            }))
             // Four routers written by four parallel units, each of which could
             // not mount itself because this file belonged to none of them. A
             // route nobody merged is a route nobody can call, and the
