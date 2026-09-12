@@ -474,18 +474,33 @@ une session Checkout payée et règle la facture qu'elle nomme. Rien dans ce
 dépôt ne *crée* une session Checkout ni un lien de paiement. Le client est donc
 facturé par PDF et paie par un lien fabriqué ailleurs.
 
-### 3.9 Signer — la gate escalade, il n'y a rien à signer
+### 3.9 Signer — joint le 2026-09-12, sans qu'aucun appel réel ait été fait
 
 `ActionKind::ContractSign` existe, l'acheteur le propose, la gate en fait
 toujours une décision humaine (`ApprovalReason::ContractSignature`) et ne la
 refuse jamais.
 
-**Où ça s'arrête,** dans les mots de `UNSERVED` : *« there is no effect behind
-it. What is missing is not authority — it is a signing surface, a document to
-sign and somewhere to put the executed copy »*. Les trois moitiés existent
-séparément : DocuSign est au catalogue, `quote_document` et `invoice_document`
-savent écrire un PDF, et `files` (`0067`) est l'endroit où ranger l'exemplaire
-signé. Personne ne les a jointes.
+**Ce qui manquait est là depuis le 2026-09-12** : `0105` porte
+`signature_envelopes`, `Effects::send_for_signature` parle au connecteur MCP du
+locataire, et `POST /v1/approvals/{id}/approve` a un **second bras avec un
+exécuteur** — le premier était le paiement. Trois routes (`/v1/signatures`, en
+préparation, registre et constat) et trois outils MCP
+(`signatures_propose`, `signatures_list`, `signatures_record`).
+
+**Ce que la table interdit :** `signed_at` ne s'écrit que si `executed_name`
+nomme un fichier du classeur, et cet exemplaire ne peut pas être le document
+qu'on a envoyé. Le mot « signé » ne peut donc pas mentir — c'est la discipline
+de `content_drafts.url`, tenue par un CHECK.
+
+**Où ça s'arrête maintenant,** et ce n'est plus la même phrase : *aucun appel
+n'a jamais été fait contre le vrai serveur de DocuSign.* `mcp.docusign.com/mcp`
+répond `403` à un appelant sans jeton, aucun compte n'existe ici, donc
+`tools/list` n'a jamais été lu : `effects::SEND_ENVELOPE` et les cinq noms
+d'arguments du pli sont **inventés**, et ce que les tests prouvent est le
+câblage, contre un faux serveur monté ici. Le webhook de complétion n'est pas là
+non plus, pour la raison de `SMARTLEAD_SIGNATURE_HEADER` : le nom de l'en-tête
+où DocuSign signe n'a jamais été lu sur une livraison réelle. Le constat est
+donc un geste d'opérateur, comme `POST /v1/invoices/{id}/paid`.
 
 ### 3.10 Le classeur et la connaissance — lisibles, pas écrivables par un siège
 
@@ -764,6 +779,15 @@ la gate escalade déjà vers un humain sans jamais refuser.
 première chose qu'un SaaS B2B demandera après le devis. Il passe après le rôle
 de console parce qu'une signature sans rôles est une signature que n'importe
 qui peut déclencher.
+
+**Fait le 2026-09-12**, et § 3.9 dit comment : `0105`,
+`Effects::send_for_signature`, un second bras d'exécuteur sur
+`POST /v1/approvals/{id}/approve`, trois routes et trois outils. **Ce qui reste
+n'est pas du code, c'est un compte** : aucun appel n'a jamais été fait contre le
+vrai DocuSign, donc le nom de l'outil et les noms d'arguments sont des
+suppositions, et le webhook de complétion attend qu'une livraison réelle ait été
+lue une fois. Ce qui est tenu par la base — qu'on ne puisse pas écrire « signé »
+sans l'exemplaire exécuté — ne dépend d'aucun compte.
 
 ### Cinquième — exposer la recherche de lead
 

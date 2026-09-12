@@ -140,7 +140,6 @@ async fn request(
         &state.gate,
         &gate_principal,
         &signature::Request {
-            employee_id: EmployeeId::from_uuid(body.employee_id),
             title: body.title,
             signatory: body.signatory,
             server: body.server,

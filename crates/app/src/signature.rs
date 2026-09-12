@@ -80,7 +80,7 @@
 //! la Gate soit appelée plutôt qu'après.
 
 use agentos_domain::action::McpTool;
-use agentos_domain::ids::{EmployeeId, Slug};
+use agentos_domain::ids::Slug;
 use agentos_providers::email::ProviderMessageId;
 use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::files;
@@ -295,9 +295,12 @@ pub enum PrepareError {
 }
 
 /// Ce qu'on demande : quel document, à qui, par quel branchement.
+///
+/// Pas de champ `employee_id` : le siège est celui du [`Principal`] que la Gate
+/// statue pour, et un second exemplaire ici serait un champ que quelqu'un
+/// pourrait un jour remplir autrement que celui sur lequel le jeton est émis.
 #[derive(Debug, Clone)]
 pub struct Request {
-    pub employee_id: EmployeeId,
     /// La phrase que l'humain lira dans sa file, et sur laquelle le hachage de
     /// l'approbation est pris.
     pub title: String,
@@ -484,7 +487,7 @@ mod tests {
     use std::sync::Arc;
 
     use agentos_domain::action::McpTool;
-    use agentos_domain::ids::{ApprovalId, TenantId};
+    use agentos_domain::ids::{ApprovalId, EmployeeId, TenantId};
     use agentos_domain::policy::PolicyLimits;
     use agentos_domain::untrusted::Untrusted;
     use agentos_providers::ProviderError;
@@ -656,7 +659,6 @@ mod tests {
 
     fn asked(document: &str) -> Request {
         Request {
-            employee_id: EmployeeId::new_v7(Utc::now()),
             title: "abonnement annuel Orizn, 12 000 EUR".to_owned(),
             signatory: "acheteur@client.example".to_owned(),
             server: HANDLE.to_owned(),
