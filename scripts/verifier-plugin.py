@@ -64,6 +64,19 @@ if missing:
 else:
     print(f"OK {len(cited - noise)} outils cites, tous presents dans le registre")
 
+# 2b. et le compte que la doc en annonce. Meme regle que
+# `every_written_count_is_the_registry_s_own` cote Rust : un nombre tape dans de
+# la prose est vrai le jour ou il est ecrit. Celui-ci disait 55 pendant que les
+# gestes en citaient 60.
+attendu = f"chacun des {len(cited - noise)} outils nommes par les quatre gestes"
+plugin_md = open("docs/PLUGIN.md", encoding="utf-8").read()
+plugin_md_sans_accents = (plugin_md.replace("\u00e9", "e").replace("\u00e8", "e")
+                          .replace("\u00ea", "e").replace("\u00e0", "a"))
+if attendu.replace("\n", " ") not in " ".join(plugin_md_sans_accents.split()):
+    bad.append(f"docs/PLUGIN.md n'annonce plus le bon compte : {attendu!r}")
+else:
+    print(f"OK docs/PLUGIN.md annonce {len(cited - noise)} outils cites")
+
 # 3. aucun secret
 for p in sorted(glob.glob("plugin/**/*", recursive=True) + [".claude-plugin/marketplace.json", "docs/PLUGIN.md"]):
     if not os.path.isfile(p):
