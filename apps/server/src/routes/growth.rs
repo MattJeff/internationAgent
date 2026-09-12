@@ -925,6 +925,11 @@ mod tests {
     use super::*;
     use crate::auth::ApiKeys;
 
+    /// Le nom que l'opérateur a donné à la liste dont sort le contact
+    /// d'[`une_entreprise`] — c'est-à-dire l'un des cinq fichiers du fondateur,
+    /// et la réponse que la lecture doit finir par prononcer.
+    const LISTE: &str = "smartlead_getorizn_prospection.csv";
+
     const SECRET_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SECRET_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -1037,6 +1042,74 @@ mod tests {
             Verdict::NoTarget,
             "une cible en dollars contre un registre en euros n'est pas un retard"
         );
+    }
+
+    /// **Une facture n'est comptée qu'une fois, quel que soit le nombre de
+    /// contacts de son compte.**
+    ///
+    /// C'est le seul piège de cette section et il est silencieux : la jointure
+    /// rend une ligne par (facture, origine), et un `sum()` naïf sur ces
+    /// lignes-là ferait de 190 $ encaissés 380 $ attribués. Un écran qui
+    /// invente de la recette au moment où on lui demande d'où elle vient est
+    /// pire que pas d'écran du tout.
+    #[test]
+    fn une_facture_a_deux_contacts_ne_compte_pas_deux_fois() {
+        let facture = Uuid::now_v7();
+        let ligne = |origin: Option<&str>, reference: Option<&str>| AttributionRow {
+            invoice_id: facture,
+            currency: "USD".to_owned(),
+            amount_minor: 19_000,
+            origin: origin.map(str::to_owned),
+            origin_ref: reference.map(str::to_owned),
+        };
+
+        // Deux contacts, **une** porte : un seau, une facture, 190 $.
+        let net = attribute(vec![
+            ligne(Some("import"), Some("getorizn.csv")),
+            ligne(Some("import"), Some("getorizn.csv")),
+        ]);
+        assert_eq!(net.len(), 1);
+        assert_eq!(net[0].invoices_paid, 1);
+        assert_eq!(net[0].collected_minor, 19_000, "et surtout pas 38 000");
+        assert_eq!(net[0].origins.len(), 1);
+
+        // Deux portes : la chaîne se scinde. Les deux sont rendues, dans **un**
+        // seau, et l'argent n'est réparti entre aucune des deux — pas de
+        // 9 500 $ chacune, qui serait un chiffre que personne n'a mesuré.
+        let scindee = attribute(vec![
+            ligne(Some("import"), Some("getorizn.csv")),
+            ligne(Some("discovery"), Some("https://ectaa.org/members")),
+        ]);
+        assert_eq!(scindee.len(), 1);
+        assert_eq!(scindee[0].invoices_paid, 1);
+        assert_eq!(scindee[0].collected_minor, 19_000);
+        assert_eq!(scindee[0].origins.len(), 2, "dis-le, et rends les deux");
+
+        // Aucune porte : la liste est **vide**, ce qui se lit « inconnu ». Il
+        // n'existe aucun seau « organique » et c'est délibéré.
+        let inconnue = attribute(vec![ligne(None, None)]);
+        assert_eq!(inconnue.len(), 1);
+        assert!(inconnue[0].origins.is_empty());
+        assert_eq!(inconnue[0].collected_minor, 19_000);
+
+        // Deux monnaies ne se somment pas : deux seaux, jamais un total.
+        let deux = attribute(vec![
+            ligne(Some("import"), Some("a.csv")),
+            AttributionRow {
+                invoice_id: Uuid::now_v7(),
+                currency: "EUR".to_owned(),
+                amount_minor: 5_000,
+                origin: Some("import".to_owned()),
+                origin_ref: Some("a.csv".to_owned()),
+            },
+        ]);
+        assert_eq!(deux.len(), 2);
+        assert_eq!(deux[0].currency, "USD", "le plus gros d'abord");
+        assert_eq!(deux[1].currency, "EUR");
+
+        // Et rien du tout rend rien du tout : pas un seau vide à zéro, qui se
+        // lirait comme une mesure.
+        assert!(attribute(Vec::new()).is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1181,14 +1254,18 @@ mod tests {
         .execute(&mut **tx)
         .await
         .expect("account");
+        // Et son origine, qui est le maillon que `0107` a posé : sans elle, tout
+        // ce qui suit se compte et rien ne se remonte.
         sqlx::query(
-            "INSERT INTO contacts (id, tenant_id, account_id, full_name, email) \
-             VALUES ($1, $2, $3, 'Ada', $4)",
+            "INSERT INTO contacts \
+                 (id, tenant_id, account_id, full_name, email, origin, origin_ref) \
+             VALUES ($1, $2, $3, 'Ada', $4, 'import', $5)",
         )
         .bind(contact)
         .bind(t)
         .bind(account)
         .bind(format!("ada-{}@buyer.example", contact.simple()))
+        .bind(LISTE)
         .execute(&mut **tx)
         .await
         .expect("contact");
@@ -1229,6 +1306,37 @@ mod tests {
         .execute(&mut **tx)
         .await
         .expect("message");
+
+        // 3 bis. La séquence qui a écrit à cette personne. Elle ne change aucun
+        // des sept comptes et elle n'est pas lue par l'attribution : elle est
+        // là pour que la chaîne du test soit celle de la vie — quelqu'un est
+        // entré par une liste, une séquence lui a écrit, il a répondu — et non
+        // une ligne de `contacts` posée à côté d'une facture.
+        let sequence = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO sequences (id, tenant_id, name, steps) \
+             VALUES ($1, $2, $3, '[]'::jsonb)",
+        )
+        .bind(sequence)
+        .bind(t)
+        .bind(format!("relance-{}", sequence.simple()))
+        .execute(&mut **tx)
+        .await
+        .expect("sequence");
+        sqlx::query(
+            "INSERT INTO sequence_runs \
+                 (id, tenant_id, sequence_id, contact_id, employee_id, conversation_id, state) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'replied')",
+        )
+        .bind(Uuid::now_v7())
+        .bind(t)
+        .bind(sequence)
+        .bind(contact)
+        .bind(seat.as_uuid())
+        .bind(conversation)
+        .execute(&mut **tx)
+        .await
+        .expect("sequence run");
 
         // 4 et 5. Un devis émis, et accepté.
         sqlx::query(
@@ -1571,6 +1679,200 @@ mod tests {
         assert_eq!(body["verdict"], "no_target");
 
         h.teardown().await;
+    }
+
+    /// **Un euro remonte jusqu'à sa cause, et un euro sans chaîne se lit
+    /// `null` plutôt que d'être rangé au hasard.**
+    ///
+    /// Les trois faits, sur la même entreprise et dans la même fenêtre :
+    ///
+    /// 1. une personne entrée par une liste nommée, une séquence qui lui écrit,
+    ///    une réponse, une affaire, un devis accepté, une facture réglée — et
+    ///    la lecture qui prononce le nom du fichier ;
+    /// 2. une seconde facture, réglée elle aussi, dont aucun contact ne dit
+    ///    d'où il vient : elle sort dans un seau aux origines **vides**, pas
+    ///    dans le premier et pas dans un seau « organique » ;
+    /// 3. la somme des seaux est exactement `collected_minor`. C'est
+    ///    l'invariant qui rend la section utilisable : une attribution qui ne
+    ///    boucle pas sur la recette est une attribution qu'on ne peut pas citer.
+    ///
+    /// Puis la chaîne se scinde, et les deux origines sortent ensemble sans que
+    /// l'argent soit divisé.
+    #[tokio::test]
+    async fn un_euro_remonte_jusqua_son_origine_et_un_euro_sans_chaine_reste_inconnu() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        une_entreprise(&h.db, h.a).await;
+        let orpheline = une_facture_sans_origine(&h.db, h.a).await;
+
+        let (status, body) = h.get("/v1/growth", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let seaux = body["attribution"].as_array().expect("attribution");
+        assert_eq!(seaux.len(), 2, "{body}");
+
+        // Le plus gros d'abord, et c'est celui qui a un nom.
+        assert_eq!(seaux[0]["collected_minor"], 19_000);
+        assert_eq!(seaux[0]["invoices_paid"], 1);
+        assert_eq!(seaux[0]["currency"], "USD");
+        assert_eq!(seaux[0]["origins"][0]["kind"], "import");
+        assert_eq!(
+            seaux[0]["origins"][0]["reference"], LISTE,
+            "la lecture nomme le fichier, pas « une liste »"
+        );
+
+        // Et celui qui n'en a pas : une liste vide, et surtout pas un seau
+        // nommé qui aurait rangé cet euro quelque part.
+        assert_eq!(seaux[1]["collected_minor"], orpheline);
+        assert_eq!(
+            seaux[1]["origins"],
+            json!([]),
+            "inconnu se dit en ne disant rien, jamais « organique »"
+        );
+
+        // L'invariant : les seaux bouclent sur la recette de la fenêtre.
+        let somme: i64 = seaux
+            .iter()
+            .map(|seau| seau["collected_minor"].as_i64().expect("un montant"))
+            .sum();
+        assert_eq!(
+            somme, body["revenue"]["collected_minor"],
+            "la somme des origines est l'encaissé de la fenêtre, sans reste"
+        );
+        let factures: i64 = seaux
+            .iter()
+            .map(|seau| seau["invoices_paid"].as_i64().expect("un compte"))
+            .sum();
+        assert_eq!(
+            factures, body["funnel"][6]["count"],
+            "et autant de factures que la septième étape en compte"
+        );
+
+        // **La chaîne se scinde.** Un second contact au même compte, entré par
+        // l'autre porte : la facture porte désormais deux origines, dans un
+        // seul seau, et son montant ne bouge pas d'un cent.
+        un_second_contact_decouvert(&h.db, h.a).await;
+        let (_, body) = h.get("/v1/growth", SECRET_A).await;
+        let seaux = body["attribution"].as_array().expect("attribution");
+        assert_eq!(seaux.len(), 2, "{body}");
+        assert_eq!(seaux[0]["collected_minor"], 19_000, "toujours 190 $");
+        assert_eq!(seaux[0]["invoices_paid"], 1);
+        let origines = seaux[0]["origins"].as_array().expect("origins");
+        assert_eq!(origines.len(), 2, "les deux, et pas la moitié de chacune");
+        assert_eq!(origines[0]["kind"], "discovery");
+        assert_eq!(origines[1]["kind"], "import");
+
+        // Et l'invariant tient encore : rien n'a été inventé en route.
+        let somme: i64 = seaux
+            .iter()
+            .map(|seau| seau["collected_minor"].as_i64().expect("un montant"))
+            .sum();
+        assert_eq!(somme, body["revenue"]["collected_minor"]);
+
+        // **RLS.** L'attribution d'autrui n'est pas filtrée, elle est invisible.
+        let (_, body) = h.get("/v1/growth", SECRET_B).await;
+        assert_eq!(body["attribution"], json!([]));
+
+        h.teardown().await;
+    }
+
+    /// Un second compte, une affaire, une facture réglée — et **personne** dont
+    /// on sache d'où il vient. C'est le cas ordinaire d'une base écrite avant
+    /// `0107`, et le cas qu'il ne faut ranger nulle part.
+    ///
+    /// Rend le montant, pour que l'assertion ne le réécrive pas.
+    async fn une_facture_sans_origine(db: &Db, tenant: TenantId) -> i64 {
+        const MONTANT: i64 = 7_000;
+        let seat = EmployeeId::new_v7(Utc::now());
+        let account = Uuid::now_v7();
+        let opportunity = Uuid::now_v7();
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let t = tenant.as_uuid();
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, $3, 'Sam', 'active')",
+        )
+        .bind(seat.as_uuid())
+        .bind(t)
+        .bind(format!("sam-{}", seat.as_uuid().simple()))
+        .execute(&mut **tx)
+        .await
+        .expect("employee");
+        sqlx::query(
+            "INSERT INTO accounts (id, tenant_id, legal_name, domain, segment, country) \
+             VALUES ($1, $2, 'Orphan plc', $3, 'ota', 'FR')",
+        )
+        .bind(account)
+        .bind(t)
+        .bind(format!("orphan-{}.example", account.simple()))
+        .execute(&mut **tx)
+        .await
+        .expect("account");
+        // Un contact bien réel, et sans origine : la colonne existe, personne
+        // ne l'a remplie, et c'est très exactement « on ne sait pas ».
+        sqlx::query(
+            "INSERT INTO contacts (id, tenant_id, account_id, full_name, email) \
+             VALUES ($1, $2, $3, 'Noa', $4)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(t)
+        .bind(account)
+        .bind(format!("noa-{}@orphan.example", account.simple()))
+        .execute(&mut **tx)
+        .await
+        .expect("contact");
+        sqlx::query(
+            "INSERT INTO opportunities \
+                 (id, tenant_id, account_id, stage, currency, value_minor, approval_id, closed_at) \
+             VALUES ($1, $2, $3, 'closed_won', 'USD', $4, $5, now())",
+        )
+        .bind(opportunity)
+        .bind(t)
+        .bind(account)
+        .bind(MONTANT)
+        .bind(Uuid::now_v7())
+        .execute(&mut **tx)
+        .await
+        .expect("opportunity");
+        sqlx::query(
+            "INSERT INTO invoices \
+                 (id, tenant_id, opportunity_id, issued_by, currency, amount_minor, memo, \
+                  number, paid_at) \
+             VALUES ($1, $2, $3, $4, 'USD', $5, 'un mois', 2, now())",
+        )
+        .bind(Uuid::now_v7())
+        .bind(t)
+        .bind(opportunity)
+        .bind(seat.as_uuid())
+        .bind(MONTANT)
+        .execute(&mut **tx)
+        .await
+        .expect("invoice");
+        tx.commit().await.expect("commit");
+        MONTANT
+    }
+
+    /// Une seconde personne au compte d'[`une_entreprise`], trouvée sur une
+    /// page d'annuaire. Le compte a maintenant deux portes et une seule
+    /// facture : c'est la scission.
+    async fn un_second_contact_decouvert(db: &Db, tenant: TenantId) {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO contacts \
+                 (id, tenant_id, account_id, full_name, email, origin, origin_ref) \
+             SELECT $1, $2, a.id, '', $3, 'discovery', 'https://ectaa.org/members' \
+               FROM accounts a WHERE a.legal_name = 'Buyer plc'",
+        )
+        .bind(id)
+        .bind(tenant.as_uuid())
+        .bind(format!("info-{}@buyer.example", id.simple()))
+        .execute(&mut **tx)
+        .await
+        .expect("contact découvert");
+        tx.commit().await.expect("commit");
     }
 
     /// La fenêtre est bornée des deux côtés, et le dire est moins cher qu'un
