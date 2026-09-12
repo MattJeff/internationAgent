@@ -996,7 +996,7 @@ pub struct SignatureRequest<'a> {
     pub signatory: &'a str,
     /// The document's address in the classeur, and the name the counterparty
     /// will see on it.
-    pub document_name: &'a String,
+    pub document_name: &'a str,
     /// The document itself, as it was filed.
     pub bytes: &'a [u8],
 }
@@ -3437,10 +3437,7 @@ impl Effects {
         let mut detail = Map::new();
         detail.insert("server".to_owned(), json!(request.server.as_str()));
         detail.insert("signatory".to_owned(), json!(request.signatory));
-        detail.insert(
-            "document_name".to_owned(),
-            json!(request.document_name.as_str()),
-        );
+        detail.insert("document_name".to_owned(), json!(request.document_name));
         self.record_sent(&ok, sent, detail).await
     }
 
