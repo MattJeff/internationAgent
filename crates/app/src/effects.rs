@@ -69,6 +69,8 @@ use agentos_store::quotes;
 use agentos_store::revenue::RevenueError;
 use agentos_store::spend;
 use async_trait::async_trait;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
 use url::Url;
@@ -303,6 +305,48 @@ const ONE_REVISION_PER_QUOTE: &str = "sales_quotes_one_revision_per_quote_idx";
 /// The filed document no longer matches its own digest. Not sent; the same
 /// refusal [`crate::files::FilesError::Corrupt`] makes on the read side.
 pub const INVOICE_DOCUMENT_CORRUPT: &str = "invoice_document_corrupt";
+
+/// The tool [`Effects::send_for_signature`] speaks on the tenant's signature
+/// connector.
+///
+/// **Invented, and that is the one thing a reader must know about it.** The
+/// `docusign` entry of [`crate::catalog`] was probed on 2026-09-06 and every
+/// literal in it comes off the documents DocuSign serves itself — but
+/// `mcp.docusign.com/mcp` answers `403 RBAC: access denied` without a bearer
+/// token, so `tools/list` has never been read from this workspace and there is
+/// no account here to read it with. This name, and the argument names in
+/// [`Effects::send_for_signature`], are a guess at a shape.
+///
+/// `crate::content`'s three GitHub tool names are the contrast worth drawing:
+/// those were read off a server that publishes its list to an anonymous caller,
+/// so they are facts. This is not, and it is written down here rather than
+/// discovered when somebody with an account makes the first real call.
+///
+/// The procedure to make it a fact is one session: connect the `docusign`
+/// connector through `crate::oauth`, call `tools/list` once, and correct this
+/// constant plus the five argument names below it.
+pub const SEND_ENVELOPE: &str = "send_envelope";
+
+/// The signature port, for [`PAYMENT_PORT`]'s reasons: an envelope that left
+/// this process and was never recorded is a document in front of a counterparty
+/// that this company has no trace of.
+const SIGNATURE_PORT: &str = "signature";
+
+/// The connector answered, and what it said was that it would not send.
+///
+/// MCP's `isError` is a *successful* response carrying a failed tool, so
+/// without this the envelope would be recorded as sent on the strength of an
+/// error message. `crate::content::ProposeError::Refused` is the same reading.
+pub const ENVELOPE_REFUSED: &str = "envelope_refused";
+
+/// The connector answered without anything this workspace will store as an
+/// envelope id.
+///
+/// A refusal and not an `Ok(())`, because an envelope with no provider id is
+/// exactly what `signature_envelopes_sent_carries_its_id` refuses to write: a
+/// date that is our word against the provider's. See [`envelope_id`] for what
+/// counts as one.
+pub const NO_ENVELOPE_ID: &str = "no_envelope_id";
 
 /// The zone a moment was promised in is not a name any tzdata knows.
 ///
@@ -594,6 +638,27 @@ subject!(
     /// gate — there is nothing for a caller to declare and nothing for a model
     /// to say.
     InternalSend { to: Slug } => InternalSend
+);
+subject!(
+    /// Bind this company in front of a third party: put a document in front of
+    /// somebody to sign.
+    ///
+    /// **The only subject in this file that cannot be obtained from
+    /// `PolicyGate::authorize` at all.** Every sibling has at least one ruling
+    /// that answers `Allow`; `domain::policy::evaluate`'s arm for
+    /// `Action::ContractSign` is `Decision::RequireApproval` with no condition
+    /// above it — no threshold, no policy field, no `if`. So the one way a
+    /// value of this type reaches [`Effects::send_for_signature`] is
+    /// `PolicyGate::redeem_approval`, after a named human pressed approve on a
+    /// row whose hash is taken over this exact `title`.
+    ///
+    /// The subject is the title and nothing else, for [`QuoteIssue`]'s reason:
+    /// which document, to which address and through which connector ride on
+    /// `signature::Envelope`, where `0105` refuses a half-written one. And the
+    /// title is not decoration — `Action`'s own module docs list it beside
+    /// `PaymentCreate::payee` as a field no rule consults and every approval
+    /// hashes, because it is the sentence the human read before deciding.
+    ContractSign { title: String } => ContractSign
 );
 
 /// Undertake one moment of this employee's own time.
@@ -905,6 +970,65 @@ pub struct QuoteDraft {
     /// `invoice_lines`' columns so that the total of an accepted quote is *the
     /// same computation* as the invoice that bills it.
     pub lines: Vec<invoices::Line>,
+}
+
+/// What [`Effects::send_for_signature`] hands the provider, beside the token.
+///
+/// Borrowed rather than owned for one reason: `bytes` is a filed PDF, and this
+/// struct exists so that nothing in this module owns a second copy of one.
+///
+/// Everything here comes off a `signature_envelopes` row (`0105`) except the
+/// bytes, which come out of the classeur under the name that row points at —
+/// see `crate::signature::send`, which is the only caller and the only place
+/// the two are put together.
+#[derive(Debug, Clone, Copy)]
+pub struct SignatureRequest<'a> {
+    /// The tenant's signature connector, by MCP handle.
+    pub server: &'a Slug,
+    /// The address asked to sign. An operator's text, never a model's — the
+    /// only writer is `POST /v1/signatures`.
+    pub signatory: &'a str,
+    /// The document's address in the classeur, and the name the counterparty
+    /// will see on it.
+    pub document_name: &'a String,
+    /// The document itself, as it was filed.
+    pub bytes: &'a [u8],
+}
+
+/// The provider's own envelope id, read out of an answer that is a stranger's
+/// prose.
+///
+/// # Why a UUID and not the value at a key
+///
+/// `crate::content::review_url` faced the same question from the other side and
+/// answered it by **rebuilding** its string from our own prefix, so that not one
+/// byte of the stranger's survives. That is not available here: an envelope id
+/// is the provider's identifier for a document that now exists on their side,
+/// and there is nothing of ours to rebuild it from.
+///
+/// So the discipline is the other one this workspace uses when a value has to
+/// come back: keep only what a strict parser admits. The first substring of the
+/// rendered answer that parses as a UUID is the id, and everything else is
+/// dropped — so what reaches `signature_envelopes.provider_envelope_id` is 36
+/// characters of hex and dashes whatever the connector sent.
+///
+/// ponytail: a substring scan of the rendered JSON rather than a walk of the
+/// tree, `content::review_url`'s choice for its reason — an MCP answer carries
+/// its JSON inside a text block, so a walk would have to reparse the blocks
+/// anyway.
+///
+/// **Unverified, like [`SEND_ENVELOPE`]:** DocuSign's envelope ids are GUIDs
+/// on the REST API, and what its MCP server puts in a tool result has never
+/// been seen from here. If it answers with something that is not a UUID, this
+/// returns `None`, the send is refused with [`NO_ENVELOPE_ID`], and nothing is
+/// recorded as sent — which is the failure direction to be in.
+fn envelope_id(answer: &Value) -> Option<ProviderMessageId> {
+    let rendered = answer.to_string();
+    rendered
+        .as_bytes()
+        .windows(36)
+        .find_map(|window| std::str::from_utf8(window).ok()?.parse::<Uuid>().ok())
+        .map(|id| ProviderMessageId::new(id.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -3161,6 +3285,157 @@ impl Effects {
                 Err(err)
             }
         }
+    }
+
+    /// Put a document in front of somebody to sign, through the tenant's own
+    /// signature connector.
+    ///
+    /// # The escalation, and why it is the hardest one in the repository
+    ///
+    /// [`Effects::issue_invoice`] and [`Effects::propose_quote`] are this
+    /// method's two models and almost every answer they reached is reused
+    /// verbatim: the bound is the trusted newtype only, the audit row is
+    /// [`Self::record`]'s, the port's answer is a stranger's prose. One answer
+    /// is deliberately *not* reused, and it is the one that matters.
+    ///
+    /// A quote and an invoice are `Risk::High` with an arm that answers
+    /// `Allow`: a seat holding the right pack can issue one inside its own
+    /// turn, and what bounds it is the channel and the ledger. A signature is
+    /// `Risk::High` **and** `Decision::RequireApproval` with nothing above it —
+    /// so no seat signs alone, ever, whatever its pack says and whatever a
+    /// tenant writes in its policy layers. That is not this file's choice: it is
+    /// `domain::policy::evaluate`'s arm, and `rolepack_sales`,
+    /// `rolepack_service` and `rolepack` all already say in as many words that
+    /// they leave `ActionKind::ContractSign` out because the gate escalates it.
+    ///
+    /// **Why not one notch below** — `approval_above`, the way a payment is
+    /// handled, where small ones pass and large ones escalate. Because there is
+    /// no figure on a signature that plays the part an amount plays for a
+    /// payment. A one-euro contract can carry an auto-renewal, an exclusivity or
+    /// an indemnity, and `Action::ContractSign` carries a *title*, which is
+    /// prose: a threshold would have to be a rule over a sentence. And the
+    /// asymmetry that decides it is with `Effects::pay`, not against it — a
+    /// wrong payment is recoverable in the sense that a second payment reverses
+    /// it, and `invoices` has a credit note for exactly that reason. **A
+    /// signature has no second document that withdraws it.** The counterparty
+    /// holds an executed copy, and nothing this process does takes it back.
+    ///
+    /// So on the MCP side this is [`crate::mcp_server::Risk::Destructive`],
+    /// whose definition is written for it — *"retire, annule, ou engage la
+    /// société devant un tiers (un envoi, un paiement, une signature)"*.
+    ///
+    /// # The fence, for [`Effects::pay`]'s reason
+    ///
+    /// A `provider_intents` row committed before the request leaves, closed
+    /// after it is answered, left `in_flight` when nothing answers —
+    /// `agentos_store::provisioning::unsettled_calls` renders it for a person.
+    /// An envelope that left and was never recorded is a document in front of a
+    /// counterparty that this company has no record of, which is the same class
+    /// of morning as an unsettled payment.
+    ///
+    /// The bounded promise is the same one and not a bigger one, and for the
+    /// same reason as a payment: what makes a *replayed approval* impossible is
+    /// one layer up, in `approvals::redeem`, which moves the row out of
+    /// `pending` in the transaction `redeem_approval` commits before this method
+    /// is reached.
+    ///
+    /// # Not a port, and the argument is `Effects::issue_invoice`'s inverted
+    ///
+    /// An invoice has no provider because this workspace may not call a PSP. A
+    /// signature has one and it must: `docs/ROADMAP.md` says of electronic
+    /// signature *"par MCP, jamais reconstruite"*, and `crate::catalog`'s
+    /// `docusign` entry says why — a signature that holds up in court needs a
+    /// qualified timestamp, a retained audit trail and proof of the signer's
+    /// identity, three things a provider sells and nobody rewrites.
+    ///
+    /// So the port is [`McpCaller`], which already exists, and there is no
+    /// `SignatureProvider` trait: that would be an interface with one
+    /// implementation, and the implementation would be an MCP client this crate
+    /// already has. `crate::content::propose` reaches GitHub exactly this way.
+    ///
+    /// **Where this differs from `content::propose`, and why.** That function
+    /// mints an `Action::McpCall` per tool it speaks. This one does not: the
+    /// ruling that governs signing a contract is the signature, ruled on by a
+    /// human, and it is strictly stronger than any `McpCall` ruling could be —
+    /// a seat whose policy allows every DocuSign tool still cannot reach this
+    /// method without an approval. Folding an `McpCall` in on top would put
+    /// `mcp_call` in the audit row for the act that binds the company, where
+    /// `contract_sign` belongs.
+    ///
+    /// # What is **not** verified, said here rather than discovered later
+    ///
+    /// [`SEND_ENVELOPE`] is a tool name **this file invented**. No DocuSign
+    /// account exists in this deployment and none was created; `mcp.docusign.com`
+    /// answers `403 RBAC: access denied` to an unauthenticated caller, so
+    /// `tools/list` has never been read and no tool name, argument name or
+    /// answer shape on this path has ever been seen from the real server. What
+    /// the tests prove is the wiring — the gate, the fence, the audit row, the
+    /// write — against a fake server this workspace mounts itself, which is
+    /// `crate::content`'s `FauxGithub` and `agentos_providers::browser_chrome`'s
+    /// fake CDP. Against the real DocuSign, the first call returns
+    /// `unknown_tool` until somebody with an account reads `tools/list` once and
+    /// corrects three constants in this file.
+    pub async fn send_for_signature(
+        &self,
+        ok: Authorized<ContractSign>,
+        request: &SignatureRequest<'_>,
+    ) -> Result<ProviderMessageId, EffectError> {
+        let tool = McpTool::new(
+            request.server.clone(),
+            Slug::parse(SEND_ENVELOPE).expect("une constante de ce fichier"),
+        );
+
+        self.begin_send(&ok, SIGNATURE_PORT).await?;
+        let answered = self
+            .ports
+            .mcp
+            .call(
+                &tool,
+                &json!({
+                    "emailSubject": ok.action().subject().title,
+                    "signerEmail": request.signatory,
+                    "documentName": request.document_name,
+                    "documentBase64": BASE64.encode(request.bytes),
+                    "status": "sent",
+                }),
+            )
+            .await;
+
+        // Le `isError` de MCP est une réponse **réussie** qui dit que l'outil a
+        // échoué. `content::propose` a la même ligne, pour la même raison : le
+        // laisser passer enregistrerait un pli parti qui ne l'est pas.
+        //
+        // Les deux refus sortent en `ProviderError::Terminal` et pas en
+        // `EffectError::Refused`, parce que c'est ce que `record_sent` sait
+        // classer : le prestataire a lu la demande et a répondu non, donc la
+        // ligne d'intention se règle `failed` plutôt que de rester en vol.
+        let sent = match answered {
+            Ok(value) => {
+                let value = value.into_inner_for_rendering();
+                if value.get("isError").and_then(Value::as_bool) == Some(true) {
+                    Err(ProviderError::Terminal {
+                        code: ENVELOPE_REFUSED,
+                    })
+                } else {
+                    envelope_id(&value).ok_or(ProviderError::Terminal {
+                        code: NO_ENVELOPE_ID,
+                    })
+                }
+            }
+            Err(err) => Err(err),
+        };
+
+        // `provider_message_id` n'est pas épelé ici : `record_sent` y fond celui
+        // de `message_detail`, donc le numéro de pli garde une seule orthographe
+        // avec tous les autres identifiants de prestataire du journal.
+        let mut detail = Map::new();
+        detail.insert("server".to_owned(), json!(request.server.as_str()));
+        detail.insert("signatory".to_owned(), json!(request.signatory));
+        detail.insert(
+            "document_name".to_owned(),
+            json!(request.document_name.as_str()),
+        );
+        self.record_sent(&ok, sent, detail).await
     }
 
     /// Say something to the colleague named on the token, and wake them.
