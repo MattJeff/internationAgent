@@ -116,7 +116,32 @@ const WEBHOOK_SECRET: &str = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
 /// take five minutes to report, which costs five minutes. A deadline too short
 /// accuses the product of a defect it does not have, which costs an afternoon
 /// and teaches whoever reads the red to stop believing it.
-const CONVERGE_DEADLINE: Duration = Duration::from_secs(300);
+///
+/// **Et 300s était encore trop court : rouge en CI à 302s.** Raiser au jugé une
+/// quatrième fois serait courir après un runner. Le chiffre se **déduit**, et il
+/// se déduit du produit lui-même.
+///
+/// Un pas en cours de tentative n'écrit **rien** : `EngineEngine::attempt`
+/// réessaie en mémoire, sans toucher la ligne, donc `updated_at` ne bouge pas et
+/// l'écran que ce test lit est légitimement muet pendant tout le budget de
+/// reprise. Le silence normal le plus long vient donc de `EngineConfig`, dont
+/// les valeurs par défaut sont dans `crates/app/src/provisioning.rs` :
+///
+/// | terme | défaut | ce qu'il vaut |
+/// |---|---|---|
+/// | `max_attempts × (call_timeout + backoff_cap)` | 3 × (20s + 5s) | **75s** |
+/// | `lease` — une reprise perdue attend le balayage | 120s | **120s** |
+/// | total | | **195s** |
+///
+/// Puis le facteur de la machine, mesuré et non supposé : le même test converge
+/// en **33s** au repos et en **252s** pendant qu'un agent compile. Trois fois.
+/// 195 × 3 ≈ 600.
+///
+/// Dix minutes pour signaler un vrai blocage est le bon prix : il n'arrive
+/// jamais, et quand il arrivera on aura dix minutes de retard sur une panne
+/// qu'on cherchait de toute façon. Un faux rouge, lui, arrive à chaque vague et
+/// coûte un après-midi.
+const CONVERGE_DEADLINE: Duration = Duration::from_secs(600);
 
 // ---------------------------------------------------------------------------
 // Harness
