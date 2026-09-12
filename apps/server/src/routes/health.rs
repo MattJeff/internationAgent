@@ -147,6 +147,22 @@ struct Counts {
     last_success_at: Option<DateTime<Utc>>,
 }
 
+/// Le dernier tour raté, avec le siège qui l'a produit.
+///
+/// Une ligne nommée plutôt qu'un quintuplet : `LAST_FAILURE_SQL` joint deux
+/// tables, et cinq positions anonymes se relisent mal.
+#[derive(Debug, sqlx::FromRow)]
+struct Failure {
+    at: DateTime<Utc>,
+    code: String,
+    detail: Option<String>,
+    employee_id: uuid::Uuid,
+    /// `null` seulement si le siège a disparu entre les deux moitiés de la
+    /// jointure — la cascade de `0099` le rend impossible en pratique, et un
+    /// `LEFT JOIN` coûte moins qu'un `unwrap` à défendre.
+    slug: Option<String>,
+}
+
 /// Ce que rend `last_failure_detail` d'une société qui n'a connecté aucun
 /// modèle et n'a donc encore rien pu rater.
 ///
@@ -281,13 +297,7 @@ async fn get(State(db): State<Db>, principal: Principal) -> Result<Response, Api
         .fetch_one(&mut **tx)
         .await
         .map_err(StoreError::from)?;
-    let failure: Option<(
-        DateTime<Utc>,
-        String,
-        Option<String>,
-        uuid::Uuid,
-        Option<String>,
-    )> = sqlx::query_as(LAST_FAILURE_SQL)
+    let failure: Option<Failure> = sqlx::query_as(LAST_FAILURE_SQL)
         .bind(TURN)
         .fetch_optional(&mut **tx)
         .await
@@ -303,9 +313,13 @@ async fn get(State(db): State<Db>, principal: Principal) -> Result<Response, Api
 
     let (last_failure_at, last_failure_code, last_failure_detail, failed_by, failed_by_slug) =
         match failure {
-            Some((at, code, detail, employee_id, slug)) => {
-                (Some(at), Some(code), detail, Some(employee_id), slug)
-            }
+            Some(f) => (
+                Some(f.at),
+                Some(f.code),
+                f.detail,
+                Some(f.employee_id),
+                f.slug,
+            ),
             // Pas de tour raté, mais pas de modèle non plus : le verdict est
             // `stopped` et sa cause doit être lisible. On ne date pas cet échec —
             // il n'a pas eu lieu, c'est l'absence qui parle — et on n'écrase jamais
