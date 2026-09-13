@@ -408,6 +408,31 @@ mod tests {
         }
     }
 
+    /// Le seul test qui parle au vrai DNS, et il est **ignoré** : la suite ne
+    /// dépend d'aucun réseau, et celui-ci existe pour être lancé à la main le
+    /// jour où on doute de l'adaptateur —
+    /// `cargo test -p agentos-providers -- --ignored the_real_dns`.
+    ///
+    /// Les trois noms sont choisis pour durer : `gmail.com` publie des MX
+    /// depuis toujours, `.invalid` est réservé par la RFC 2606 et ne peut pas
+    /// être délégué, et `example.com` est réservé par la même RFC **et** publie
+    /// le MX nul de la RFC 7505 — c'est le seul domaine stable au monde qui le
+    /// fasse, ce qui en fait le seul témoin possible de cette branche.
+    #[tokio::test]
+    #[ignore = "parle au vrai DNS"]
+    async fn the_real_dns_answers_the_three_verdicts() {
+        let mx = HickoryMailDomains::from_system().expect("resolver");
+        assert_eq!(mx.lookup("gmail.com").await.unwrap(), MailDomain::Accepts);
+        assert_eq!(
+            mx.lookup("ceci-nexiste-pas.invalid").await.unwrap(),
+            MailDomain::NoSuchDomain
+        );
+        assert_eq!(
+            mx.lookup("example.com").await.unwrap(),
+            MailDomain::NoMailExchanger
+        );
+    }
+
     /// Le MX nul de la RFC 7505 (`.`) est le seul enregistrement présent qui
     /// soit un refus, et un `CNAME` dans la réponse n'est pas un serveur de
     /// courrier.
