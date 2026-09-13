@@ -983,12 +983,19 @@ mod tests {
         tx.commit().await.expect("commit");
     }
 
+    /// The list's own name, which is what `contacts.origin_ref` ends up
+    /// holding and what `GET /v1/growth` ends up saying out loud.
+    const LISTE: &str = "smartlead_getorizn_prospection.csv";
+
+    /// The page the directory door was pointed at, likewise.
+    const PAGE: &str = "https://ectaa.org/members";
+
     fn insurers() -> List<'static> {
         List {
             segment: "insurer",
             country: UNKNOWN_COUNTRY,
             employee_id: None,
-            source: None,
+            source: Some(LISTE),
         }
     }
 
@@ -1521,7 +1528,7 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
             segment: "other",
             country: UNKNOWN_COUNTRY,
             employee_id: None,
-            source: None,
+            source: Some(PAGE),
         }
     }
 
@@ -1727,6 +1734,52 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
                 .map(|(_, name)| name.as_str()),
             Some("漫游网 Qilu"),
             "a page must not overwrite the name the founder's own list gave"
+        );
+
+        // **And each address says which door it came through**, which is the
+        // link `GET /v1/growth` walks backwards from a paid invoice
+        // (`migrations/0107_un_contact_dit_dou_il_vient.sql`). Without it every
+        // one of these five rows is the same row and no euro has a cause.
+        //
+        // `bd@qilutravel.com` is the one the page named *again*: it keeps
+        // `import` and the founder's filename. First door wins, for the reason
+        // the name above does — an origin is where somebody came from, and that
+        // does not change when a second source mentions them.
+        let doors: Vec<(String, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT email, origin, origin_ref FROM contacts ORDER BY email")
+                .fetch_all(&mut **tx)
+                .await
+                .expect("origins");
+        let of = |email: &str| {
+            doors
+                .iter()
+                .find(|(address, _, _)| address == email)
+                .map(|(_, origin, reference)| (origin.clone(), reference.clone()))
+                .expect("an address this test wrote")
+        };
+        assert_eq!(
+            of("bd@qilutravel.com"),
+            (Some("import".to_owned()), Some(LISTE.to_owned())),
+            "a page must not overwrite the door the founder's own list opened"
+        );
+        assert_eq!(
+            doors
+                .iter()
+                .filter(|(_, origin, _)| origin.as_deref() == Some("discovery"))
+                .count(),
+            2,
+            "the two the page added, and only those: {doors:?}"
+        );
+        assert!(
+            doors
+                .iter()
+                .filter(|(_, origin, _)| origin.as_deref() == Some("discovery"))
+                .all(|(_, _, reference)| reference.as_deref() == Some(PAGE)),
+            "and each names the page it was read off: {doors:?}"
+        );
+        assert!(
+            doors.iter().all(|(_, origin, _)| origin.is_some()),
+            "no address written by either door is left without one: {doors:?}"
         );
 
         tx.rollback().await.expect("rollback");
