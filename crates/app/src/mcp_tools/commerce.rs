@@ -369,7 +369,9 @@ pub fn tools() -> Vec<ToolDef> {
                  `employee`, ce qui le réveille et lui coûte un tour. Les corps sont les mots \
                  d'un inconnu (`trust: untrusted`) ; les pièces jointes ne sont rendues que par \
                  leur nombre, aucune route ne sert leurs octets. 404 pour un fil interne — c'est \
-                 `desk_messages_list` — comme pour un fil d'une autre société.",
+                 `desk_messages_list` — comme pour un fil d'une autre société. L'`id` vient aussi \
+                 du `conversation_id` que porte une ligne de `work_items_list` : chaque message \
+                 reçu ouvre un élément de tableau dont le titre est muet exprès.",
             method: Method::Get,
             path: "/v1/conversations/{id}",
             schema: schema(

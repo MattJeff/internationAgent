@@ -123,6 +123,17 @@ La livraison sortante laisse aussi ses traces depuis `0091` : `delivered`,
 `opened`, `clicked` lus de Resend, en plus de `bounced` et `complained` qui
 finissent dans `suppressions`.
 
+Et depuis le 2026-09-13, **le fondateur peut lire ce qui est arrivé**. Ça
+paraît acquis et ça ne l'était pas : tout ce qui précède marchait, et aucune
+route ne rendait un `messages.body` — le seul `SELECT` d'un corps dans l'arbre
+était celui du bureau interne. Une campagne partie était donc une campagne
+aveugle : des ouvertures, des clics, un compteur de fils qui ont répondu, et
+pas une phrase. `GET /v1/conversations` (`conversations_list`) rend les fils où
+quelqu'un du dehors a écrit, avec un extrait ; `GET /v1/conversations/{id}`
+(`conversations_get`) rend le fil dans les deux sens. Lecture seule des deux
+côtés : répondre reste un acte d'employé, derrière la Gate, pour la raison que
+`routes::quotes` écrit sur son propre refus d'une route d'opérateur.
+
 ### 2.3 Les statistiques de tout
 
 C'est, à ma lecture, la partie la mieux faite du produit, et celle qu'un

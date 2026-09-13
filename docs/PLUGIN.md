@@ -185,7 +185,7 @@ python3 scripts/verifier-plugin.py
 
 Vérifié par ce script : chaque JSON parse, chaque `SKILL.md` porte un
 frontmatter délimité dont tous les champs sont documentés et dont le `name`
-correspond à son dossier, **chacun des 62 outils nommés par les quatre gestes
+correspond à son dossier, **chacun des 64 outils nommés par les quatre gestes
 existe encore dans `crates/app/src/mcp_tools/`**, aucun fichier ne contient
 `sk-`, `re_`, `whsec_` ni un `Bearer ` suivi d'un jeton, et la `source` du
 marketplace mène à un manifeste dont le nom correspond.

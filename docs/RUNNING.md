@@ -89,6 +89,7 @@ expensive defect available in this product.
 | Browser | built | `browser.rs`, `effects.rs` |
 | Email | built | `providers/src/email.rs`, `email_resend.rs` |
 | Inbound STOP → suppression | built | `inbound.rs::land`, and the quote is cut first |
+| **Read what they wrote back** | built | `GET /v1/conversations` (threads somebody outside wrote on, newest reply first, with an excerpt and `waiting`), `GET /v1/conversations/{id}` (the thread both ways, plus the delivery traces); `routes/conversations.rs`. Read-only: answering is an employee's act, through the gate — the same refusal `routes::quotes` argues. Until 2026-09-13 no route in the workspace selected a `messages.body` outside the internal desk, so a campaign that had gone out was a campaign nobody could read |
 | Provider refusal → suppression | built | `inbound.rs::record_refusal`, gated on `permanent` |
 | Delivered / opened / clicked → the chase knows | built | `message_events` (0091), written by `inbound.rs::record_raw_email_delivery` keyed on `svix-id`; the follow-up brief says "opened twice, the last 3 h ago" or "never opened"; `GET /v1/outreach/health?days=N` (default 30, max 365) → sent, delivered, opened, clicked, bounced, complained, and both rates in ‰ of sent; `store/traces.rs`, `routes/outreach.rs` |
 | Work queues | built | `outbox.rs`, `queue.rs` |
