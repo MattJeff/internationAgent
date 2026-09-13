@@ -78,6 +78,7 @@ pub mod email_resend; // real Resend client
 pub mod embedder; // U19
 pub mod embedder_openai; // real /v1/embeddings client
 pub mod leads; // the outbound sending platform's list
+pub mod mail_domain; // est-ce que ce domaine accepte du courrier : une question au DNS, jamais à un serveur de courrier
 pub mod llm; // U19
 pub mod llm_anthropic; // real /v1/messages client
 pub mod llm_cli; // local `claude` CLI backend, for testing without an API key
