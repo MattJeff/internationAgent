@@ -78,9 +78,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use agentos_domain::ids::TenantId;
 use agentos_providers::Secret;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+
+use crate::mcp::Credentials;
+use crate::model_access::ApiBase;
 
 /// La racine de l'API Stripe. [`StripeRead::with_base_url`] la déplace pour les
 /// tests, et pour un déploiement derrière un mandataire de sortie.
@@ -671,6 +675,116 @@ impl StripeRead {
 
         Ok(summarise(&subscriptions, events.as_deref(), now))
     }
+}
+
+// ---------------------------------------------------------------------------
+// La clé : scellée après preuve, ouverte le temps d'un écran
+// ---------------------------------------------------------------------------
+
+/// Le contexte de chiffrement sous lequel la clé Stripe d'un locataire est
+/// scellée.
+///
+/// Un locataire, un compte Stripe, donc l'identifiant du locataire suffit — la
+/// forme de `model_access::model_context`, et pour la même raison :
+/// `tenant_stripe_access` a une clé primaire d'une colonne précisément pour
+/// qu'un second compte ne soit pas représentable.
+///
+/// Le schéma `stripe://` est le **cinquième** espace de clés du dépôt, après
+/// `secret://`, `mcp://`, `model://` et celui de `crate::oauth`. Ce que la
+/// disjonction achète, concrètement : les colonnes scellées d'un même locataire
+/// sont à un `UPDATE … SELECT` les unes des autres pour qui peut écrire les
+/// tables, l'AAD du locataire ne les sépare pas (elles lui appartiennent
+/// toutes), et une clé d'API de modèle déplacée dans cette colonne partirait
+/// chez Stripe en `Authorization: Bearer`. Le contexte est la seule chose qui
+/// l'empêche.
+fn stripe_context(tenant_id: TenantId) -> String {
+    format!("stripe://{tenant_id}")
+}
+
+/// Pourquoi une clé n'a pas été rangée.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ConnectError {
+    /// Le corps portait une chaîne vide. Un formulaire qui poste `""` pour un
+    /// champ qu'on n'a pas touché est la façon la plus courante de ranger une
+    /// clé qui n'en est pas une.
+    #[error("an empty string is not a key")]
+    Blank,
+    /// Stripe a refusé, ou n'a pas répondu. La clé n'est **pas** rangée.
+    #[error(transparent)]
+    Stripe(#[from] StripeError),
+    /// Le chiffre n'a pas scellé. Une clé maîtresse absente ou changée.
+    #[error("the deployment's cipher refused to seal this key")]
+    Cipher,
+}
+
+/// Prouver une clé contre Stripe, puis la sceller pour la colonne.
+///
+/// **L'ordre est la moitié de l'intérêt.** Une clé rangée sans être prouvée est
+/// un écran qui dit « connecté » et un `null` le lendemain, et le lendemain
+/// personne ne sait si c'est la clé, le réseau ou le code. C'est la discipline
+/// de `model_access::connect`, une porte plus loin, avec sa propre sonde.
+///
+/// Ce que la sonde prouve : cette clé authentifie, et elle lit les abonnements.
+/// Ce qu'elle ne prouve pas : qu'elle soit **restreinte**. Rien dans l'API ne
+/// dit à un porteur ce que sa clé n'a pas le droit de faire, et une clé secrète
+/// complète collée ici passerait la sonde. C'est pour ça que la lecture seule
+/// est une propriété de [`StripeRead`] et non une confiance dans la clé.
+///
+/// `api_base` est `None` en production. Voir `model_access::ApiBase` : ce n'est
+/// pas une surface de configuration, c'est ce qui rend cette fonction testable
+/// autrement que par une paraphrase d'elle-même.
+pub async fn prove_and_seal(
+    credentials: &Credentials,
+    tenant_id: TenantId,
+    api_key: String,
+    api_base: ApiBase<'_>,
+) -> Result<Vec<u8>, ConnectError> {
+    // `String` pris par valeur et jamais rendu : le tampon que le corps de la
+    // requête a alloué devient celui que `Secret` efface en mourant. C'est
+    // l'argument de `Credentials::seal`, mot pour mot.
+    let trimmed = api_key.trim();
+    if trimmed.is_empty() {
+        return Err(ConnectError::Blank);
+    }
+    let secret = Secret::new(trimmed);
+    let client = match api_base {
+        Some(origin) => {
+            StripeRead::new(Secret::new(secret.expose_for_transport())).with_base_url(origin)
+        }
+        None => StripeRead::new(Secret::new(secret.expose_for_transport())),
+    };
+    client.probe().await?;
+    credentials
+        .seal_as(tenant_id, &stripe_context(tenant_id), &secret)
+        .map_err(|_| ConnectError::Cipher)
+}
+
+/// Ouvrir la clé rangée, le temps d'une lecture.
+///
+/// Le [`Secret`] est un local : il meurt avec le client, qui meurt avec
+/// l'écran. Aucune ligne d'audit par lecture — la pose est auditée une fois,
+/// et une ligne par chargement d'écran disant « on a ouvert la clé pour faire
+/// ce que la ligne suivante décrit » serait du volume sans question derrière.
+///
+/// `None` : l'enveloppe ne s'ouvre pas sous ce contexte. Une clé maîtresse
+/// tournée, une ligne restaurée d'une autre installation, ou un blob déplacé
+/// d'une autre colonne scellée. Le seul remède est de recoller la clé, donc
+/// l'appelant rend `null` et n'a rien à décider.
+#[must_use]
+pub fn client_for(
+    credentials: &Credentials,
+    tenant_id: TenantId,
+    sealed: &[u8],
+    api_base: ApiBase<'_>,
+) -> Option<StripeRead> {
+    let key = credentials
+        .open_as(tenant_id, &stripe_context(tenant_id), sealed)
+        .ok()?;
+    let client = StripeRead::new(key);
+    Some(match api_base {
+        Some(origin) => client.with_base_url(origin),
+        None => client,
+    })
 }
 
 #[cfg(test)]
@@ -1323,6 +1437,78 @@ mod tests {
                 .iter()
                 .any(|request| request.query.contains("starting_after=sub_1")),
             "{asked:#?}"
+        );
+    }
+
+    // -- la clé ------------------------------------------------------------
+
+    /// **Une clé est prouvée avant d'être rangée, et elle n'ouvre que là où
+    /// elle a été scellée.**
+    ///
+    /// Les deux moitiés sont dans le même test parce qu'elles sont la même
+    /// promesse vue des deux bouts : ce qui entre est prouvé, ce qui sort est
+    /// celui du bon locataire sous le bon contexte.
+    #[tokio::test]
+    async fn une_cle_est_prouvee_avant_detre_rangee_et_nouvre_que_sous_son_contexte() {
+        use agentos_providers::secrets::LocalEnvelopeSecretStore;
+
+        let credentials = Credentials::new(Arc::new(LocalEnvelopeSecretStore::new([4_u8; 32])));
+        let tenant = TenantId::new_v7(Utc::now());
+        let autre = TenantId::new_v7(Utc::now());
+
+        // Une chaîne vide n'est pas une clé, et ça se voit sans réseau.
+        assert_eq!(
+            prove_and_seal(&credentials, tenant, "   ".to_owned(), None).await,
+            Err(ConnectError::Blank)
+        );
+
+        // Stripe refuse : rien n'est scellé, donc rien ne sera rangé.
+        let refus = FakeStripe::start(401, vec![]).await;
+        let base = format!("http://{}", refus.addr);
+        assert_eq!(
+            prove_and_seal(
+                &credentials,
+                tenant,
+                "rk_live_fausse".to_owned(),
+                Some(&base)
+            )
+            .await,
+            Err(ConnectError::Stripe(StripeError::Refused))
+        );
+        assert!(
+            refus.seen().iter().all(|request| request.method == "GET"),
+            "même la sonde ne fait qu'un GET"
+        );
+
+        // Stripe accepte : la clé est scellée, et elle rouvre.
+        let vrai = FakeStripe::start(200, vec![("/subscriptions", page(json!([]), false))]).await;
+        let base = format!("http://{}", vrai.addr);
+        let sealed = prove_and_seal(
+            &credentials,
+            tenant,
+            "rk_live_vraie".to_owned(),
+            Some(&base),
+        )
+        .await
+        .expect("prouvée");
+        assert!(!sealed.is_empty());
+        let client = client_for(&credentials, tenant, &sealed, Some(&base)).expect("rouverte");
+        assert_eq!(client.probe().await, Ok(()));
+
+        // Pas sous un autre locataire : l'AAD du locataire.
+        assert!(client_for(&credentials, autre, &sealed, None).is_none());
+        // Et pas depuis une autre colonne scellée du **même** locataire : c'est
+        // ce que `stripe://` achète, et l'AAD du locataire ne l'achèterait pas.
+        let ailleurs = credentials
+            .seal_as(
+                tenant,
+                &format!("model://{tenant}"),
+                &Secret::new("sk-ant-la-cle-du-modele"),
+            )
+            .expect("scellée ailleurs");
+        assert!(
+            client_for(&credentials, tenant, &ailleurs, None).is_none(),
+            "une clé de modèle déplacée dans la colonne Stripe partirait chez Stripe"
         );
     }
 
