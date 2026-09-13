@@ -878,7 +878,7 @@ fn app(
             // taux de passage, la recette, le coût du modèle, et la cible que
             // le fondateur a posée — la seule lecture qui réponde à « est-ce
             // que j'y arrive ».
-            .merge(routes::growth::router(db.clone()))
+            .merge(routes::growth::router(db.clone(), credentials.clone()))
             .merge(routes::accounting::router(db.clone()))
             .merge(routes::teams::router(hiring.clone()))
             .merge(routes::companies::router(hiring.clone()))
