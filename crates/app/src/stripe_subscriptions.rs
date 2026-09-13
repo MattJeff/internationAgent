@@ -1460,6 +1460,130 @@ mod tests {
         );
     }
 
+    /// **La marche, sur la grille d'Orizn.**
+    ///
+    /// Quatre paliers — 0 $, 49 $, 199 $, 600 $ — tels que `visa.orizn.app` les
+    /// vendait le 2026-09-13, un abonné arrivé et un parti dans la fenêtre.
+    /// C'est le test qui répond à la question du fondateur avec ses propres
+    /// chiffres, et le seul endroit du dépôt où le palier gratuit montre ce
+    /// qu'il fait à la lecture : il compte un abonné et n'ajoute pas un centime.
+    #[tokio::test]
+    async fn la_grille_dorizn_de_bout_en_bout() {
+        let abonnements = json!([
+            // Deux gratuits : des abonnés, zéro recette.
+            subscription(
+                "sub_f1",
+                "active",
+                json!([item("price_free", Some("Gratuit"), Some(0), "usd")])
+            ),
+            subscription(
+                "sub_f2",
+                "active",
+                json!([item("price_free", Some("Gratuit"), Some(0), "usd")])
+            ),
+            // Trois à 49 $, dont un dont la carte a été refusée hier.
+            subscription(
+                "sub_s1",
+                "active",
+                json!([item("price_starter", Some("Starter"), Some(4900), "usd")])
+            ),
+            subscription(
+                "sub_s2",
+                "active",
+                json!([item("price_starter", Some("Starter"), Some(4900), "usd")])
+            ),
+            subscription(
+                "sub_s3",
+                "past_due",
+                json!([item("price_starter", Some("Starter"), Some(4900), "usd")])
+            ),
+            // Un à 199 $.
+            subscription(
+                "sub_p1",
+                "active",
+                json!([item("price_pro", Some("Pro"), Some(19_900), "usd")])
+            ),
+            // Un « dès 600 $ » négocié à 750 $, payé à l'année.
+            json!({
+                "id": "sub_e1",
+                "object": "subscription",
+                "status": "active",
+                "items": { "object": "list", "has_more": false, "data": [{
+                    "id": "si_e1",
+                    "object": "subscription_item",
+                    "quantity": 1,
+                    "price": {
+                        "id": "price_enterprise",
+                        "object": "price",
+                        "currency": "usd",
+                        "nickname": "Entreprise",
+                        "unit_amount": 900_000,
+                        "recurring": { "interval": "year", "interval_count": 1 },
+                    },
+                }]},
+            }),
+            // Et un essai, qui ne paie pas encore.
+            subscription(
+                "sub_t1",
+                "trialing",
+                json!([item("price_pro", Some("Pro"), Some(19_900), "usd")])
+            ),
+        ]);
+
+        let fake = FakeStripe::start(
+            200,
+            vec![
+                ("/subscriptions", page(abonnements, false)),
+                (
+                    "/events",
+                    page(
+                        json!([
+                            event(STARTED, "evt_1", "sub_s2"),
+                            event(STOPPED, "evt_2", "sub_parti"),
+                        ]),
+                        false,
+                    ),
+                ),
+            ],
+        )
+        .await;
+
+        let now = Utc::now();
+        let read = fake
+            .client()
+            .read(now - chrono::Duration::days(29), now)
+            .await
+            .expect("la lecture");
+
+        // Sept abonnés : les deux gratuits, les trois à 49 $ (le past_due
+        // compris), le 199 $ et l'annuel. L'essai n'en est pas un.
+        assert_eq!(read.subscribers, 7);
+        // 0 + 0 + 49 × 3 + 199 + 750 = 1 096 $.
+        assert_eq!(read.mrr_minor, Some(109_600));
+        assert_eq!(read.currency.as_deref(), Some("usd"));
+        assert!(!read.mrr_is_floor, "tous les montants ont été lus");
+        assert_eq!(read.started, Some(1));
+        assert_eq!(read.stopped, Some(1));
+
+        // Les paliers, du plus gros au plus petit, et le gratuit en dernier
+        // avec ses deux abonnés et ses zéro cents.
+        let paliers: Vec<(&str, i64, Option<i64>)> = read
+            .tiers
+            .iter()
+            .map(|tier| (tier.price_id.as_str(), tier.subscribers, tier.mrr_minor))
+            .collect();
+        assert_eq!(
+            paliers,
+            [
+                ("price_enterprise", 1, Some(75_000)),
+                ("price_pro", 1, Some(19_900)),
+                ("price_starter", 3, Some(14_700)),
+                ("price_free", 2, Some(0)),
+            ],
+            "le gratuit est un abonné et pas un centime"
+        );
+    }
+
     // -- la clé ------------------------------------------------------------
 
     /// **Une clé est prouvée avant d'être rangée, et elle n'ouvre que là où
