@@ -361,7 +361,10 @@ pub fn tools() -> Vec<ToolDef> {
             title: "Où en est un échange, message par message",
             description: "Rend les cinquante derniers messages d'un fil dans les deux sens, du \
                  plus ancien au plus récent et sans coupe dans les corps, plus ce que nos envois \
-                 ont laissé comme traces chez le fournisseur (livré, ouvert, cliqué, les liens). \
+                 ont laissé comme traces chez le fournisseur (livré, ouvert, cliqué, les liens) — \
+                 **`engagement` vaut `null` hors e-mail**, parce que seul le rappel du \
+                 fournisseur d'e-mail écrit ces traces et que sept zéros se liraient comme une \
+                 mesure. \
                  C'est la suite de `conversations_list`, d'où vient l'`id` : la liste dit qui a \
                  répondu, celui-ci dit ce qui s'est dit. **Aucun outil ne répond à leur place** — \
                  un message parti au nom de la société passe par la Policy Gate depuis un siège ; \

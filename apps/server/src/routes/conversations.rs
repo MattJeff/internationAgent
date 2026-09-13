@@ -361,7 +361,19 @@ struct MessageView {
     at: DateTime<Utc>,
 }
 
-/// Ce qu'un envoi a laissé comme traces, quand le canal en laisse.
+/// Ce qu'un envoi a laissé comme traces — **e-mail seulement, et `null`
+/// ailleurs**.
+///
+/// `traces::engagement` compte les lignes `channel = 'email'` du fil et les
+/// `message_events` qui s'y rattachent, et `message_events` n'a qu'un
+/// écrivain : le rappel de Resend. Sur un fil SMS ou WhatsApp, les sept
+/// champs valent donc structurellement zéro — et « zéro envoi, zéro
+/// livraison » sur un fil où l'on a réellement écrit est un mensonge de la
+/// même famille que le taux de rebond à 0 ‰ que `routes::outreach::per_mille`
+/// a dû corriger deux fois : *un zéro sans dénominateur n'est pas une mesure,
+/// c'est l'absence de mesure*. Alors le bloc est `null` hors e-mail, ce qui se
+/// lit « cette question ne se pose pas sur ce canal » et ne se confond avec
+/// rien.
 #[derive(Serialize)]
 struct EngagementView {
     /// Nos e-mails sortants sur ce fil.
@@ -443,7 +455,14 @@ async fn one(
     // façons — `message_id` quand la ligne existait déjà, sinon
     // `provider_message_id` : Resend peut livrer un `opened` avant le
     // `delivered`, et même avant notre propre ligne.
-    let engagement = traces::engagement(&mut tx, ConversationId::from_uuid(id)).await?;
+    //
+    // Sur un fil qui n'est pas e-mail, la requête n'est pas posée du tout :
+    // elle rendrait sept zéros qui se lisent comme une mesure. Voir
+    // [`EngagementView`].
+    let engagement = match channel.as_str() {
+        "email" => Some(traces::engagement(&mut tx, ConversationId::from_uuid(id)).await?),
+        _ => None,
+    };
     tx.rollback().await?;
 
     // Rendus du plus ancien au plus récent : un fil se lit comme une
@@ -477,15 +496,15 @@ async fn one(
         "truncated": count > i64::try_from(messages.len()).unwrap_or(i64::MAX),
         "trust": UNTRUSTED,
         "thread": messages,
-        "engagement": EngagementView {
-            sent: engagement.sent,
-            delivered: engagement.delivered,
-            opened: engagement.opened,
-            clicked: engagement.clicked,
-            last_opened_at: engagement.last_opened_at,
-            last_clicked_at: engagement.last_clicked_at,
-            links: engagement.links,
-        },
+        "engagement": engagement.map(|traces| EngagementView {
+            sent: traces.sent,
+            delivered: traces.delivered,
+            opened: traces.opened,
+            clicked: traces.clicked,
+            last_opened_at: traces.last_opened_at,
+            last_clicked_at: traces.last_clicked_at,
+            links: traces.links,
+        }),
     }))
     .into_response())
 }
@@ -865,12 +884,24 @@ mod tests {
         assert_eq!(thread[1]["direction"], Value::from("inbound"));
         assert_eq!(thread[2]["body"], Value::from("notre relance"));
         assert_eq!(body["truncated"], Value::from(false));
+        // Fil e-mail : le bloc de traces existe, même sans aucune trace — la
+        // question se pose sur ce canal.
+        assert_eq!(body["engagement"]["sent"], Value::from(2), "{body}");
         assert!(
             body["employee"]
                 .as_str()
                 .is_some_and(|slug| slug.starts_with("lena-")),
             "le siège qui tient le fil est nommé : {body}"
         );
+
+        // Et sur un fil qui n'est pas e-mail, le bloc est absent plutôt que
+        // rempli de zéros : rien n'écrit de trace sur ce canal, et « zéro
+        // envoi » sur un fil où l'on a écrit est un mensonge, pas une mesure.
+        let sms = conversation(&h.db, h.a, h.seat_a, "sms", "+33612345678").await;
+        message(&h.db, h.a, h.seat_a, sms, "outbound", "un texto", now).await;
+        message(&h.db, h.a, h.seat_a, sms, "inbound", "leur texto", now).await;
+        let (_, body) = h.get(&format!("/v1/conversations/{sms}"), SECRET_A).await;
+        assert_eq!(body["engagement"], Value::Null, "{body}");
 
         h.teardown().await;
     }
