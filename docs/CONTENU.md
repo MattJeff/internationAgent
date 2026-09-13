@@ -706,12 +706,12 @@ La règle du § 2 s'applique à toute source qu'on approche, et l'hypothèse
 |---|---|---|
 | `stackoverflow.com` | **le fichier lui-même ne se lit pas** : un défi Cloudflare répond à sa place | On ne lit pas. Un site qui refuse jusqu'à sa propre déclaration refuse tout le reste. |
 | `www.reddit.com` | `User-agent: *` / `Disallow: /`, avec un lien vers sa *Public Content Policy* | On ne lit pas. Le refus est écrit, complet, et il vaut aussi pour qui vient chercher une cible. |
-| `www.quora.com` | interdit explicitement l'usage du contenu pour entraîner ou alimenter un système automatique sans accord contractuel | On ne lit pas. |
+| `www.quora.com` | `User-agent: *` / `Disallow: /`, avec une poignée d'`Allow` qui ne couvrent que l'accueil, « à propos » et l'inscription — aucune page de question. Et deux blocs plus haut, `Claude-User` et `Claude-SearchBot` sont nommés avec `Disallow: /` | On ne lit pas, et deux fois plutôt qu'une : la règle générique refuse, et notre nom est écrit dans le fichier. |
 | `news.ycombinator.com` | `Crawl-delay: 30`, et seuls les chemins d'action (`/vote?`, `/reply?`, `/login`…) sont interdits — les pages d'articles sont ouvertes | **Lisible**, à trente secondes par page. Pas lu quand même : voir ci-dessous. |
 
-Donc les deux plus gros endroits où une question de développeur est posée nous
-sont **fermés par écrit**, et le seul qui reste ouvert l'est à un rythme qui
-interdit l'exploration. Le chemin « aller lire les forums pour y trouver nos
+Donc les trois plus gros endroits où une question se pose nous sont **fermés par
+écrit** — et Quora prend la peine de nommer nos agents un par un —, tandis que
+le seul qui reste ouvert l'est à un rythme qui interdit l'exploration. Le chemin « aller lire les forums pour y trouver nos
 questions » est mort avant d'avoir coûté une ligne — ce qui est exactement à
 quoi sert de vérifier d'abord.
 
