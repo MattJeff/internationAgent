@@ -55,6 +55,7 @@ pub mod sequence; // la séquence: several promises in a row, branching on what 
 pub mod signature; // la signature d'un document : le pli qu'on envoie, la décision humaine qui le libère, et l'exemplaire exécuté
 pub mod sourcing;
 pub mod stripe; // une livraison Stripe encaisse une facture : le quatrième schéma de webhook
+pub mod stripe_subscriptions; // lire chez Stripe le revenu d'abonnement qu'aucune facture d'ici ne porte — et ne rien lui écrire
 pub mod turn; // U25
 pub mod vertical; // le fil du pack de rôle vers une verticale
 pub mod webhooks; // wave M: whose provider callback this is, when there is more than one customer
