@@ -4371,8 +4371,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use agentos_providers::mail_domain::MockMailDomains;
     use crate::gate::{Denied, PolicyGate};
+    use agentos_providers::mail_domain::MockMailDomains;
 
     // -- test doubles for the two ports that have no adapter ---------------
 

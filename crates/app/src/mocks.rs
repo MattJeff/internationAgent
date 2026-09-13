@@ -56,10 +56,10 @@ use agentos_providers::cdp::CdpWebsocket;
 use agentos_providers::email::{EmailProvider, MockEmailProvider};
 use agentos_providers::email_resend::ResendEmailProvider;
 use agentos_providers::embedder::Embedder;
-use agentos_providers::mail_domain::HickoryMailDomains;
 use agentos_providers::embedder_openai::OpenAiEmbedder;
 use agentos_providers::llm_anthropic::AnthropicLlm;
 use agentos_providers::llm_cli::CliLlm;
+use agentos_providers::mail_domain::HickoryMailDomains;
 use agentos_providers::secrets::LocalEnvelopeSecretStore;
 use agentos_providers::telephony::{MockTelephony, TelephonyProvider};
 use agentos_providers::telephony_twilio::TwilioTelephony;
@@ -1307,11 +1307,11 @@ mod tests {
                 BrowserPorts::default(),
                 Arc::new(MockMailDomains::silent()),
             )
-                .browser
-                .ensure_context(&ctx)
-                .await
-                .expect("ensure")
-                .provider
+            .browser
+            .ensure_context(&ctx)
+            .await
+            .expect("ensure")
+            .provider
         };
 
         assert_eq!(provider_of(&Credentials::default()).await, MOCK_PROVIDER);
@@ -1385,11 +1385,11 @@ mod tests {
                 BrowserPorts::default(),
                 Arc::new(MockMailDomains::silent()),
             )
-                .browser
-                .ensure_context(&ctx)
-                .await
-                .expect("ensure")
-                .provider
+            .browser
+            .ensure_context(&ctx)
+            .await
+            .expect("ensure")
+            .provider
         };
 
         assert_eq!(
@@ -1423,16 +1423,16 @@ mod tests {
         };
         assert_eq!(
             ports_for(
-            &both,
-            "https://agents.test",
-            BrowserPorts::default(),
-            Arc::new(MockMailDomains::silent()),
-        )
-                .browser
-                .ensure_context(&ctx.clone().with_existing(existing))
-                .await
-                .expect("a persisted binding needs no round trip")
-                .provider,
+                &both,
+                "https://agents.test",
+                BrowserPorts::default(),
+                Arc::new(MockMailDomains::silent()),
+            )
+            .browser
+            .ensure_context(&ctx.clone().with_existing(existing))
+            .await
+            .expect("a persisted binding needs no round trip")
+            .provider,
             agentos_providers::browser_browserbase::PROVIDER
         );
     }

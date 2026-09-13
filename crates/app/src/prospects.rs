@@ -521,7 +521,9 @@ pub async fn import(
         };
 
         if let Some(why) = no_mail_here(mx, &address, &mut report).await {
-            report.refused.push(format!("line {line}: {address}: {why}"));
+            report
+                .refused
+                .push(format!("line {line}: {address}: {why}"));
             continue;
         }
 
@@ -1295,12 +1297,15 @@ mod tests {
         let now = Utc::now();
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
 
-        let first = import(&mut tx, &insurers(), &anywhere(), REAL, now).await.expect("one");
+        let first = import(&mut tx, &insurers(), &anywhere(), REAL, now)
+            .await
+            .expect("one");
         let before = (accounts(&mut tx).await, contacts(&mut tx).await);
 
         let second = import(
             &mut tx,
             &insurers(),
+            &anywhere(),
             REAL,
             now + chrono::TimeDelta::hours(1),
         )
@@ -1567,7 +1572,9 @@ mod tests {
             employee_id: None,
             source: None,
         };
-        let report = import(&mut tx, &list_of, &anywhere(), &list, now).await.expect("import");
+        let report = import(&mut tx, &list_of, &anywhere(), &list, now)
+            .await
+            .expect("import");
         assert_eq!(report.contacts_created, 3);
         assert_eq!(report.nameless, 2);
         assert!(report.refused.is_empty(), "{:?}", report.refused);
@@ -1925,6 +1932,7 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
         let second = discover(
             &mut tx,
             &associations(),
+            &anywhere(),
             &directory(),
             now + chrono::TimeDelta::hours(1),
             50,
@@ -2257,9 +2265,16 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
 
         // Tomorrow is a new day, on the same rows.
         let tomorrow = now + chrono::TimeDelta::days(1);
-        let fresh = discover(&mut tx, &associations(), &anywhere(), &directory(), tomorrow, 2)
-            .await
-            .expect("discover");
+        let fresh = discover(
+            &mut tx,
+            &associations(),
+            &anywhere(),
+            &directory(),
+            tomorrow,
+            2,
+        )
+        .await
+        .expect("discover");
         assert_eq!(fresh.contacts_created, 1, "the third one, at last");
         assert!(fresh.refused.is_empty(), "{:?}", fresh.refused);
 
