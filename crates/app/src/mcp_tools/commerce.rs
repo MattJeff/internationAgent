@@ -160,7 +160,11 @@ pub fn tools() -> Vec<ToolDef> {
                  même fichier ne duplique rien : un compte est son domaine, un contact son \
                  adresse. Corps plafonné à 1 Mio comme toute requête de cette API. **Le rapport ne \
                  rend aucun identifiant** : les contacts créés se relisent sur `contacts_list`, \
-                 qui est la seule source du `contact_id` que `sequences_enroll` réclame.",
+                 qui est la seule source du `contact_id` que `sequences_enroll` réclame. \
+                 **Nommez la liste dans `source`** : ce nom est écrit sur chaque contact créé et \
+                 c'est lui que `growth_get` prononce quand on lui demande d'où vient un euro. \
+                 L'omettre n'empêche rien et coûte la réponse : les contacts portent alors \
+                 « importé, d'une liste sans nom ».",
             method: Method::Post,
             path: "/v1/prospects/import",
             schema: json!({
@@ -181,11 +185,15 @@ pub fn tools() -> Vec<ToolDef> {
                     "dry_run": {
                         "type": "boolean",
                         "description": "true n'écrit rien et rend le rapport ; à faire en premier"
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "le nom de cette liste — un nom de fichier, un fournisseur. Écrit sur chaque contact créé, et rendu par `growth_get` comme l'origine des factures qui en découlent."
                     }
                 },
                 "required": ["csv", "segment"],
             }),
-            query: &["segment", "country", "dry_run"],
+            query: &["segment", "country", "dry_run", "source"],
             // La seule ligne de ce déploiement à corps brut, et la raison
             // d'être du champ : la route lit des octets et refuse en 415 tout
             // ce qui n'est pas `text/csv`.
@@ -1675,7 +1683,7 @@ mod tests {
         );
         // Le reste part en chaîne de requête : la route les lit là, et un
         // corps brut n'a pas de place pour eux.
-        for key in ["segment", "country", "dry_run"] {
+        for key in ["segment", "country", "dry_run", "source"] {
             assert!(tool.query.contains(&key), "{key}");
         }
     }
