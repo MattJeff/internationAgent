@@ -228,6 +228,24 @@ not given as ISO-2 (the location string is kept verbatim instead). An address on
 the suppression list is skipped and never re-activated. `docs/ORIZN.md` §8 is the
 column-by-column table and `agentos_app::prospects` is the argument for each.
 
+**It refuses an address whose domain takes no mail**, and names each one in the
+report with which of the two it was — the domain does not exist, or it publishes
+no mail exchanger. One DNS question per domain (`hickory`'s own cache, at each
+record's own TTL); **no mail server is ever contacted**, so whether the *mailbox*
+exists is not something this knows or will ever ask. The reason it refuses at
+all is that a list which bounces does not cost contacts, it burns the sending
+domain §7 rotates. Two lines to read in the report:
+
+```text
+6 addresses are on a domain that takes no mail and were NOT imported; …
+3 addresses were imported WITHOUT being checked: the resolver did not answer …
+```
+
+The second one matters: a resolver that does not answer never refuses anybody —
+a broken resolver silently dropping a whole list would be worse than every
+bounce it prevents — so a run with a large number there has verified nothing,
+and `dig MX <domain>` from the same machine is the first thing to try.
+
 **The same import, from the console.** `POST /v1/prospects/import` is the
 subcommand as a route, for the founder who has the CSV on a laptop and no shell
 in the container. Same auth as `outreach`, the body is the file:
