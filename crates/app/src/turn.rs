@@ -3131,6 +3131,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use agentos_providers::mail_domain::MockMailDomains;
     use crate::effects::{McpCaller, PaymentProvider, Ports};
     use crate::gate::{PolicyGate, Principal};
     use crate::vertical::Charter;
@@ -3424,6 +3425,7 @@ mod tests {
             mcp,
             payments: payments.clone(),
             leads: Arc::new(MockLeadSink::new()),
+            mail_domains: Arc::new(MockMailDomains::silent()),
         });
         let effects = Effects::new(db.clone(), ports, principal.clone());
 

@@ -1182,6 +1182,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use agentos_providers::mail_domain::MockMailDomains;
     use crate::effects::{McpCaller, PaymentInstruction, PaymentProvider, Ports};
     use crate::gate::PolicyGate;
 
@@ -1342,6 +1343,7 @@ mod tests {
             mcp: Arc::new(StubMcp),
             payments: payments.clone(),
             leads: Arc::new(MockLeadSink::new()),
+            mail_domains: Arc::new(MockMailDomains::silent()),
         });
         let effects = Effects::new(db.clone(), ports, principal.clone());
 

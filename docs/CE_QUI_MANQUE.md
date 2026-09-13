@@ -269,13 +269,46 @@ Et c'est le seul des trois qui vise le vrai coût : une liste qui rebondit ne
 coûte pas des contacts perdus, elle brûle **le domaine d'envoi**, et
 `outreach_health_get` ne le voit qu'après.
 
-**Recommandé — et pas maintenant.** La raison est celle que § 7 oppose déjà à
-la recherche elle-même : *ouvrir le robinet avant d'avoir mesuré, c'est ajouter
-avant de mesurer*. On n'a **aucun taux de rebond d'une semaine réelle** — les
-deux taux de `GET /v1/outreach/health` valent `null` tant que rien n'est
-revenu. Construire un vérificateur avant de connaître le nombre qu'il doit
-faire baisser, c'est construire contre une intuition. La semaine de prospection
-réelle est la même que celle de la cinquième place ; ce chantier la suit.
+**Recommandé — et pas maintenant**, disait ce paragraphe le 2026-09-12, parce
+qu'on n'avait aucun taux de rebond d'une semaine réelle. Ce qui a changé le
+2026-09-13 : le fondateur commence à prospecter sur sa propre entreprise avec
+**deux domaines vérifiés chez Resend** qu'il ne peut pas se permettre de
+brûler. Attendre le nombre aurait voulu dire l'obtenir en brûlant ce qu'il
+mesure.
+
+**Bâti**, et voici ce que ça fait et ne fait pas.
+
+`crates/providers/src/mail_domain.rs` pose **une** question au résolveur du
+système : ce domaine publie-t-il une destination de courrier ? Trois verdicts —
+le domaine n'existe pas (NXDOMAIN), il existe et ne veut pas de courrier (aucun
+MX, aucune adresse à la place, ou le MX nul de la RFC 7505), il en accepte — et
+une quatrième réponse qui n'est pas un verdict : *le résolveur n'a pas
+répondu*, qui n'écarte jamais personne. La dépendance est `hickory-resolver`
+sans ses features par défaut ; `tokio::net::lookup_host` ne pouvait pas servir,
+`getaddrinfo` n'a pas de type d'enregistrement.
+
+**Pas de SMTP.** Savoir si la *boîte* existe demande un `RCPT TO` chez
+l'hébergeur du destinataire : une sollicitation, à laquelle Google et Microsoft
+répondent « oui » de toute façon, et qui fait lister l'IP qui la pose. Le
+module en porte l'argument entier.
+
+**À l'import et à la découverte, pas à l'envoi.** `deliverability::check` est
+au fil parce que le corps qu'il juge *n'existe pas* avant l'envoi ; une adresse
+existe à l'import, et la règle est de juger au plus tôt. Conséquence assumée :
+le verdict vieillit — un domaine peut perdre son MX entre l'import et l'envoi,
+et rien ne le verra. La suite est un appel au même port à côté de
+`deliverability::check`, et **ce qui dira s'il faut la faire est le taux de
+rebond réel**, celui que ce paragraphe attendait : si les rebonds tombent sur
+des domaines qui ont bien un MX, ce n'est pas là qu'il faut regarder.
+
+**Le refus est nommé, pas silencieux.** L'adresse n'est pas écrite et le
+rapport la cite avec sa raison (`Report::no_mail_domain`), sur le modèle des
+compteurs que `prospects_import` avait déjà ; un résolveur muet écrit la ligne
+et le dit (`Report::mx_unknown`), pour qu'« cette liste est propre » ne se
+confonde pas avec « rien n'a été vérifié ».
+
+**Pas de cache écrit à la main.** Celui de hickory, au TTL que chaque autorité
+publie, dans une instance partagée par tout le processus.
 
 #### Chemin C — acheter
 

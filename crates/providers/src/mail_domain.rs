@@ -37,8 +37,17 @@
 //!   tombe sur l'expéditeur, c'est-à-dire sur la réputation que ce chantier
 //!   existe pour protéger.
 //!
-//! On s'arrête donc au serveur de courrier, et [`crate::mail_domain`] ne parle
-//! à personne d'autre qu'au résolveur du système.
+//! On s'arrête donc au serveur de courrier, et ce module ne parle à personne
+//! d'autre qu'au résolveur du système.
+//!
+//! **Qui fait payer pour le quatrième point, nommé et pas appelé.** `lumail`
+//! porte un outil `verify_email` et `exa` sait lire le web public
+//! (`docs/CATALOGUE.md`) ; les deux demandent une clé, donc un compte, donc une
+//! dépense, et le plancher de `lumail` est `Destructive`, ce qui veut dire
+//! qu'un humain approuve chaque appel de toute façon. Le jour où le DNS ne
+//! suffit plus — c'est-à-dire le jour où une semaine d'envois montre des
+//! rebonds sur des domaines qui ont bien un MX — c'est là qu'on regarde, pas
+//! avant.
 //!
 //! # Ce n'est pas un contrôle SSRF, et la différence est le fond
 //!
@@ -238,25 +247,58 @@ fn unavailable() -> ProviderError {
     }
 }
 
-/// Le faux : une table de domaines, et rien d'autre.
+/// Le faux : une table de domaines, et un verdict par défaut pour le reste du
+/// monde.
 ///
-/// Un domaine absent de la table rend [`MailDomain::NoSuchDomain`], ce qui est
-/// le bon défaut pour un test — un test qui oublie de déclarer un domaine voit
-/// son adresse écartée, pas admise par inadvertance.
-#[derive(Debug, Default)]
+/// `None`, dans la table comme au défaut, veut dire « le résolveur ne répond
+/// pas » — c'est un `Err`, donc « je ne sais pas », donc jamais un refus chez
+/// l'appelant.
+#[derive(Debug)]
 pub struct MockMailDomains {
-    verdicts: BTreeMap<String, MailDomain>,
-    /// Les domaines pour lesquels le résolveur « ne répond pas ».
-    unreachable: Vec<String>,
+    verdicts: BTreeMap<String, Option<MailDomain>>,
+    default: Option<MailDomain>,
+}
+
+impl Default for MockMailDomains {
+    fn default() -> Self {
+        Self {
+            verdicts: BTreeMap::new(),
+            default: Some(MailDomain::NoSuchDomain),
+        }
+    }
 }
 
 impl MockMailDomains {
-    /// Une table vide : tout est NXDOMAIN.
+    /// Une table vide : tout domaine non déclaré est NXDOMAIN. Le bon défaut
+    /// pour un test qui juge la vérification — un domaine oublié est écarté,
+    /// pas admis par inadvertance.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Tous ces domaines acceptent du courrier.
+    /// Un résolveur qui ne répond jamais : chaque question rend `Err`.
+    ///
+    /// C'est ce qu'obtient un déploiement sans DNS lisible, et c'est la fixture
+    /// des tests qui ne sont pas là pour juger cette vérification : les
+    /// adresses passent, exactement comme avant qu'elle existe, et le rapport
+    /// le **dit** (`mx_unknown`) au lieu de le taire.
+    pub fn silent() -> Self {
+        Self {
+            verdicts: BTreeMap::new(),
+            default: None,
+        }
+    }
+
+    /// Le monde entier accepte du courrier. Pour un test dont le sujet est
+    /// ailleurs et qui veut le rapport qu'il aurait eu sans cette étape.
+    pub fn everywhere() -> Self {
+        Self {
+            verdicts: BTreeMap::new(),
+            default: Some(MailDomain::Accepts),
+        }
+    }
+
+    /// Ces domaines-là acceptent du courrier ; les autres n'existent pas.
     pub fn accepting(domains: &[&str]) -> Self {
         let mut mock = Self::new();
         for domain in domains {
@@ -265,18 +307,19 @@ impl MockMailDomains {
         mock
     }
 
-    /// Poser un verdict.
+    /// Poser un verdict sur un domaine.
     #[must_use]
     pub fn with(mut self, domain: &str, verdict: MailDomain) -> Self {
-        self.verdicts.insert(domain.to_ascii_lowercase(), verdict);
+        self.verdicts
+            .insert(domain.to_ascii_lowercase(), Some(verdict));
         self
     }
 
-    /// Ce domaine-là fait tomber le résolveur en panne : `Err`, donc « je ne
-    /// sais pas », donc pas de refus chez l'appelant.
+    /// Ce domaine-là ne reçoit pas de réponse : `Err`, donc « je ne sais pas »,
+    /// donc pas de refus chez l'appelant.
     #[must_use]
     pub fn unreachable(mut self, domain: &str) -> Self {
-        self.unreachable.push(domain.to_ascii_lowercase());
+        self.verdicts.insert(domain.to_ascii_lowercase(), None);
         self
     }
 }
@@ -284,15 +327,11 @@ impl MockMailDomains {
 #[async_trait]
 impl MailDomains for MockMailDomains {
     async fn lookup(&self, domain: &str) -> Result<MailDomain, ProviderError> {
-        let domain = domain.to_ascii_lowercase();
-        if self.unreachable.contains(&domain) {
-            return Err(unavailable());
-        }
-        Ok(self
-            .verdicts
-            .get(&domain)
+        self.verdicts
+            .get(&domain.to_ascii_lowercase())
             .copied()
-            .unwrap_or(MailDomain::NoSuchDomain))
+            .unwrap_or(self.default)
+            .ok_or_else(unavailable)
     }
 }
 

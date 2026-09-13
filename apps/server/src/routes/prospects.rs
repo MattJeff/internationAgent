@@ -291,7 +291,10 @@ async fn import(
     };
 
     let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
-    let report = match prospects::import(&mut tx, &list, &text, Utc::now()).await {
+    // Le même résolveur que le reste du processus — son cache est déjà chaud
+    // du tour précédent, et la console n'a pas de raison d'en monter un second.
+    let mx = state.ports.mail_domains.clone();
+    let report = match prospects::import(&mut tx, &list, mx.as_ref(), &text, Utc::now()).await {
         Ok(report) => report,
         Err(ImportError::Segment(_)) => {
             return Err(

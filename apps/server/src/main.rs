@@ -374,10 +374,18 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
         proxies: browser_proxies.clone(),
         solver: config.captcha_solver(),
     };
+    // Le résolveur du système, **une** instance pour tout le processus : le
+    // cache DNS vit dedans, au TTL de chaque enregistrement, et c'est lui qui
+    // fait qu'une liste de mille adresses sur trois cents domaines ne pose que
+    // trois cents questions. Choisi dans `mocks` comme tous les autres ports —
+    // ce binaire n'a pas `agentos-providers` dans son manifeste, et c'est
+    // voulu.
+    let mail_domains = agentos_app::mocks::mail_domains();
     let ports = Arc::new(agentos_app::mocks::ports_for(
         &config.credentials,
         &config.public_host,
         browser_ports(),
+        mail_domains.clone(),
     ));
     // The same `Credentials`, one adapter further: `EMBEDDER_API_KEY` selects
     // the real client and its absence selects the SHA-256 hash. Not a field of
