@@ -138,5 +138,42 @@ pub fn tools() -> Vec<ToolDef> {
             // dehors : c'est la même classe que `PUT /v1/employees/{id}/initiative`.
             risk: Risk::Write,
         },
+        ToolDef {
+            name: "growth_stripe_connect",
+            title: "Brancher la lecture du revenu d'abonnement sur Stripe",
+            description: "Range la clé **restreinte** Stripe avec laquelle `growth_get` lira le revenu \
+                 d'abonnement — le MRR, le nombre d'abonnés, les arrivées, les départs et les \
+                 paliers — et rend `connected: true`. Cet outil existe parce que le registre de \
+                 factures ne peut pas porter ces euros-là : une facture exige une affaire \
+                 `closed_won` approuvée par un humain, et un abonnement pris en libre-service par \
+                 carte n'a ni affaire ni approbation. C'est donc l'inverse de \
+                 `growth_target_set`, qui écrit un chiffre que l'entreprise se donne : celui-ci \
+                 branche une source extérieure. **La clé est prouvée avant d'être rangée** : une \
+                 lecture part chez Stripe, et un refus n'écrit rien — la réponse dit alors ce qui \
+                 manque à la clé. Il lui faut la lecture de `subscriptions`, et celle d'`events` \
+                 pour savoir qui est arrivé et qui est parti ; sans la seconde, `growth_get` rend \
+                 ces deux comptes à `null`. **Il n'y a qu'une clé par entreprise et ceci remplace \
+                 celle d'avant** ; il n'existe pas de geste pour la retirer, parce que le vrai \
+                 débranchement est la révocation de la clé dans le tableau de bord Stripe — c'est \
+                 le seul qui arrête réellement la lecture. Rien de ce qui est collé ne ressort : \
+                 ni la clé, ni une empreinte, ni ses quatre derniers caractères.",
+            method: Method::Post,
+            path: "/v1/growth/stripe",
+            schema: schema(
+                json!({
+                    "api_key": {
+                        "type": "string",
+                        "description": "La clé restreinte Stripe, en clair. Elle n'a besoin que de la lecture : `subscriptions` et `events`. Une chaîne vide est refusée."
+                    }
+                }),
+                &["api_key"],
+            ),
+            query: &[],
+            raw_body: None,
+            // Elle range un credential de paiement du locataire et remplace
+            // celui d'avant, et elle parle à un tiers en le faisant. Même
+            // classe que `model_connect`, qui prouve et range une clé d'API.
+            risk: Risk::Write,
+        },
     ]
 }
