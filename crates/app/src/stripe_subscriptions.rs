@@ -1000,6 +1000,26 @@ mod tests {
             .expect("le palier existe même sans montant");
         assert_eq!(usage.subscribers, 1);
         assert_eq!(usage.mrr_minor, None, "un montant illisible n'est pas zéro");
+
+        // L'autre façon de ne pas tout savoir : un abonnement de plus de dix
+        // lignes, dont Stripe ne sert que la première page. Ce module ne va pas
+        // chercher la suite, il le dit.
+        let tronque: Vec<Subscription> = serde_json::from_value(json!([{
+            "id": "sub_9",
+            "status": "active",
+            "items": {
+                "object": "list",
+                "has_more": true,
+                "data": [item("price_pro", Some("Pro"), Some(4900), "usd")],
+            },
+        }]))
+        .expect("la forme du fil");
+        let read = summarise(&tronque, None, Utc::now());
+        assert_eq!(read.mrr_minor, Some(4900));
+        assert!(
+            read.mrr_is_floor,
+            "une page de lignes sur deux est un plancher"
+        );
     }
 
     #[test]
