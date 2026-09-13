@@ -348,7 +348,7 @@ de cette vague, à poser dans `agentos_app::effects` »*. C'est faux depuis le
 ### 3.4 Les articles — rien ne publie
 
 `content_questions`, `content_citations` en ajout seul, `content_drafts`
-(`0100`), neuf outils `content_*`, la mesure sur `duckduckgo_lite` par un siège
+(`0100`), treize outils `content_*`, la mesure sur `duckduckgo_lite` par un siège
 qui porte `Channel::Web`.
 
 **Le chemin A a été codé le 2026-09-11** (`0043dde`), et le titre de cette
@@ -375,6 +375,20 @@ Et la mesure a son propre plafond, nommé : un seul moteur lisible, parce que
 tous les autres exigent un compte ou le refusent dans leur `robots.txt`
 (vérifié le 2026-09-11 sur cinq). Une mesure sur un moteur n'est pas la
 citation par un modèle ; c'en est le meilleur indicateur gratuit.
+
+**La moitié qui manquait à cette section, et qui n'y était pas nommée.** Tout ce
+qui précède *mesure* si l'on est cité ; rien n'agit pour qu'on le soit davantage
+ailleurs que sur notre propre site. C'est ce qu'un concurrent direct vend sous
+le nom d'« autorité », et le trou était réel. Il est **arbitré le 2026-09-13**,
+pas comblé : `docs/CONTENU.md` § 9 range en trois tas ce que ce mot recouvre,
+prend le premier — savoir où la question vit déjà — et refuse les deux autres
+en toutes lettres (§ 6 ci-dessous les reprend). Ce qui est codé est
+`content_places_list` : les hôtes qui reviennent dans les résultats de nos
+questions, et celles de nos questions où ils sont sans nous. Un compte sur des
+mesures déjà prises — **aucune source nouvelle, aucune clé, aucune migration**.
+Ce qui reste hors de portée est le graphe des liens entrants (qui cite un
+concurrent et pas nous) : il ne se lit dans aucune page de résultats, quatre
+sociétés le vendent, elles sont nommées au § 9 et aucune n'est appelée.
 
 ### 3.5 Les réseaux sociaux — le câblage est fait, les comptes ne le sont pas
 
@@ -673,6 +687,19 @@ sa raison plutôt qu'un goût.
   vaut par-delà le contenu : tout ce qui publierait au nom de dix clients
   depuis un domaine à nous est un produit qui meurt le jour où un client s'en
   aperçoit.
+* **Une machine à liens**, sous le nom d'« autorité » ou sous un autre. Trois
+  refus, arbitrés le 2026-09-13 et argumentés dans `docs/CONTENU.md` § 9, qui
+  est aussi l'endroit où le tas qu'on prend est nommé. **Acheter un lien, ou
+  louer un domaine pour en émettre** : *un lien acheté est un mensonge adressé
+  à un classement, et le produit qui l'automatise vend à son client une dette
+  dont il ignore l'échéance.* **Écrire sur un site tiers au nom du client sans
+  qu'une personne l'ait relu** : *le chemin A passe par une pull request chez le
+  client précisément parce que la relecture humaine est la seule chose qui
+  distingue une contribution d'un publipostage.* **Inventer la voix de
+  quelqu'un d'autre** — un avis, un témoignage, un compte de forum qui n'est
+  personne : *un faux client est une fraude avant d'être une tactique.* Ce qui
+  est codé à la place est un compte sur les mesures qu'on a déjà,
+  `content_places_list`, qui n'écrit rien et ne démarche personne.
 
 ---
 
