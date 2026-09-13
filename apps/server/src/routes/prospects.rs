@@ -139,6 +139,13 @@ struct ImportQuery {
     country: Option<String>,
     #[serde(default)]
     dry_run: bool,
+    /// Le nom que l'appelant donne à cette liste, écrit sur chaque contact créé
+    /// (`contacts.origin_ref`, `migrations/0107_un_contact_dit_dou_il_vient.sql`).
+    /// Optionnel, parce qu'un corps `text/csv` n'a pas de nom de fichier :
+    /// l'omettre dit « importé, d'une liste que je ne sais pas nommer », ce qui
+    /// est vrai. Le passer est ce qui laisse `GET /v1/growth` répondre *quelle*
+    /// liste a produit quel euro.
+    source: Option<String>,
 }
 
 /// Une ligne refusée, telle que [`Report::refused`] la formule : `line N: …`.
@@ -276,6 +283,11 @@ async fn import(
         segment: &query.segment,
         country: &country,
         employee_id: None,
+        source: query
+            .source
+            .as_deref()
+            .map(str::trim)
+            .filter(|source| !source.is_empty()),
     };
 
     let mut tx = state.db.tenant_tx(principal.tenant_id).await?;

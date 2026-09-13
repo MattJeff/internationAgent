@@ -2,7 +2,7 @@
 //! modèle comment faire ce que nous vendons.**
 //!
 //! `agentos_app::content` porte la thèse et les limites de la mesure,
-//! `docs/CONTENU.md` la boucle entière. Douze lignes, une par route montée par
+//! `docs/CONTENU.md` la boucle entière. Treize lignes, une par route montée par
 //! `apps/server/src/routes/content.rs`.
 //!
 //! # Ce que les descriptions portent, et pourquoi
@@ -299,6 +299,24 @@ pub fn tools() -> Vec<ToolDef> {
             Risk::Read,
         ),
         t(
+            "content_places_list",
+            "Où nos questions vivent déjà",
+            "Les hôtes qui reviennent dans les résultats de toutes nos questions, et sur lesquelles de \
+             ces questions nous ne sommes nulle part. Ne lit rien de neuf : c'est un compte sur les \
+             mesures déjà prises par `content_questions_measure`, donc une question jamais mesurée n'y \
+             est pas, et un locataire qui n'a rien mesuré rend une liste vide. **Ce n'est pas une liste \
+             de liens à aller chercher, et ce n'est pas non plus qui nous cite** : un lien entrant ne se \
+             lit pas dans une page de résultats, et rien ici ne le mesure. Ce que ça nomme est l'endroit \
+             où la question est déjà posée — un forum, un comparatif, un annuaire, ou un concurrent — \
+             pour qu'une personne décide si notre réponse y a sa place. Rien dans ce produit ne publie \
+             ailleurs que dans le dépôt du client, et `content_drafts_propose` est le seul chemin.",
+            Method::Get,
+            "/v1/content/places",
+            nothing(),
+            &[],
+            Risk::Read,
+        ),
+        t(
             "content_repos_set",
             "Attacher un dépôt à un siège, ou remplacer le sien",
             "Dit où ce siège pousse ses articles, et où ils ressortent. **Remplace la ligne en entier** : les \
@@ -392,9 +410,9 @@ mod tests {
     /// Une ligne par route montée, et le chemin de chacune est bien un chemin de
     /// ce domaine. Le test de couverture de `mod.rs` prouve l'autre sens.
     #[test]
-    fn douze_lignes_pour_douze_routes() {
+    fn treize_lignes_pour_treize_routes() {
         let all = tools();
-        assert_eq!(all.len(), 12, "une route montée n'a pas sa ligne");
+        assert_eq!(all.len(), 13, "une route montée n'a pas sa ligne");
         for tool in &all {
             assert!(
                 tool.path.starts_with("/v1/content/"),

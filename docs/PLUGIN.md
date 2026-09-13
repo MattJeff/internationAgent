@@ -1,7 +1,7 @@
-# Le plugin Claude Code — l'interface par-dessus les 144 outils
+# Le plugin Claude Code — l'interface par-dessus les 145 outils
 
-Le serveur MCP (`docs/MCP_SERVEUR.md`) rend 144 outils. Brancher une URL et une
-clé donne 144 verbes bruts et aucun mode d'emploi : le modèle doit deviner
+Le serveur MCP (`docs/MCP_SERVEUR.md`) rend 145 outils. Brancher une URL et une
+clé donne 145 verbes bruts et aucun mode d'emploi : le modèle doit deviner
 qu'on lit `company_health_get` avant de croire un chiffre, qu'un import se fait à
 blanc d'abord, qu'une action d'approbation se recopie octet par octet.
 
@@ -191,7 +191,7 @@ existe encore dans `crates/app/src/mcp_tools/`**, aucun fichier ne contient
 marketplace mène à un manifeste dont le nom correspond.
 
 La troisième ligne est la seule qui mérite un script plutôt qu'une relecture :
-les 144 lignes du registre sont éditées par d'autres chantiers, et un outil
+les 145 lignes du registre sont éditées par d'autres chantiers, et un outil
 renommé rend un geste faux **sans rien casser d'autre**. Le script a été vu
 rougir — renommer `company_health_get` dans `point-du-jour` le fait échouer — parce
 qu'une vérification qui n'a jamais échoué ne prouve rien.

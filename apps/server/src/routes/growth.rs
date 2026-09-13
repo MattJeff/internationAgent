@@ -79,6 +79,32 @@
 //! quand il n'y a aucune facture — un zéro sans monnaie n'est pas un montant,
 //! et `Money` lui-même refuse le zéro.
 //!
+//! # D'où vient un euro
+//!
+//! Les cinq montants ci-dessus disent **combien**. `attribution` dit **d'où**,
+//! et c'est la question que le fondateur pose quand il choisit où doubler son
+//! effort : on ne double pas toutes les trois semaines ce qu'on ne sait pas
+//! attribuer.
+//!
+//! La chaîne est celle que le schéma portait déjà, et elle n'a pas été
+//! inventée ici : `invoices.opportunity_id` → `opportunities.account_id` →
+//! `contacts.account_id`. Le seul anneau qui manquait est le premier — par
+//! quelle porte cette adresse est entrée — et c'est
+//! `migrations/0107_un_contact_dit_dou_il_vient.sql` qui le pose, sur
+//! `contacts`, en deux colonnes : `origin` (`import` ou `discovery`) et
+//! `origin_ref` (le fichier, ou l'URL de la page).
+//!
+//! **Aucun euro n'est réparti.** Une facture réglée est attribuée à
+//! l'**ensemble** des origines que ses contacts nomment, pas divisée entre
+//! elles : un seau dont la liste `origins` a deux entrées est une chaîne qui se
+//! scinde, et rendre « 50 % à l'une, 50 % à l'autre » serait inventer deux
+//! chiffres là où il n'y a qu'un fait. Un seau dont la liste est **vide** est
+//! une facture dont l'origine est **inconnue** — jamais « organique », qui est
+//! un nom de canal et non un aveu.
+//!
+//! La somme des seaux d'une monnaie est exactement son `collected_minor` : la
+//! fenêtre est la même, la table est la même, et un test l'affirme.
+//!
 //! # Le coût, et pourquoi il est souvent `null`
 //!
 //! `model_minor` est les jetons de la fenêtre multipliés par le tarif que ce
@@ -131,6 +157,8 @@ use axum::routing::get as get_route;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet};
+use uuid::Uuid;
 
 use crate::auth::Principal;
 use crate::error::ApiError;
@@ -212,6 +240,39 @@ struct RevenueView {
     outstanding_minor: Option<i64>,
 }
 
+/// Une porte par laquelle une adresse est entrée, telle que `contacts` la
+/// porte depuis `migrations/0107_un_contact_dit_dou_il_vient.sql`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+struct OriginView {
+    /// `import` ou `discovery`. La CHECK de 0107 tient l'ensemble fermé.
+    kind: String,
+    /// Le nom que l'opérateur a donné à cette source — le fichier, l'URL.
+    /// `null` quand la porte est connue et la source anonyme : c'est le cas de
+    /// `POST /v1/prospects/import`, qui reçoit un corps `text/csv` sans nom.
+    reference: Option<String>,
+}
+
+/// Ce qu'une chaîne d'origines a encaissé dans la fenêtre.
+///
+/// Un seau par **ensemble** d'origines et par monnaie. Les trois formes que
+/// prend `origins`, et il n'y en a pas d'autres :
+///
+/// * **une entrée** — la chaîne est nette, et l'argent a un nom ;
+/// * **plusieurs** — elle se scinde : les contacts de ce compte ne sont pas
+///   tous entrés par la même porte. Les deux sont rendues et l'argent n'est
+///   **pas** réparti entre elles ;
+/// * **vide** — aucun contact de ce compte ne dit d'où il vient. C'est
+///   **inconnu**, et `unmeasured` dit les trois façons de l'être.
+#[derive(Debug, Serialize)]
+struct AttributionView {
+    origins: Vec<OriginView>,
+    /// Celle des factures de ce seau. Jamais sommée à travers les codes ISO,
+    /// comme partout ici — d'où un seau par monnaie plutôt qu'un `null`.
+    currency: String,
+    invoices_paid: i64,
+    collected_minor: i64,
+}
+
 /// Ce que le modèle a coûté, en cents de dollar.
 #[derive(Debug, Default, Serialize)]
 struct CostView {
@@ -277,6 +338,24 @@ const UNMEASURED: &[&str] = &[
     "Les cinq montants sont null ensemble dès que le registre emploie plus d'une monnaie : \
      cette route ne somme jamais à travers les codes ISO, et aucun taux de change n'est \
      fourni. Ils sont null aussi quand il n'existe aucune facture.",
+    "attribution ne voit que ce qui est passé par une facture, et une facture exige une affaire \
+     closed_won (invoices.opportunity_id, 0066). Un abonnement pris en libre-service sur le site \
+     du locataire — une carte, une clé d'API, aucun humain — n'a ni affaire ni devis, donc il \
+     n'entre jamais dans invoices et il n'est pas ici. Ces euros-là ne sont pas d'origine \
+     inconnue : ils sont hors de cette lecture, et le webhook Stripe (0081) ne fait que régler \
+     une facture déjà écrite, jamais en créer une. Une entreprise qui vend en libre-service lit \
+     donc une attribution vide sans que rien ne soit cassé.",
+    "Une origine est la porte par laquelle une adresse est entrée, pas ce qui l'a convaincue. \
+     Un contact importé en mars et converti après un article de septembre porte import, et rien \
+     ici ne dit lequel des deux a emporté l'affaire. C'est une attribution au premier contact, \
+     et c'est la seule que le schéma puisse prouver.",
+    "L'origine est portée par les contacts d'un compte et non par la facture : opportunities \
+     n'a aucune colonne qui nomme la personne. Quand les contacts d'un même compte sont entrés \
+     par deux portes, origins en a deux et l'argent n'est réparti entre aucune des deux.",
+    "Les contacts écrits avant migrations/0107 n'ont pas d'origine et ne peuvent pas en \
+     recevoir une rétroactivement. Un seau vide sur une entreprise établie est donc autant une \
+     date de mise en service qu'une mesure, et il se lit 'nous ne savons pas' — jamais \
+     'organique'.",
     "model_minor est null sans tarif déclaré et sur le chemin cli — un abonnement n'a pas de \
      facture au jeton. Un null n'est jamais une absence de coût : c'est une absence de prix.",
     "model_minor est un plancher quand une partie des appels n'a pas été mesurée par le \
@@ -293,6 +372,9 @@ struct GrowthView {
     window: WindowView,
     funnel: Vec<StageView>,
     revenue: RevenueView,
+    /// D'où viennent les factures réglées de la fenêtre. Voir l'en-tête : la
+    /// somme des seaux d'une monnaie est son `collected_minor`.
+    attribution: Vec<AttributionView>,
     cost: CostView,
     target: Option<TargetView>,
     verdict: Verdict,
@@ -384,6 +466,82 @@ fn verdict(
     }
 }
 
+/// Une ligne d'[`ATTRIBUTION_SQL`] : une facture réglée, et **une** des
+/// origines que sa chaîne nomme — `origin` est `null` quand elle n'en nomme
+/// aucune, la jointure étant un `LEFT JOIN`.
+#[derive(Debug, sqlx::FromRow)]
+struct AttributionRow {
+    invoice_id: Uuid,
+    currency: String,
+    amount_minor: i64,
+    origin: Option<String>,
+    origin_ref: Option<String>,
+}
+
+/// Les seaux, depuis les lignes plates de la jointure.
+///
+/// Pure pour la raison de [`funnel`] et de [`verdict`] : c'est toute la
+/// logique, et le piège qu'elle évite ne se voit qu'en la refaisant à la main.
+///
+/// **Le piège, et c'est le seul de cette section.** La requête rend une ligne
+/// par (facture, origine) : un compte dont deux contacts sont entrés par deux
+/// portes rend deux lignes pour une facture. Sommer ces lignes-là compterait
+/// l'argent deux fois — c'est-à-dire inventerait de la recette à l'endroit
+/// exact où cette section existe pour ne pas en inventer. D'où deux passes :
+/// une facture d'abord, avec l'**ensemble** de ses origines, les seaux ensuite.
+fn attribute(rows: Vec<AttributionRow>) -> Vec<AttributionView> {
+    let mut invoices: BTreeMap<Uuid, (String, i64, BTreeSet<OriginView>)> = BTreeMap::new();
+    for AttributionRow {
+        invoice_id,
+        currency,
+        amount_minor,
+        origin,
+        origin_ref,
+    } in rows
+    {
+        let entry = invoices
+            .entry(invoice_id)
+            .or_insert_with(|| (currency, amount_minor, BTreeSet::new()));
+        if let Some(kind) = origin {
+            entry.2.insert(OriginView {
+                kind,
+                reference: origin_ref,
+            });
+        }
+    }
+
+    let mut buckets: BTreeMap<(String, Vec<OriginView>), (i64, i64)> = BTreeMap::new();
+    for (currency, amount_minor, origins) in invoices.into_values() {
+        let bucket = buckets
+            .entry((currency, origins.into_iter().collect()))
+            .or_insert((0, 0));
+        bucket.0 += 1;
+        bucket.1 += amount_minor;
+    }
+
+    let mut out: Vec<AttributionView> = buckets
+        .into_iter()
+        .map(
+            |((currency, origins), (invoices_paid, collected_minor))| AttributionView {
+                origins,
+                currency,
+                invoices_paid,
+                collected_minor,
+            },
+        )
+        .collect();
+    // Le plus gros d'abord : c'est l'ordre dans lequel la question se pose.
+    // Les deux départages ensuite, pour que deux appels identiques rendent deux
+    // réponses identiques.
+    out.sort_by(|a, b| {
+        b.collected_minor
+            .cmp(&a.collected_minor)
+            .then_with(|| a.currency.cmp(&b.currency))
+            .then_with(|| a.origins.cmp(&b.origins))
+    });
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Les requêtes
 // ---------------------------------------------------------------------------
@@ -455,6 +613,35 @@ SELECT currency, \
          AS previous_mrr \
   FROM invoices \
  GROUP BY currency";
+
+/// Les factures réglées de la fenêtre, et les portes par lesquelles les gens de
+/// leur compte sont entrés.
+///
+/// Les trois jointures que le schéma portait déjà, dans l'ordre :
+/// `invoices.opportunity_id` (0066, `NOT NULL`), `opportunities.account_id`
+/// (0011), `contacts.account_id` (0011). RLS `force` sur les trois tables, donc
+/// aucun `WHERE tenant_id` et aucun compte d'une autre entreprise.
+///
+/// `LEFT JOIN` et non `JOIN` : une facture dont aucun contact ne dit d'où il
+/// vient doit sortir d'ici avec une origine nulle, pas disparaître. Une facture
+/// qui manque à cette liste serait un euro effacé, et le seau « inconnu » est
+/// tout l'intérêt de la lecture.
+///
+/// `DISTINCT` parce que deux contacts entrés par la même porte avec la même
+/// référence sont une porte, pas deux ; [`attribute`] déduplique de toute façon
+/// par `BTreeSet`, et le faire ici est une ligne de moins à transporter.
+///
+/// Les contacts inactifs comptent. Une adresse désactivée par une suppression
+/// dit toujours par où son entreprise est entrée, et l'effacer ici ferait
+/// passer une facture dans « inconnu » le jour où quelqu'un se désabonne.
+const ATTRIBUTION_SQL: &str = "\
+SELECT DISTINCT i.id AS invoice_id, i.currency, i.amount_minor, c.origin, c.origin_ref \
+  FROM invoices i \
+  JOIN opportunities o ON o.id = i.opportunity_id \
+  LEFT JOIN contacts c ON c.account_id = o.account_id AND c.origin IS NOT NULL \
+ WHERE i.paid_at IS NOT NULL \
+   AND (i.paid_at AT TIME ZONE 'UTC')::date >= $1 \
+   AND (i.paid_at AT TIME ZONE 'UTC')::date <  $2";
 
 /// Les jetons de la fenêtre au tarif déclaré, en cents.
 ///
@@ -538,6 +725,13 @@ async fn get(
         .await
         .map_err(StoreError::from)?;
 
+    let attribution: Vec<AttributionRow> = sqlx::query_as(ATTRIBUTION_SQL)
+        .bind(from)
+        .bind(end)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(StoreError::from)?;
+
     // Le tarif, lu par le même chemin que `GET /v1/model` : c'est lui qui dit
     // si le coût a un prix et si ce prix veut dire quelque chose.
     let connection = agentos_store::model_access::load(&mut tx).await?;
@@ -608,6 +802,7 @@ async fn get(
             per_seat_minor: cost_minor.filter(|_| seats > 0).map(|cost| cost / seats),
         },
         revenue,
+        attribution: attribute(attribution),
         target,
         unmeasured: UNMEASURED,
     })
@@ -730,6 +925,11 @@ mod tests {
     use super::*;
     use crate::auth::ApiKeys;
 
+    /// Le nom que l'opérateur a donné à la liste dont sort le contact
+    /// d'[`une_entreprise`] — c'est-à-dire l'un des cinq fichiers du fondateur,
+    /// et la réponse que la lecture doit finir par prononcer.
+    const LISTE: &str = "smartlead_getorizn_prospection.csv";
+
     const SECRET_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SECRET_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -842,6 +1042,74 @@ mod tests {
             Verdict::NoTarget,
             "une cible en dollars contre un registre en euros n'est pas un retard"
         );
+    }
+
+    /// **Une facture n'est comptée qu'une fois, quel que soit le nombre de
+    /// contacts de son compte.**
+    ///
+    /// C'est le seul piège de cette section et il est silencieux : la jointure
+    /// rend une ligne par (facture, origine), et un `sum()` naïf sur ces
+    /// lignes-là ferait de 190 $ encaissés 380 $ attribués. Un écran qui
+    /// invente de la recette au moment où on lui demande d'où elle vient est
+    /// pire que pas d'écran du tout.
+    #[test]
+    fn une_facture_a_deux_contacts_ne_compte_pas_deux_fois() {
+        let facture = Uuid::now_v7();
+        let ligne = |origin: Option<&str>, reference: Option<&str>| AttributionRow {
+            invoice_id: facture,
+            currency: "USD".to_owned(),
+            amount_minor: 19_000,
+            origin: origin.map(str::to_owned),
+            origin_ref: reference.map(str::to_owned),
+        };
+
+        // Deux contacts, **une** porte : un seau, une facture, 190 $.
+        let net = attribute(vec![
+            ligne(Some("import"), Some("getorizn.csv")),
+            ligne(Some("import"), Some("getorizn.csv")),
+        ]);
+        assert_eq!(net.len(), 1);
+        assert_eq!(net[0].invoices_paid, 1);
+        assert_eq!(net[0].collected_minor, 19_000, "et surtout pas 38 000");
+        assert_eq!(net[0].origins.len(), 1);
+
+        // Deux portes : la chaîne se scinde. Les deux sont rendues, dans **un**
+        // seau, et l'argent n'est réparti entre aucune des deux — pas de
+        // 9 500 $ chacune, qui serait un chiffre que personne n'a mesuré.
+        let scindee = attribute(vec![
+            ligne(Some("import"), Some("getorizn.csv")),
+            ligne(Some("discovery"), Some("https://ectaa.org/members")),
+        ]);
+        assert_eq!(scindee.len(), 1);
+        assert_eq!(scindee[0].invoices_paid, 1);
+        assert_eq!(scindee[0].collected_minor, 19_000);
+        assert_eq!(scindee[0].origins.len(), 2, "dis-le, et rends les deux");
+
+        // Aucune porte : la liste est **vide**, ce qui se lit « inconnu ». Il
+        // n'existe aucun seau « organique » et c'est délibéré.
+        let inconnue = attribute(vec![ligne(None, None)]);
+        assert_eq!(inconnue.len(), 1);
+        assert!(inconnue[0].origins.is_empty());
+        assert_eq!(inconnue[0].collected_minor, 19_000);
+
+        // Deux monnaies ne se somment pas : deux seaux, jamais un total.
+        let deux = attribute(vec![
+            ligne(Some("import"), Some("a.csv")),
+            AttributionRow {
+                invoice_id: Uuid::now_v7(),
+                currency: "EUR".to_owned(),
+                amount_minor: 5_000,
+                origin: Some("import".to_owned()),
+                origin_ref: Some("a.csv".to_owned()),
+            },
+        ]);
+        assert_eq!(deux.len(), 2);
+        assert_eq!(deux[0].currency, "USD", "le plus gros d'abord");
+        assert_eq!(deux[1].currency, "EUR");
+
+        // Et rien du tout rend rien du tout : pas un seau vide à zéro, qui se
+        // lirait comme une mesure.
+        assert!(attribute(Vec::new()).is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -986,14 +1254,18 @@ mod tests {
         .execute(&mut **tx)
         .await
         .expect("account");
+        // Et son origine, qui est le maillon que `0107` a posé : sans elle, tout
+        // ce qui suit se compte et rien ne se remonte.
         sqlx::query(
-            "INSERT INTO contacts (id, tenant_id, account_id, full_name, email) \
-             VALUES ($1, $2, $3, 'Ada', $4)",
+            "INSERT INTO contacts \
+                 (id, tenant_id, account_id, full_name, email, origin, origin_ref) \
+             VALUES ($1, $2, $3, 'Ada', $4, 'import', $5)",
         )
         .bind(contact)
         .bind(t)
         .bind(account)
         .bind(format!("ada-{}@buyer.example", contact.simple()))
+        .bind(LISTE)
         .execute(&mut **tx)
         .await
         .expect("contact");
@@ -1034,6 +1306,37 @@ mod tests {
         .execute(&mut **tx)
         .await
         .expect("message");
+
+        // 3 bis. La séquence qui a écrit à cette personne. Elle ne change aucun
+        // des sept comptes et elle n'est pas lue par l'attribution : elle est
+        // là pour que la chaîne du test soit celle de la vie — quelqu'un est
+        // entré par une liste, une séquence lui a écrit, il a répondu — et non
+        // une ligne de `contacts` posée à côté d'une facture.
+        let sequence = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO sequences (id, tenant_id, name, steps) \
+             VALUES ($1, $2, $3, '[]'::jsonb)",
+        )
+        .bind(sequence)
+        .bind(t)
+        .bind(format!("relance-{}", sequence.simple()))
+        .execute(&mut **tx)
+        .await
+        .expect("sequence");
+        sqlx::query(
+            "INSERT INTO sequence_runs \
+                 (id, tenant_id, sequence_id, contact_id, employee_id, conversation_id, state) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'replied')",
+        )
+        .bind(Uuid::now_v7())
+        .bind(t)
+        .bind(sequence)
+        .bind(contact)
+        .bind(seat.as_uuid())
+        .bind(conversation)
+        .execute(&mut **tx)
+        .await
+        .expect("sequence run");
 
         // 4 et 5. Un devis émis, et accepté.
         sqlx::query(
@@ -1376,6 +1679,200 @@ mod tests {
         assert_eq!(body["verdict"], "no_target");
 
         h.teardown().await;
+    }
+
+    /// **Un euro remonte jusqu'à sa cause, et un euro sans chaîne se lit
+    /// `null` plutôt que d'être rangé au hasard.**
+    ///
+    /// Les trois faits, sur la même entreprise et dans la même fenêtre :
+    ///
+    /// 1. une personne entrée par une liste nommée, une séquence qui lui écrit,
+    ///    une réponse, une affaire, un devis accepté, une facture réglée — et
+    ///    la lecture qui prononce le nom du fichier ;
+    /// 2. une seconde facture, réglée elle aussi, dont aucun contact ne dit
+    ///    d'où il vient : elle sort dans un seau aux origines **vides**, pas
+    ///    dans le premier et pas dans un seau « organique » ;
+    /// 3. la somme des seaux est exactement `collected_minor`. C'est
+    ///    l'invariant qui rend la section utilisable : une attribution qui ne
+    ///    boucle pas sur la recette est une attribution qu'on ne peut pas citer.
+    ///
+    /// Puis la chaîne se scinde, et les deux origines sortent ensemble sans que
+    /// l'argent soit divisé.
+    #[tokio::test]
+    async fn un_euro_remonte_jusqua_son_origine_et_un_euro_sans_chaine_reste_inconnu() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        une_entreprise(&h.db, h.a).await;
+        let orpheline = une_facture_sans_origine(&h.db, h.a).await;
+
+        let (status, body) = h.get("/v1/growth", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let seaux = body["attribution"].as_array().expect("attribution");
+        assert_eq!(seaux.len(), 2, "{body}");
+
+        // Le plus gros d'abord, et c'est celui qui a un nom.
+        assert_eq!(seaux[0]["collected_minor"], 19_000);
+        assert_eq!(seaux[0]["invoices_paid"], 1);
+        assert_eq!(seaux[0]["currency"], "USD");
+        assert_eq!(seaux[0]["origins"][0]["kind"], "import");
+        assert_eq!(
+            seaux[0]["origins"][0]["reference"], LISTE,
+            "la lecture nomme le fichier, pas « une liste »"
+        );
+
+        // Et celui qui n'en a pas : une liste vide, et surtout pas un seau
+        // nommé qui aurait rangé cet euro quelque part.
+        assert_eq!(seaux[1]["collected_minor"], orpheline);
+        assert_eq!(
+            seaux[1]["origins"],
+            json!([]),
+            "inconnu se dit en ne disant rien, jamais « organique »"
+        );
+
+        // L'invariant : les seaux bouclent sur la recette de la fenêtre.
+        let somme: i64 = seaux
+            .iter()
+            .map(|seau| seau["collected_minor"].as_i64().expect("un montant"))
+            .sum();
+        assert_eq!(
+            somme, body["revenue"]["collected_minor"],
+            "la somme des origines est l'encaissé de la fenêtre, sans reste"
+        );
+        let factures: i64 = seaux
+            .iter()
+            .map(|seau| seau["invoices_paid"].as_i64().expect("un compte"))
+            .sum();
+        assert_eq!(
+            factures, body["funnel"][6]["count"],
+            "et autant de factures que la septième étape en compte"
+        );
+
+        // **La chaîne se scinde.** Un second contact au même compte, entré par
+        // l'autre porte : la facture porte désormais deux origines, dans un
+        // seul seau, et son montant ne bouge pas d'un cent.
+        un_second_contact_decouvert(&h.db, h.a).await;
+        let (_, body) = h.get("/v1/growth", SECRET_A).await;
+        let seaux = body["attribution"].as_array().expect("attribution");
+        assert_eq!(seaux.len(), 2, "{body}");
+        assert_eq!(seaux[0]["collected_minor"], 19_000, "toujours 190 $");
+        assert_eq!(seaux[0]["invoices_paid"], 1);
+        let origines = seaux[0]["origins"].as_array().expect("origins");
+        assert_eq!(origines.len(), 2, "les deux, et pas la moitié de chacune");
+        assert_eq!(origines[0]["kind"], "discovery");
+        assert_eq!(origines[1]["kind"], "import");
+
+        // Et l'invariant tient encore : rien n'a été inventé en route.
+        let somme: i64 = seaux
+            .iter()
+            .map(|seau| seau["collected_minor"].as_i64().expect("un montant"))
+            .sum();
+        assert_eq!(somme, body["revenue"]["collected_minor"]);
+
+        // **RLS.** L'attribution d'autrui n'est pas filtrée, elle est invisible.
+        let (_, body) = h.get("/v1/growth", SECRET_B).await;
+        assert_eq!(body["attribution"], json!([]));
+
+        h.teardown().await;
+    }
+
+    /// Un second compte, une affaire, une facture réglée — et **personne** dont
+    /// on sache d'où il vient. C'est le cas ordinaire d'une base écrite avant
+    /// `0107`, et le cas qu'il ne faut ranger nulle part.
+    ///
+    /// Rend le montant, pour que l'assertion ne le réécrive pas.
+    async fn une_facture_sans_origine(db: &Db, tenant: TenantId) -> i64 {
+        const MONTANT: i64 = 7_000;
+        let seat = EmployeeId::new_v7(Utc::now());
+        let account = Uuid::now_v7();
+        let opportunity = Uuid::now_v7();
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let t = tenant.as_uuid();
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, $3, 'Sam', 'active')",
+        )
+        .bind(seat.as_uuid())
+        .bind(t)
+        .bind(format!("sam-{}", seat.as_uuid().simple()))
+        .execute(&mut **tx)
+        .await
+        .expect("employee");
+        sqlx::query(
+            "INSERT INTO accounts (id, tenant_id, legal_name, domain, segment, country) \
+             VALUES ($1, $2, 'Orphan plc', $3, 'ota', 'FR')",
+        )
+        .bind(account)
+        .bind(t)
+        .bind(format!("orphan-{}.example", account.simple()))
+        .execute(&mut **tx)
+        .await
+        .expect("account");
+        // Un contact bien réel, et sans origine : la colonne existe, personne
+        // ne l'a remplie, et c'est très exactement « on ne sait pas ».
+        sqlx::query(
+            "INSERT INTO contacts (id, tenant_id, account_id, full_name, email) \
+             VALUES ($1, $2, $3, 'Noa', $4)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(t)
+        .bind(account)
+        .bind(format!("noa-{}@orphan.example", account.simple()))
+        .execute(&mut **tx)
+        .await
+        .expect("contact");
+        sqlx::query(
+            "INSERT INTO opportunities \
+                 (id, tenant_id, account_id, stage, currency, value_minor, approval_id, closed_at) \
+             VALUES ($1, $2, $3, 'closed_won', 'USD', $4, $5, now())",
+        )
+        .bind(opportunity)
+        .bind(t)
+        .bind(account)
+        .bind(MONTANT)
+        .bind(Uuid::now_v7())
+        .execute(&mut **tx)
+        .await
+        .expect("opportunity");
+        sqlx::query(
+            "INSERT INTO invoices \
+                 (id, tenant_id, opportunity_id, issued_by, currency, amount_minor, memo, \
+                  number, paid_at) \
+             VALUES ($1, $2, $3, $4, 'USD', $5, 'un mois', 2, now())",
+        )
+        .bind(Uuid::now_v7())
+        .bind(t)
+        .bind(opportunity)
+        .bind(seat.as_uuid())
+        .bind(MONTANT)
+        .execute(&mut **tx)
+        .await
+        .expect("invoice");
+        tx.commit().await.expect("commit");
+        MONTANT
+    }
+
+    /// Une seconde personne au compte d'[`une_entreprise`], trouvée sur une
+    /// page d'annuaire. Le compte a maintenant deux portes et une seule
+    /// facture : c'est la scission.
+    async fn un_second_contact_decouvert(db: &Db, tenant: TenantId) {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO contacts \
+                 (id, tenant_id, account_id, full_name, email, origin, origin_ref) \
+             SELECT $1, $2, a.id, '', $3, 'discovery', 'https://ectaa.org/members' \
+               FROM accounts a WHERE a.legal_name = 'Buyer plc'",
+        )
+        .bind(id)
+        .bind(tenant.as_uuid())
+        .bind(format!("info-{}@buyer.example", id.simple()))
+        .execute(&mut **tx)
+        .await
+        .expect("contact découvert");
+        tx.commit().await.expect("commit");
     }
 
     /// La fenêtre est bornée des deux côtés, et le dire est moins cher qu'un

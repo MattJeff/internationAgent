@@ -6377,6 +6377,8 @@ mod tests {
                 is_primary: true,
                 lawful_basis: "legitimate_interest",
                 next_follow_up_at: None,
+                origin: None,
+                origin_ref: None,
             },
         )
         .await
@@ -7022,6 +7024,8 @@ mod tests {
                     // Exactly what the importer writes, and older than the real
                     // chase so it sorts in front of it.
                     next_follow_up_at: Some(now - TimeDelta::days(1)),
+                    origin: None,
+                    origin_ref: None,
                 },
             )
             .await

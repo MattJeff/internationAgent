@@ -217,7 +217,25 @@ pub struct List<'a> {
     pub country: &'a str,
     /// The employee who owns these prospects, if any.
     pub employee_id: Option<EmployeeId>,
+    /// What to call this source on every contact it creates: the file's path
+    /// for [`import`], the page's URL for [`discover`]. `None` is honest and
+    /// costs the reading its name — see
+    /// `migrations/0107_un_contact_dit_dou_il_vient.sql`, which is the column
+    /// this lands in, and [`ORIGIN_IMPORT`] / [`ORIGIN_DISCOVERY`], which are
+    /// the door it came through. The two together are what lets
+    /// `GET /v1/growth` answer "which list produced this euro" instead of
+    /// "seven invoices were paid".
+    pub source: Option<&'a str>,
 }
+
+/// The door [`import`] writes on every contact it creates.
+pub const ORIGIN_IMPORT: &str = "import";
+
+/// The door [`discover`] writes. Both are the closed set of
+/// `contacts_origin` in `migrations/0107_un_contact_dit_dou_il_vient.sql`, and
+/// they are constants here because that CHECK and these two calls are the only
+/// places the strings exist.
+pub const ORIGIN_DISCOVERY: &str = "discovery";
 
 /// Why a file could not be loaded at all.
 ///
@@ -492,6 +510,8 @@ pub async fn import(
                 is_primary: false,
                 lawful_basis: LAWFUL_BASIS,
                 next_follow_up_at: Some(now),
+                origin: Some(ORIGIN_IMPORT),
+                origin_ref: list.source,
             },
         )
         .await?;
@@ -623,6 +643,10 @@ pub async fn discover(
                 is_primary: false,
                 lawful_basis: LAWFUL_BASIS,
                 next_follow_up_at: Some(now),
+                origin: Some(ORIGIN_DISCOVERY),
+                // The URL the operator asked for, which is ours; not a byte the
+                // page authored. Same refusal as `legal_name` above.
+                origin_ref: list.source,
             },
         )
         .await?;
@@ -959,11 +983,19 @@ mod tests {
         tx.commit().await.expect("commit");
     }
 
+    /// The list's own name, which is what `contacts.origin_ref` ends up
+    /// holding and what `GET /v1/growth` ends up saying out loud.
+    const LISTE: &str = "smartlead_getorizn_prospection.csv";
+
+    /// The page the directory door was pointed at, likewise.
+    const PAGE: &str = "https://ectaa.org/members";
+
     fn insurers() -> List<'static> {
         List {
             segment: "insurer",
             country: UNKNOWN_COUNTRY,
             employee_id: None,
+            source: Some(LISTE),
         }
     }
 
@@ -1278,6 +1310,7 @@ mod tests {
             segment: "relocation",
             country: "PH",
             employee_id: None,
+            source: None,
         };
         let report = import(&mut tx, &list_of, &list, now).await.expect("import");
         assert_eq!(report.contacts_created, 3);
@@ -1408,6 +1441,7 @@ mod tests {
             segment: "cruise_line",
             country: UNKNOWN_COUNTRY,
             employee_id: None,
+            source: None,
         };
         let err = import(&mut tx, &wrong_segment, REAL, now)
             .await
@@ -1418,6 +1452,7 @@ mod tests {
             segment: "other",
             country: "Philippines",
             employee_id: None,
+            source: None,
         };
         let err = import(&mut tx, &wrong_country, REAL, now)
             .await
@@ -1448,6 +1483,7 @@ mod tests {
                 segment,
                 country: "FR",
                 employee_id: None,
+                source: None,
             };
             let report = import(&mut tx, &list_of, &list, now)
                 .await
@@ -1492,6 +1528,7 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
             segment: "other",
             country: UNKNOWN_COUNTRY,
             employee_id: None,
+            source: Some(PAGE),
         }
     }
 
@@ -1697,6 +1734,52 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
                 .map(|(_, name)| name.as_str()),
             Some("漫游网 Qilu"),
             "a page must not overwrite the name the founder's own list gave"
+        );
+
+        // **And each address says which door it came through**, which is the
+        // link `GET /v1/growth` walks backwards from a paid invoice
+        // (`migrations/0107_un_contact_dit_dou_il_vient.sql`). Without it every
+        // one of these five rows is the same row and no euro has a cause.
+        //
+        // `bd@qilutravel.com` is the one the page named *again*: it keeps
+        // `import` and the founder's filename. First door wins, for the reason
+        // the name above does — an origin is where somebody came from, and that
+        // does not change when a second source mentions them.
+        let doors: Vec<(String, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT email, origin, origin_ref FROM contacts ORDER BY email")
+                .fetch_all(&mut **tx)
+                .await
+                .expect("origins");
+        let of = |email: &str| {
+            doors
+                .iter()
+                .find(|(address, _, _)| address == email)
+                .map(|(_, origin, reference)| (origin.clone(), reference.clone()))
+                .expect("an address this test wrote")
+        };
+        assert_eq!(
+            of("bd@qilutravel.com"),
+            (Some("import".to_owned()), Some(LISTE.to_owned())),
+            "a page must not overwrite the door the founder's own list opened"
+        );
+        assert_eq!(
+            doors
+                .iter()
+                .filter(|(_, origin, _)| origin.as_deref() == Some("discovery"))
+                .count(),
+            2,
+            "the two the page added, and only those: {doors:?}"
+        );
+        assert!(
+            doors
+                .iter()
+                .filter(|(_, origin, _)| origin.as_deref() == Some("discovery"))
+                .all(|(_, _, reference)| reference.as_deref() == Some(PAGE)),
+            "and each names the page it was read off: {doors:?}"
+        );
+        assert!(
+            doors.iter().all(|(_, origin, _)| origin.is_some()),
+            "no address written by either door is left without one: {doors:?}"
         );
 
         tx.rollback().await.expect("rollback");
@@ -1943,6 +2026,7 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
             segment: "cruise_line",
             country: UNKNOWN_COUNTRY,
             employee_id: None,
+            source: None,
         };
         let err = discover(&mut tx, &wrong, &directory(), now, 50)
             .await

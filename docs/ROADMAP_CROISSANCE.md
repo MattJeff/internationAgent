@@ -155,3 +155,74 @@ le plus risqué ; il n'a de sens qu'une fois le reste stable.
 - **Promettre le ×10 par le code.** Le code rend le ×10 possible ; ce qui le
   produit est une clé d'API, une semaine de prospection réelle, et dix articles
   qu'un modèle cite.
+
+---
+
+## Correction du 2026-09-13 : l'objectif a changé, et la machine n'est pas celle qu'on croyait
+
+Deux faits sont arrivés après l'écriture de ce document, et ils déplacent son
+centre. Ils sont datés ici plutôt que fondus dans le texte au-dessus : ce qui a
+été écrit le 2026-09-11 l'a été de bonne foi avec ce qu'on savait, et un
+document qui se réécrit en silence n'apprend rien à son lecteur.
+
+### 1. La cible est ×55, pas ×10
+
+Le fondateur vise désormais **10 000 $/mois en quatre mois**, depuis 180 $. Ce
+n'est pas une version plus ambitieuse du même problème :
+
+| | ×10 (ce document) | ×55 (la cible) |
+|---|---|---|
+| par mois | ×1,8 | **×2,7** |
+| par semaine | +15 % | **+27 %** |
+| tenu pendant | 17 semaines | 17 semaines |
+
+### 2. Orizn vend en libre-service, et notre entonnoir mesure l'inverse
+
+Les paliers, lus à la source sur `visa.orizn.app/visa-api` le 2026-09-13 :
+**0 $** (100 req, non commercial) · **49 $** (droit d'embarquer, 30 000 req) ·
+**199 $** (webhook de changement, SLA 99,9 %, contact nommé, 250 000 req) ·
+**dès 600 $** (marque blanche, redistribution). Compte par Google ou Apple, clé
+instantanée **sans carte**, abonnement payant pris **sans parler à personne**.
+
+10 000 $ font donc de l'ordre de **120 clients payants** — environ 100 × 49 $,
+20 × 199 $, 2 × 600 $ — soit **un nouveau client payant par jour pendant 120
+jours**. Et **aucun de ces 120 ne passera par un devis.**
+
+Or `GET /v1/growth` compte sept étapes de **vente sortante** : prospect ajouté,
+contacté, ayant répondu, devis émis, devis accepté, facture émise, facture
+réglée. Le parcours réel d'un euro est ailleurs :
+
+> on cherche une API → on la trouve → clé gratuite → **premier appel** →
+> intégration → dépassement du gratuit **ou** besoin du droit commercial →
+> paiement.
+
+Les deux entonnoirs ne se recouvrent que sur les paliers 199 $ et 600 $, où un
+humain discute vraiment — et c'est probablement là qu'est la moitié de la somme.
+
+### Ce que ça change à l'ordre de la phase 2
+
+* **Le SEO et le GEO ne sont plus un levier parmi d'autres : ils sont *le*
+  levier du volume.** Être trouvé au moment où quelqu'un cherche une API de
+  visas *est* le chiffre d'affaires à 49 $. La mesure existe : `visa.orizn.app`
+  sort **3ᵉ** sur « visa requirements api » (2026-09-12, après correction d'un
+  rang perdu sur une espace dans une URL). Le rang est le KPI, pas les
+  impressions.
+* **L'autorité devient la moitié manquante**, et elle n'était nommée nulle part
+  avant ce jour : on mesure où l'on est cité, on ne fait rien pour l'être
+  davantage. Pour une API, les annuaires de développeurs et les comparatifs
+  qu'on n'a pas écrits sont le canal le plus sous-exploité.
+* **La prospection sortante garde tout son sens, visée sur les paliers hauts.**
+  Devis et signature, construits les 2026-09-11 et 12, servent ces deux
+  paliers-là et pas le volume.
+* **L'attribution devient un préalable, pas un confort.** On ne double pas
+  toutes les trois semaines ce qu'on ne sait pas attribuer, et un euro de
+  libre-service ne se remonte pas par les mêmes maillons qu'un euro de
+  prospection.
+
+### Ce que ce document continue de refuser, et plus fort qu'avant
+
+La phrase de clôture ci-dessus tient mot pour mot, et la cible ×55 la rend plus
+vraie, pas moins : **le code rend le chiffre possible, il ne le produit pas.**
+Au 2026-09-13, aucun employé n'a pris un tour depuis le 6 septembre, les sept
+étapes de l'entonnoir sont à zéro faute de matière, et il manque toujours une
+clé d'API Anthropic que personne d'autre que le fondateur ne peut poser.

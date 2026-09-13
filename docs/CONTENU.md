@@ -2,7 +2,9 @@
 
 Écrit le 2026-09-11, en même temps que le code qu'il décrit ; repris le
 2026-09-12, quand deux des trois trous du § 7 ont été refermés et le troisième
-arbitré (§ 8).
+arbitré (§ 8) ; repris le 2026-09-13 pour **l'autre moitié du levier** — être
+cité davantage, et pas seulement savoir si on l'est (§ 9), qui range en trois
+tas ce que le mot « autorité » recouvre et dit lequel on prend.
 `docs/ROADMAP_CROISSANCE.md` § 2.1 dit **pourquoi** ce chantier passe devant les
 autres. Ce document dit **ce qui existe**, **ce qui est mesuré**, **ce qui ne
 peut pas l'être et pourquoi**, et **ce qui manque pour publier**.
@@ -328,6 +330,10 @@ Publier sur un domaine **à nous** (un blog `orizn-content.com` qui parle au nom
 de dix clients) : ce serait une ferme de contenu, les moteurs la classent comme
 telle, et le premier client à s'en apercevoir aurait raison de partir.
 
+Le § 9 applique la même épreuve à l'autre moitié du levier — se faire citer
+ailleurs — et en sort trois refus de plus, écrits pour être cités le jour où
+quelqu'un les repropose.
+
 ---
 
 ## 6. Où est quoi
@@ -337,9 +343,9 @@ telle, et le premier client à s'en apercevoir aurait raison de partir.
 | `migrations/0100_une_question_merite_une_reponse.sql` | les trois tables, leur RLS, et l'argument de l'ajout seul |
 | `migrations/0102_une_pull_request_nest_pas_une_publication.sql` | le dépôt d'un siège, le troisième état, et pourquoi ce n'est pas `employee_resources` |
 | `migrations/0106_un_site_nest_pas_un_expediteur.sql` | le site où l'on publie, et pourquoi ce n'est pas le domaine d'où l'on envoie |
-| `crates/app/src/content.rs` | la mesure, le scan, le brief, la proposition, et les limites de chacun |
-| `apps/server/src/routes/content.rs` | les douze routes, et pourquoi la mesure comme la proposition nomment un siège |
-| `crates/app/src/mcp_tools/contenu.rs` | les douze outils, un par route |
+| `crates/app/src/content.rs` | la mesure, le scan, le brief, **les endroits** (`places`), la proposition, et les limites de chacun |
+| `apps/server/src/routes/content.rs` | les treize routes, et pourquoi la mesure comme la proposition nomment un siège |
+| `crates/app/src/mcp_tools/contenu.rs` | les treize outils, un par route |
 | `docs/ROADMAP_CROISSANCE.md` § 2.1 | pourquoi ce levier passe devant les autres |
 
 ---
@@ -572,3 +578,178 @@ réveiller — pas une boucle de plus.
 *Et pourquoi ce n'est pas codé ici* : la question posée était un avis avant du
 code, et l'avis est « non » pour le webhook. Coder la contre-proposition sans
 qu'elle soit arbitrée serait construire la deuxième vague du même jour.
+
+---
+
+## 9. L'autorité : les trois tas, l'arbitrage, et ce qu'on ne fera jamais
+
+Écrit le 2026-09-13. Un concurrent direct vend quatre leviers, et son deuxième
+agent s'appelle « autorité » : il cherche des endroits où faire citer le site du
+client, parce que des liens et des mentions depuis des sites sérieux sont ce qui
+fait qu'un moteur — et derrière lui un modèle — te classe devant. Le reproche
+est juste : **les § 1 à 8 mesurent le thermomètre et ne touchent pas au
+chauffage.**
+
+La question posée était un avis avant du code, comme au § 8. Voici l'avis.
+
+### Le tas 1 — le travail honnête
+
+Ce qui reste vrai si le client le raconte à haute voix, et qui aurait été fait
+par quelqu'un de compétent sans nous.
+
+* **Répondre là où la question est posée**, sur un forum public ou un site de
+  questions-réponses, **quand on a réellement la réponse** — et signé, sous
+  l'identité du client, pas sous un pseudonyme.
+* **Figurer dans un annuaire du métier** que des acheteurs consultent : celui
+  d'une association professionnelle, la place de marché d'une plateforme dont on
+  est une intégration, le répertoire d'un standard qu'on implémente.
+* **Être mentionné dans un comparatif qu'on n'a pas écrit.** Quelqu'un compare
+  cinq fournisseurs de données de visa ; nous sommes le cinquième, ou nous
+  n'y sommes pas. Lui demander de nous regarder est une demande, pas une
+  transaction.
+* **Savoir où la question vit déjà**, ce qui est la condition des trois
+  précédents : sans cette liste, « aller répondre » est une intuition.
+
+### Le tas 2 — la mécanique grise
+
+Ni illégal, ni interdit nulle part, et pourtant : ce qui n'existe que pour
+tromper un classement, et dont un acheteur informé se détournerait.
+
+* **Les échanges de liens.** Deux sites conviennent de se citer parce qu'ils se
+  citent, pas parce qu'ils se lisent.
+* **L'article invité au volume.** Un texte par site, trente sites, un lien dans
+  chacun. Ce n'est pas l'article invité qui est gris — c'en est le compteur.
+* **Les commentaires signés** laissés sous des billets pour le lien qu'ils
+  portent.
+* **Les répertoires qui n'existent que pour donner des liens** : un annuaire
+  sans lecteur est un panneau planté dans un champ.
+
+Le point commun se dit en une phrase : **le geste n'a de valeur que si personne
+ne regarde à quoi il sert.** C'est la même épreuve que le § 5 fait passer à la
+ferme de contenu, et elle donne le même résultat.
+
+### Le tas 3 — ce qu'on ne fera jamais
+
+Trois lignes, écrites pour être citées le jour où quelqu'un les repropose.
+
+* **Acheter un lien, ou louer un domaine pour en émettre.** *Un lien acheté est
+  un mensonge adressé à un classement, et le produit qui l'automatise vend à son
+  client une dette dont il ignore l'échéance.*
+* **Écrire sur un site tiers au nom du client sans qu'une personne l'ait relu.**
+  *Le chemin A passe par une pull request chez le client précisément parce que la
+  relecture humaine est la seule chose qui distingue une contribution d'un
+  publipostage, et un produit qui poste ailleurs sans elle a supprimé la moitié
+  qui valait quelque chose.*
+* **Inventer la voix de quelqu'un d'autre** — un avis, un témoignage, un compte
+  de forum qui n'est personne. *Un faux client est une fraude avant d'être une
+  tactique, et aucune formulation du besoin ne rend acceptable d'écrire au nom
+  d'une personne qui n'existe pas.*
+
+Et une quatrième, propre à ce dépôt : **on ne lit pas ce qui nous refuse, même
+pour chercher une cible.** Une source qui interdit sa lecture l'interdit aussi
+à qui vient y chercher une occasion de lien.
+
+### L'arbitrage : on prend le tas 1, et on n'en code que la quatrième ligne
+
+**Ce qui est codé aujourd'hui est un compte, pas une action.**
+`content_places_list` rend les hôtes qui reviennent dans les résultats de nos
+questions, et sur lesquelles de nos questions ils sont là où nous ne sommes pas.
+Rien n'écrit, rien ne sort, rien ne démarche. Ce que la liste devient est une
+décision humaine, et les trois tas ci-dessus sont là pour qu'elle se prenne les
+yeux ouverts.
+
+La raison de s'arrêter là n'est pas la prudence, c'est le compte. Les quatre
+gestes du tas 1 sont des **demandes adressées à des personnes** : on ne les
+automatise pas, on les prépare. Ce qui manquait pour les préparer était la
+liste ; elle existe maintenant, et elle n'a coûté ni source nouvelle, ni clé, ni
+migration.
+
+### Les deux hypothèses du fondateur, jugées
+
+**« Mesurer où la question vit est peut-être plus utile que d'inventer des
+liens. » — confirmée, et c'est ce qui est codé.** Mieux : ça ne demandait
+aucune lecture de plus. La page de résultats qu'on lit déjà porte, pour chaque
+question, les hôtes qui répondent à notre place. Ce qui manquait n'était pas une
+donnée, c'était de les additionner **d'une question à l'autre** : un hôte vu une
+fois est un concurrent, le même vu sur huit de nos questions est un endroit où
+la conversation a lieu sans nous.
+
+**« L'écart entre qui cite mon concurrent et qui me cite se tire de données
+qu'on a déjà. » — infirmée, et il faut le dire clairement.**
+`content_citations.competitors` n'est **pas** la liste de qui cite qui : c'est la
+liste des hôtes que le moteur **classe** sur notre question. « Qui cite
+`visadb.io` » est un graphe de liens entrants, et un graphe de liens entrants ne
+se lit dans aucune page de résultats — il se construit en explorant le web
+entier, ce que quatre sociétés font et vendent.
+
+Elles sont donc **nommées et pas appelées**, comme les API de recherche payantes
+du § 2 : **Ahrefs**, **Majestic**, **Moz** et **Semrush** vendent chacune une API
+de liens entrants, entre quelques dizaines et quelques centaines de dollars par
+mois. L'une d'elles rendrait cette question mesurable ; aucune n'est branchée,
+aucun compte n'est ouvert, et rien dans ce dépôt n'expose de moyen de le faire.
+**Treg**, la passerelle d'outils au crédit consommé, mettrait la même donnée
+derrière un seul compte au lieu de quatre : c'est une entrée au catalogue le
+jour où quelqu'un décide de payer pour un lien entrant, et ce jour n'est pas
+arrivé.
+
+Ce que ça coûte de ne pas les avoir, dit franchement : on sait *où la question
+vit*, on ne sait pas *qui parle déjà de notre concurrent*. La première liste
+suffit pour aller répondre ; la seconde aurait servi à aller demander.
+
+### Ce qu'on a vérifié avant de ne pas le lire — le 2026-09-13
+
+La règle du § 2 s'applique à toute source qu'on approche, et l'hypothèse
+« allons lire les forums où la question est posée » a été instruite avant d'être
+écartée. Quatre `curl`, le 2026-09-13 :
+
+| source | `robots.txt` | ce qu'on en fait |
+|---|---|---|
+| `stackoverflow.com` | **le fichier lui-même ne se lit pas** : un défi Cloudflare répond à sa place | On ne lit pas. Un site qui refuse jusqu'à sa propre déclaration refuse tout le reste. |
+| `www.reddit.com` | `User-agent: *` / `Disallow: /`, avec un lien vers sa *Public Content Policy* | On ne lit pas. Le refus est écrit, complet, et il vaut aussi pour qui vient chercher une cible. |
+| `www.quora.com` | `User-agent: *` / `Disallow: /`, avec une poignée d'`Allow` qui ne couvrent que l'accueil, « à propos » et l'inscription — aucune page de question. Et deux blocs plus haut, `Claude-User` et `Claude-SearchBot` sont nommés avec `Disallow: /` | On ne lit pas, et deux fois plutôt qu'une : la règle générique refuse, et notre nom est écrit dans le fichier. |
+| `news.ycombinator.com` | `Crawl-delay: 30`, et seuls les chemins d'action (`/vote?`, `/reply?`, `/login`…) sont interdits — les pages d'articles sont ouvertes | **Lisible**, à trente secondes par page. Pas lu quand même : voir ci-dessous. |
+
+Donc les trois plus gros endroits où une question se pose nous sont **fermés par
+écrit** — et Quora prend la peine de nommer nos agents un par un —, tandis que
+le seul qui reste ouvert l'est à un rythme qui interdit l'exploration. Le chemin
+« aller lire les forums pour y trouver nos questions » est mort avant d'avoir
+coûté une ligne — ce qui est exactement à quoi sert de vérifier d'abord.
+
+Et le détour est inutile : `lite.duckduckgo.com`, qui nous autorise, **indexe
+déjà ces sites**. Un fil de forum qui répond à notre question sort dans les
+résultats de notre question, avec son hôte, et c'est cet hôte que
+`content_places_list` compte. Nous lisons une page qui nous accueille plutôt que
+cent qui nous refusent, et nous en tirons la même information.
+
+### Ce qui n'est pas codé, et ce qu'il faudrait pour l'être
+
+* **Distinguer un forum d'un concurrent.** La liste rend des hôtes ; elle ne dit
+  pas lequel est un endroit où répondre et lequel est un rival. Le faire
+  demanderait soit une liste fermée écrite à la main (qui vieillit), soit de
+  lire chaque hôte (un appel réseau par hôte), soit de le demander à un modèle
+  (qui laisserait la page choisir ses catégories — ce que le brief refuse déjà
+  de faire, et pour la même raison). Un humain qui lit trente noms de domaine
+  fait ce tri en dix secondes et ne se trompe pas. **Il le fait.**
+* **Suivre ce qu'on a demandé à qui.** Le jour où un employé écrit à un
+  comparatif pour lui demander de nous regarder, ce qui manque est une trace —
+  et cette trace existe déjà ailleurs : c'est un fil de `contacts` et de
+  `messages`, exactement la prospection, avec un autre objet. Rien de neuf à
+  bâtir, une décision à prendre.
+* **Le graphe des liens entrants.** Nommé ci-dessus, non appelé.
+
+### Ce que ça donne, en une commande
+
+```bash
+# après au moins une mesure — une question jamais mesurée n'a pas d'endroit
+GET /v1/content/places
+→ { "places": [
+      { "host": "stackoverflow.com", "questions": 6, "best_rank": 1,
+        "without_us": ["how do I check visa requirements by API", …] },
+      { "host": "rapidapi.com",      "questions": 4, "best_rank": 2,
+        "without_us": [] } ] }
+```
+
+`without_us` est la seule colonne actionnable : l'hôte y est, nous n'y sommes
+pas, et la question est celle qu'on voulait gagner. `questions` dit si l'endroit
+compte ou s'il est passé une fois. `best_rank` dit à quelle hauteur il est vu.
+Ce que ça ne dit pas — qui nous cite — est dit plus haut, et c'est volontaire.

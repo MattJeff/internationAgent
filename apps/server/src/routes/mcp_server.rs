@@ -159,7 +159,11 @@ GitHub du client (`integrations_connect`), lire ses outils \
 (`integrations_tools_declare`) — un outil non déclaré est traité comme \
 destructif et refusé. Ensuite `content_drafts_propose` \
 ouvre une pull request. **Ça ne publie pas** : une personne fusionne, et c'est \
-`content_drafts_amend` avec l'`url` constatée qui l'enregistre.
+`content_drafts_amend` avec l'`url` constatée qui l'enregistre. Une fois \
+plusieurs questions mesurées, `content_places_list` dit quels hôtes reviennent \
+dans leurs résultats et sur lesquelles de ces questions ils sont là sans nous : \
+c'est une liste d'endroits à faire lire à une personne, jamais une liste de \
+liens à aller poser.
 
 Un refus n'est pas une panne : `pending_approval` veut dire qu'un humain doit \
 valider, `halted` que la société est à l'arrêt, `daily_limit` qu'un plafond est \
