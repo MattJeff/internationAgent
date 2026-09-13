@@ -399,8 +399,11 @@ fn summarise(
     let mut subscribers = 0_i64;
     let mut is_floor = false;
     let mut currencies: BTreeSet<String> = BTreeSet::new();
-    // price_id -> (libellé, monnaie, abonnés, mrr, plancher)
-    let mut tiers: BTreeMap<String, (Option<String>, String, i64, i64, bool)> = BTreeMap::new();
+    // price_id -> (libellé, monnaie, abonnés, mrr, plancher). Le mrr est en
+    // i128 comme le total : une addition de montants lus chez un tiers ne doit
+    // pas pouvoir déborder un i64 au milieu d'une boucle — en `debug` c'est une
+    // panique, donc un 500 sur un écran de direction.
+    let mut tiers: BTreeMap<String, (Option<String>, String, i64, i128, bool)> = BTreeMap::new();
     let mut total: i128 = 0;
 
     for subscription in subscriptions {
@@ -432,7 +435,7 @@ fn summarise(
             tier.2 += 1;
             match monthly {
                 Some(minor) => {
-                    tier.3 += minor;
+                    tier.3 += i128::from(minor);
                     total += i128::from(minor);
                 }
                 None => {
@@ -461,7 +464,10 @@ fn summarise(
                 label,
                 currency,
                 subscribers,
-                mrr_minor: (!floor).then_some(mrr),
+                // Un palier dont un montant n'a pas été lu, ou dont la somme ne
+                // tient pas dans un `i64`, rend `None` : les deux sont « on ne
+                // sait pas », et aucun n'est zéro.
+                mrr_minor: (!floor).then(|| i64::try_from(mrr).ok()).flatten(),
             },
         )
         .collect();
