@@ -1057,9 +1057,9 @@ async fn read_subscriptions(
     // `window.from` rend, pour que « nouveaux ce mois-ci » et « facturés ce
     // mois-ci » parlent du même mois.
     let window_start = from.and_hms_opt(0, 0, 0).map_or(now, |at| at.and_utc());
-    match client.read(window_start, now).await {
-        Ok(read) => Some(read.into()),
-        Err(err) => {
+    match tokio::time::timeout(STRIPE_DEADLINE, client.read(window_start, now)).await {
+        Ok(Ok(read)) => Some(read.into()),
+        Ok(Err(err)) => {
             tracing::warn!(
                 %tenant_id,
                 code = err.code(),
@@ -1067,8 +1067,26 @@ async fn read_subscriptions(
             );
             None
         }
+        Err(_) => {
+            tracing::warn!(
+                %tenant_id,
+                seconds = STRIPE_DEADLINE.as_secs(),
+                "stripe took longer than this screen may wait: growth reads no subscription revenue this time"
+            );
+            None
+        }
     }
 }
+
+/// Ce que tout l'aller-retour Stripe a le droit de coûter à un écran.
+///
+/// Le délai de `agentos_app::stripe_subscriptions` borne **une** requête ; une
+/// lecture en fait jusqu'à vingt et une (dix pages par état compté, plus les
+/// événements), donc sans cette borne-ci le pire cas d'un Stripe qui traîne est
+/// plusieurs minutes d'écran blanc. Vingt secondes : trois requêtes lentes
+/// tiennent, une pagination pathologique non — et une pagination pathologique
+/// rendait déjà `null` par [`agentos_app::stripe_subscriptions::MAX_PAGES`].
+const STRIPE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 // ---------------------------------------------------------------------------
 // POST /v1/growth/stripe
