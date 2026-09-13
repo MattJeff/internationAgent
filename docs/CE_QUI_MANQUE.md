@@ -132,7 +132,9 @@ acheteur voit en premier. Sept lectures qui ne se contredisent pas :
   colonne (`contacts.created_at`, `outreach_buckets.contacts_taken`,
   `messages`, `sales_quotes.issued_at` / `.accepted_at`, `invoices.issued_at` /
   `.paid_at`), plus `mrr_minor` défini comme *trente jours glissants
-  d'encaissé* et non comme une projection ;
+  d'encaissé* et non comme une projection, plus `attribution` depuis
+  `0107` — d'où vient chaque facture réglée, remontée jusqu'à la porte par
+  laquelle la personne est entrée, `origins: []` quand on ne sait pas ;
 * `GET /v1/pnl` — par siège : tours, jetons, `cost_usd` avec son `cost_source` ;
 * `GET /v1/forecast` — le point mort, une division avec ses opérandes nommés ;
 * `GET /v1/usage` et `/v1/usage/models` — les jetons du client, sur son propre

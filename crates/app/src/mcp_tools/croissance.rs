@@ -51,6 +51,13 @@ pub fn tools() -> Vec<ToolDef> {
                  qui dise si l'entreprise *progresse* : `outreach_summary_get` compte les approches, \
                  `pnl_get` ce qu'un siège brûle, `invoices_list` ce qui est dû, aucune \
                  ne met les sept bout à bout ni ne calcule les taux. \
+                 Puis `attribution` : **d'où viennent les factures réglées de la fenêtre**, un seau \
+                 par ensemble d'origines et par monnaie, remonté d'une facture à son affaire, à son \
+                 compte, aux gens de ce compte et à la porte par laquelle ils sont entrés (une liste \
+                 importée, une page d'annuaire lue). Aucun euro n'y est réparti : un seau à deux \
+                 origines est une chaîne qui se scinde et les deux sont rendues, un seau dont \
+                 `origins` est **vide** est une facture d'origine **inconnue** — et inconnu n'est pas \
+                 organique. La somme des seaux d'une monnaie est son `collected_minor`. \
                  **`null` n'est jamais zéro** : un taux sans dénominateur n'existe pas, un coût \
                  `null` est un tarif non déclaré (ou un abonnement CLI, qui n'a pas de facture \
                  au jeton) et non un modèle gratuit, une recette `null` est un registre à \
