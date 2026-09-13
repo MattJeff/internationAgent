@@ -649,7 +649,7 @@ Et une quatrième, propre à ce dépôt : **on ne lit pas ce qui nous refuse, m�
 pour chercher une cible.** Une source qui interdit sa lecture l'interdit aussi
 à qui vient y chercher une occasion de lien.
 
-### L'arbitrage : on prend le tas 1, et seulement une moitié de sa première ligne
+### L'arbitrage : on prend le tas 1, et on n'en code que la quatrième ligne
 
 **Ce qui est codé aujourd'hui est un compte, pas une action.**
 `content_places_list` rend les hôtes qui reviennent dans les résultats de nos
@@ -711,9 +711,9 @@ La règle du § 2 s'applique à toute source qu'on approche, et l'hypothèse
 
 Donc les trois plus gros endroits où une question se pose nous sont **fermés par
 écrit** — et Quora prend la peine de nommer nos agents un par un —, tandis que
-le seul qui reste ouvert l'est à un rythme qui interdit l'exploration. Le chemin « aller lire les forums pour y trouver nos
-questions » est mort avant d'avoir coûté une ligne — ce qui est exactement à
-quoi sert de vérifier d'abord.
+le seul qui reste ouvert l'est à un rythme qui interdit l'exploration. Le chemin
+« aller lire les forums pour y trouver nos questions » est mort avant d'avoir
+coûté une ligne — ce qui est exactement à quoi sert de vérifier d'abord.
 
 Et le détour est inutile : `lite.duckduckgo.com`, qui nous autorise, **indexe
 déjà ces sites**. Un fil de forum qui répond à notre question sort dans les
