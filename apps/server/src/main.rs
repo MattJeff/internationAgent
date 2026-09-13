@@ -774,6 +774,14 @@ fn app(
             // thread — the same `messages` rows an employee already writes to a
             // colleague, with a person at one end.
             .merge(routes::desk::router(db.clone()))
+            // L'autre moitié de la même paire de tables, et le trou que la
+            // ligne au-dessus ne fermait pas : le bureau rend le canal
+            // interne, et rien ne rendait ce que des gens du DEHORS ont
+            // écrit. Une campagne partie était une campagne aveugle — des
+            // ouvertures, des clics, un compteur de fils qui ont répondu, et
+            // pas une phrase. Lecture seule : répondre est un acte d'employé,
+            // voir l'en-tête du module.
+            .merge(routes::conversations::router(db.clone()))
             // And beside them, closing the asymmetry the founder named: the
             // company could buy end to end and could not ask to be paid.
             // Read-and-settle only — issuing goes through the gate, from a seat,
