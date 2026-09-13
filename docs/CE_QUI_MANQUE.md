@@ -534,6 +534,17 @@ une session Checkout payée et règle la facture qu'elle nomme. Rien dans ce
 dépôt ne *crée* une session Checkout ni un lien de paiement. Le client est donc
 facturé par PDF et paie par un lien fabriqué ailleurs.
 
+**Et depuis le 2026-09-13, une deuxième porte vers Stripe, qui ne fait que
+lire.** `agentos_app::stripe_subscriptions` interroge `GET /v1/subscriptions` et
+`GET /v1/events` avec une clé restreinte rangée par locataire (`0108`), et
+`GET /v1/growth` rend le résultat sous `subscriptions`, **à côté** du registre
+de factures et jamais dedans. C'est la moitié du revenu qu'aucune table d'ici ne
+pouvait porter : `invoices.opportunity_id` est `NOT NULL` et une affaire
+`closed_won` exige une approbation humaine, donc un abonnement pris en
+libre-service à 3 h du matin n'entrait nulle part. Ce module n'écrit rien chez
+Stripe et ne le peut pas — une seule fonction y touche le réseau, elle fait un
+`GET`, et un test lit le fichier pour refuser les verbes d'écriture.
+
 ### 3.9 Signer — joint le 2026-09-12, sans qu'aucun appel réel ait été fait
 
 `ActionKind::ContractSign` existe, l'acheteur le propose, la gate en fait
