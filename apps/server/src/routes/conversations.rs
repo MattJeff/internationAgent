@@ -95,6 +95,14 @@
 //!   le même silence que [`super::desk`] garde sur un siège inconnu.
 //! * **Les appels.** `Channel::Voice` n'a pas de corps ; la ligne existe, le
 //!   `body` est ce que la transcription a laissé.
+//! * **Le deux-cent-unième fil qui a répondu.** `limit` est tout le contrôle :
+//!   pas de curseur, donc au-delà de [`MAX_LIMIT`] les plus anciens ne sont
+//!   atteignables par aucun appel. Assumé plutôt qu'oublié — un fondateur lit
+//!   ce qui vient d'arriver, et un curseur est une promesse d'ordre stable que
+//!   `routes::knowledge` refuse pour sa recherche avec le même argument. Le
+//!   jour où une entreprise dépasse ça, la clé de pagination est la paire
+//!   `(last.received_at, c.id)` déjà dans le `ORDER BY`, en `keyset` comme
+//!   `pool_ops::affinities`.
 
 use agentos_domain::ids::ConversationId;
 use agentos_domain::untrusted::Untrusted;
@@ -210,6 +218,17 @@ struct ThreadView {
 /// portent toutes les trois la RLS depuis `0001_core`, et la transaction est
 /// une `tenant_tx`. Le prédicat est la policy, pas une clause qu'un
 /// remaniement peut laisser tomber.
+///
+/// **Et le `JOIN` sur `employees` ne peut pas faire disparaître un fil, parce
+/// que `0103` l'a rendu impossible.** Une jointure interne sous RLS cache
+/// silencieusement la ligne dont le côté droit est invisible ; ce serait
+/// exactement le cas d'une conversation pointant sur le siège d'un autre
+/// locataire, et jusqu'à `0103` le contrôle de clé étrangère — exécuté hors de
+/// la RLS, en tant que propriétaire de la table référencée — acceptait cette
+/// ligne. La clé est maintenant composite sur `(tenant_id, employee_id)`, donc
+/// le siège d'un fil est du même locataire que lui, donc il est visible dans
+/// la même transaction. Aucune garde à écrire ici : ce qui la remplace est une
+/// contrainte que Postgres vérifie sur tous les chemins d'écriture à la fois.
 ///
 /// ponytail: un balayage de `conversations` puis une latérale par ligne. À
 /// quelques milliers de fils c'est une milliseconde et l'index
