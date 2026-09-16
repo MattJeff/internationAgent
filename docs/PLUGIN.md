@@ -13,7 +13,7 @@ fondateur a **cinq gestes nommés** plutôt qu'un catalogue.
 ## 1. L'installation, en trois lignes
 
 ```
-/plugin marketplace add MattJeff/InternationalAgent
+/plugin marketplace add MattJeff/internationAgent
 /plugin install siglair@siglair
 ```
 
@@ -265,7 +265,7 @@ mais `browser_js` ne se bascule par aucune route et **ce mur reste entier**.
 
 **Non vérifié, et ça ne peut pas l'être depuis un worktree :** l'installation
 elle-même. Le marketplace n'est atteignable qu'une fois la branche poussée sur
-`MattJeff/InternationalAgent`, donc personne n'a encore vu `/plugin marketplace
+`MattJeff/internationAgent`, donc personne n'a encore vu `/plugin marketplace
 add` résoudre ce catalogue, ni l'installateur demander la clé, ni
 `${user_config.cle_api}` être remplacé dans l'en-tête `Authorization`, ni le
 serveur `siglair` apparaître dans `/mcp`. Tant que quelqu'un ne l'a pas fait une
