@@ -255,6 +255,10 @@ fi
 # Gmail le lit.
 PUBLIC="http://127.0.0.1:$PORT"
 if [ "$RECEVOIR" = 1 ]; then
+  # Celui d'avant, s'il tourne encore : une nouvelle exécution a de toute façon
+  # une nouvelle adresse, et écraser le fichier de pid laisserait l'ancien
+  # tunnel ouvert sans que rien ne sache plus l'arrêter.
+  arreter_pid "$TUNNEL_PIDFILE" "l'ancien tunnel" 10
   dit "j'ouvre un tunnel rapide (sans compte, sans dépense)…"
   : > "$TUNNEL_JOURNAL"
   cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$PORT" \
