@@ -224,6 +224,20 @@ pub struct EmailCredentials {
     /// its own per-tenant registry and never calls the adapter's
     /// `verify_webhook`, so this is a belt with no braces on it yet.
     pub webhook_secret: String,
+    /// `EMAIL_API_BASE`: où l'adaptateur Resend parle, quand ce n'est pas
+    /// `api.resend.com`.
+    ///
+    /// La répétition générale du chemin `--reel`, et rien d'autre.
+    /// `scripts/faux-resend.py` sert les cinq routes que la marche touche, et
+    /// `EMAIL_API_BASE=http://127.0.0.1:…` fait passer l'envoi entier par lui —
+    /// la même bascule que `ResendEmailProvider::with_base_url` offre déjà aux
+    /// tests, portée jusqu'à la variable d'environnement parce qu'un script de
+    /// montage n'a pas d'autre main sur l'adaptateur.
+    ///
+    /// **`config.rs` la refuse sans `AGENTOS_ALLOW_MOCKS`**, et c'est la
+    /// frontière qui compte : rediriger l'API d'un fournisseur, c'est choisir
+    /// à qui la clé de ce fournisseur est présentée.
+    pub api_base: Option<String>,
     /// `AGENT_EMAIL_DOMAIN`. **Not the adapter's domain any more** — the
     /// sending domain is the tenant's, in `tenant_domains` (0093), and the
     /// seat reads it off the employee's row. This is the default a tenant
@@ -354,6 +368,10 @@ fn email_provider(credentials: &Credentials, public_host: Option<&str>) -> Arc<d
                 Secret::new(email.api_key.clone()),
                 Secret::new(email.webhook_secret.clone()),
             );
+            let provider = match &email.api_base {
+                Some(base) => provider.with_base_url(base.clone()),
+                None => provider,
+            };
             Arc::new(match public_host {
                 Some(host) => {
                     provider.with_unsubscribe_origin(&crate::inbound::callback_origin(host))
@@ -1276,6 +1294,7 @@ mod tests {
             email: Some(EmailCredentials {
                 api_key: "re_live_key".to_owned(),
                 webhook_secret: LIVE_WEBHOOK_SECRET.to_owned(),
+                api_base: None,
                 domain: "agents.example.com".to_owned(),
             }),
             telephony: Some(TelephonyCredentials {
