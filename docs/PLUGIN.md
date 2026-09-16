@@ -111,6 +111,20 @@ recopiée sans un octet de différence ou `approvals_deny` avec une note, puis l
 couche — et enfin `desk_messages_send` depuis un fauteuil pour dire à l'employé ce qui a
 été décidé et pourquoi.
 
+**`monter-la-societe`** — **le geste qui vient avant les quatre autres**, et le seul qui parte
+de rien : `model_connect` `{"path":"cli"}`, `company_create`, `domains_register` →
+`domains_verify`, `initiatives_set` sur chaque siège, `prospects_import` à blanc puis réel,
+`sequences_create` → `contacts_list` → `sequences_enroll` → `sequences_runs_list`. Il existe
+parce que le fondateur ne doit pas avoir à savoir que `org_apply` est un piège sur une société
+neuve : cette route embauche et **n'écrit aucune couche de limites**, une couche absente hérite
+du plafond de la plateforme, et `policy_role_set` ne peut pas la créer après coup — il rend 404.
+Il porte **six barrières**, une par pas, annoncées en tête : ce qu'on relit *avant* de passer au
+suivant, et quoi faire quand ce n'est pas ça. Et il **embarque ses chiffres** plutôt que de les
+faire inventer : `company_create` réclame un document de limites complet par rôle, et les six
+gabarits de `skills/monter-la-societe/gabarits/` sont les documents du fondateur —
+`docs/orizn-roles/*.json` et `docs/orizn-org.json` — copiés à l'octet près, parce qu'un plugin
+installé ne voit pas `docs/`. `verifier-plugin.py` refuse une copie qui a dérivé.
+
 **`embaucher`** — `teams_list` pour savoir sous quel `role_name` ses limites
 seront lues, `employees_create` (202 et non 201 : commandé, pas embauché) ou
 `org_apply` pour plus d'un siège, `teams_members_add` / `teams_members_set` pour
@@ -192,8 +206,9 @@ Vérifié par ce script : chaque JSON parse, chaque `SKILL.md` porte un
 frontmatter délimité dont tous les champs sont documentés et dont le `name`
 correspond à son dossier, **chacun des 68 outils nommés par les cinq gestes
 existe encore dans `crates/app/src/mcp_tools/`**, aucun fichier ne contient
-`sk-`, `re_`, `whsec_` ni un `Bearer ` suivi d'un jeton, et la `source` du
-marketplace mène à un manifeste dont le nom correspond.
+`sk-`, `re_`, `whsec_` ni un `Bearer ` suivi d'un jeton, **les six gabarits de
+`monter-la-societe` sont encore les documents du fondateur à l'octet près**, et
+la `source` du marketplace mène à un manifeste dont le nom correspond.
 
 La troisième ligne est la seule qui mérite un script plutôt qu'une relecture :
 les 148 lignes du registre sont éditées par d'autres chantiers, et un outil
@@ -214,6 +229,39 @@ quarante envois dont aucune trace n'était revenue ; `company_health_get` ne
 nommait pas le siège qui venait d'échouer ; `capability_requests_list` rendait
 un seuil sous un nom de date). Les deux autres gestes de lecture n'ont toujours
 été joués par personne.
+
+**Vérifié depuis le 2026-09-16 :** `monter-la-societe` a été **joué deux fois
+par un vrai `claude`**, en non interactif (`claude -p --plugin-dir ./plugin
+--mcp-config … --strict-mcp-config`), sur deux bases neuves montées et
+supprimées pour l'occasion, depuis « rien » jusqu'à quatre runs de séquence
+`active` et un premier tour abouti (`last_success_at` cesse d'être `null`). Le
+modèle a **choisi le geste lui-même** sur la phrase « monte-moi l'entreprise ».
+
+La première marche — 64 tours — a rendu trois défauts du geste, tous corrigés
+puis rejoués : les six relectures étaient **groupées à la fin** au lieu d'être
+posées entre deux pas (elles sont devenues une *barrière* par pas, annoncée en
+tête) ; le geste imposait `domains_dns_publish` → `domains_verify` alors que le
+fournisseur avait **déjà rendu le domaine vérifié** à l'enregistrement ; et
+l'import laissait `country: ZZ`, parce que la colonne `location` d'un export
+Smartlead est de la prose et que `country` vaut pour **tout** le fichier — une
+liste qui mélange les pays s'importe en un appel par pays. La seconde marche,
+sur le geste corrigé, a fait **38 tours au lieu de 64** et franchi les six
+barrières en place.
+
+Une quatrième correction vient de la mesure et pas d'un écart : la barrière du
+pas 4 réclamait un `initiatives_get` après chaque `initiatives_set`, et
+l'écriture **rend déjà** `plan`, `clarify` et `next_at` dans sa propre réponse.
+Quatre appels de moins, et `initiatives_get` reste nommé pour ce qu'il sert
+vraiment — relire une charte posée un autre jour, diagnostiquer un run mort en
+`not_sent`.
+
+Ce que la marche a rendu et qui n'est pas dans le geste : sur un déploiement
+sans JavaScript ni proxy navigateur, la séquence reste `active`, le siège prend
+ses tours, **aucun refus n'est enregistré** et pas un mail ne part — la charte du
+commercial lui interdit d'écrire sans un défaut reproduit, et aucune page ne se
+charge. Le geste dit désormais où regarder (`events_list`, puis
+`desk_messages_list` sur le fauteuil, où l'employé dépose son « sans constat »),
+mais `browser_js` ne se bascule par aucune route et **ce mur reste entier**.
 
 **Non vérifié, et ça ne peut pas l'être depuis un worktree :** l'installation
 elle-même. Le marketplace n'est atteignable qu'une fois la branche poussée sur

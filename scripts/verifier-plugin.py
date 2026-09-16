@@ -70,7 +70,7 @@ noise = {"dry_run", "user_config", "last_failure_detail", "outstanding_minor", "
          "no_model", "no_platform_policy", "not_sent", "objective_field",
          "role_layer_exists", "tenant_mismatch", "unreachable_colleague",
          "window_exists", "corporate_travel", "escalate_to",
-         "first_response_hours", "target_accounts", "next_at"}
+         "first_response_hours", "target_accounts", "next_at", "browser_js"}
 missing = sorted(t for t in cited - noise if t not in registry)
 if missing:
     bad.append(f"outils cites et absents du registre : {missing}")

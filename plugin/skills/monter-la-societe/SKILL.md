@@ -32,7 +32,7 @@ encore petite et lisible est juste après l'avoir écrite.
 | 1 le modèle | `company_health_get` ne dit plus `no_model` |
 | 2 la société | `employees_list` rend un siège par ligne du tableau |
 | 3 le domaine | `domains_list` le dit **`verified`** |
-| 4 les chartes | `initiatives_get` rend **un plan** sur chaque siège chargé |
+| 4 les chartes | la réponse d'`initiatives_set` porte **un plan** et `clarify: null` |
 | 5 les prospects | le `dry_run` rend **zéro refus** avant l'import réel |
 | 6 la séquence | `sequences_runs_list` rend chaque inscrit **actif** |
 
@@ -210,14 +210,17 @@ Trois choses qu'on se prend une fois :
 `relocation` et `other`. Prendre une valeur de l'une pour l'autre est un 400 `objective_field`.
 Deux listes, deux questions, jamais la même réponse recopiée.
 
-**Lis ensuite `initiatives_get` sur chaque siège que tu viens de charger.** Elle doit rendre
-**un plan**, recalculé depuis l'objectif à chaque lecture.
+**La barrière est dans la réponse de l'écriture elle-même**, et c'est la seule du geste qui ne
+coûte pas un appel de plus : `initiatives_set` rend déjà le **plan**, recalculé depuis
+l'objectif, `clarify`, et `next_at`. Lis-la avant le siège suivant.
 
-- Un plan → c'est bon, et dis sa prochaine échéance.
+- Un `plan` et `clarify: null` → c'est bon. Dis sa prochaine échéance.
 - `clarify` avec une question → l'objectif a un trou, et la réponse te dit lequel. Rapporte la
-  question au fondateur et rejoue `initiatives_set` complet.
-- 404 → le siège n'a pas d'initiative, ou n'est pas de cette société. Reprends son UUID dans
-  `employees_list`.
+  question au fondateur et rejoue `initiatives_set` **complet** (c'est un remplacement).
+- **`initiatives_get`** relit exactement la même chose plus tard, et c'est par elle qu'on passe
+  quand on doute d'une charte posée un autre jour, ou qu'un run meurt en `not_sent`. 404 veut
+  dire que le siège n'a pas d'initiative, ou n'est pas de cette société : reprends son UUID
+  dans `employees_list`.
 
 ---
 
