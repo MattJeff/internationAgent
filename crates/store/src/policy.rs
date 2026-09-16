@@ -702,8 +702,15 @@ pub fn default_ceiling() -> PolicyLimits {
         // do is compose a letter nobody read — and the operator who wanted the
         // review would find out it existed only after not having had it.
         //
-        // It costs a queue and the queue is readable: one line per email a
-        // tainted turn drafts, which on a first campaign is a handful, and
+        // It costs a queue and the queue is readable, and that second half is
+        // load-bearing rather than hopeful: `evaluate` asks
+        // `ActionCtx::read_outside` as well as the taint bit, so what lands in
+        // it is one line per email written *after a named outside source
+        // reached the turn* — a reply, or an approach composed from a page the
+        // seat actually read. A sequence's first touch, which is `Untrusted`
+        // on this build because the board and the diary are fenced, does not.
+        // Without that second bit this default would be "every email waits",
+        // and it would be switched off within a day.
         // `approvals_list` is already where a founder looks. An operator who
         // does not want it writes `false` in a tenant layer — and cannot,
         // because this field intersects with `||` and a lower layer may only

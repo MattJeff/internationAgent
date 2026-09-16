@@ -641,7 +641,14 @@ impl PolicyGate {
         // logged a decision it never made would be worse than one that logged
         // nothing.
         let outcome = self
-            .decide(&mut tx, principal, &subject, action.trust(), now)
+            .decide(
+                &mut tx,
+                principal,
+                &subject,
+                action.trust(),
+                origin.is_some(),
+                now,
+            )
             .await?;
 
         let mut extra = Map::new();
@@ -860,6 +867,15 @@ impl PolicyGate {
         principal: &Principal,
         action: &Action,
         trust: TrustLabel,
+        // Whether a `TaintOrigin` reached this turn — a source outside this
+        // company that can be *named*. Passed beside `trust` rather than
+        // derived from it, because they are different questions: see
+        // `ActionCtx::read_outside`. `authorize_from` is the only caller and it
+        // hands `origin.is_some()`, which is where the distinction is already
+        // drawn — `Context::with_untrusted` records no origin for the board and
+        // the diary, `with_untrusted_from` and `Reply::Untrusted` record one
+        // for a message and for a page.
+        read_outside: bool,
         now: DateTime<Utc>,
     ) -> Result<Outcome, Denied> {
         // 0. The company, before anything at all. One row by primary key, in
@@ -1005,6 +1021,7 @@ impl PolicyGate {
         let ctx = ActionCtx {
             actor: principal.action_actor(),
             trust,
+            read_outside,
             contact,
             spent_today,
             new_contacts_today,

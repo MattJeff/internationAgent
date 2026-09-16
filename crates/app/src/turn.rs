@@ -3067,10 +3067,45 @@ impl Turn {
                 // between the two reads; from a turn that refusal is otherwise
                 // unreachable, since the address on the token *is* the
                 // register's answer and the model never supplied one.
-                let sent = gated!(self, trust, origin, EmailSend { to }, |ok| self
-                    .effects
-                    .send_invoice(ok, id, &self.from)
-                    .await);
+                // Le brouillon, pour la raison de `send_email` et avec ce que
+                // ce verbe a de particulier : il n'y en a pas. Le corps d'une
+                // facture n'est pas rédigé par le modèle — `Effects::send_invoice`
+                // l'assemble depuis le registre et y attache le PDF — donc
+                // l'approbateur ne peut pas relire des mots, il peut relire
+                // QUELLE facture part et à qui. C'est ce qu'il y a à décider ici,
+                // et une ligne sans rien à lire serait une ligne que
+                // `routes::approvals` refuse d'envoyer : un client qui demande
+                // sa facture ne recevrait plus jamais rien.
+                let draft = json!({
+                    "to": to.to_string(),
+                    "subject": format!("invoice {id}"),
+                    "body": "The invoice document as this company's register holds it, with the \
+                             PDF attached. The wording is not a seat's — `Effects::send_invoice` \
+                             assembles it from the register — so what is being approved here is \
+                             the recipient and which invoice, not a sentence.",
+                    // **La clé qui change l'exécuteur**, et sans elle
+                    // l'approbation enverrait le texte ci-dessus à la place de
+                    // la facture. `routes::approvals::letter` la lit et appelle
+                    // `send_invoice` plutôt que `send_email` : une ligne
+                    // `approvals` porte un `Action::EmailSend` dans les deux
+                    // cas, et rien d'autre ne distingue les deux verbes une
+                    // fois le tour fini.
+                    "invoice": id.as_uuid().to_string(),
+                    "from": self.from,
+                });
+                let sent = gated!(
+                    self,
+                    trust,
+                    origin,
+                    EmailSend { to },
+                    |ok| self.effects.send_invoice(ok, id, &self.from).await,
+                    |denied| {
+                        if let Denied::PendingApproval(approval) = denied {
+                            self.effects.attach_email_draft(approval, &draft).await;
+                        }
+                        refusal(denied)
+                    }
+                );
                 // The contact's address is not repeated back: it is a row in
                 // our register, and a register row can have arrived from a
                 // page. The model chose the invoice; that is what it is told.

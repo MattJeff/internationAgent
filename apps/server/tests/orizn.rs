@@ -844,6 +844,26 @@ async fn assert_the_company_is_orizn(db: &Db, tenant: TenantId, seats: &HashMap<
             );
         }
 
+        // **The one switch on this company that is asserted ON**, and it is not
+        // in the loop above because it is not that kind of field: the four
+        // there are permissions and `false` is their safe value, this is a
+        // requirement and `true` is. The loader takes the OR rather than the
+        // AND, so `docs/orizn-ceiling.json` alone decides it and no role
+        // document can put it back — which is the point, and which is why it is
+        // worth a line here rather than a trust that nobody edited the ceiling.
+        //
+        // What it means on the running company, in the founder's words: *« et
+        // pour moi on valide aussi la réponse »*. An email drafted in a turn
+        // that read outside text — a reply, and a cold approach written after
+        // reading the prospect's own page — waits on `approvals_list` with its
+        // letter attached, and goes out when somebody holding the approver key
+        // says so.
+        assert!(
+            limits.untrusted_email_needs_approval,
+            "{role}: a reply from this seat would leave without anybody reading it, and the \
+             shipped ceiling is what was supposed to stop that"
+        );
+
         // **Can this seat actually do the thing the columns above describe?**
         //
         // The columns are values; this is the rule they produce. It is here

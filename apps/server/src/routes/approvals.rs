@@ -175,7 +175,7 @@ use agentos_app::effects::{
 use agentos_app::gate::{PolicyGate, Principal as GatePrincipal};
 use agentos_app::signature;
 use agentos_domain::action::{Action, ActionKind, EmailAddress};
-use agentos_domain::ids::{ApprovalId, EmployeeId};
+use agentos_domain::ids::{ApprovalId, EmployeeId, InvoiceId};
 use agentos_domain::policy::DenyReason;
 use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
 use agentos_store::capability;
@@ -828,11 +828,23 @@ async fn letter(
     to: EmailAddress,
     id: Uuid,
 ) -> Result<Json<Value>, ApiError> {
-    /// The two strings a letter is, off the row.
+    /// The letter, off the row.
+    ///
+    /// `invoice` and `from` are the invoice path's: a turn's `send_invoice` is
+    /// an `Action::EmailSend` exactly like `send_email` is, and once the turn is
+    /// over nothing else can tell the two apart. Without that key an approved
+    /// invoice would go out as `body` — a sentence *about* a document, in place
+    /// of the document — which is the one way this route could send something
+    /// nobody wrote. With it, the executor is chosen by the seat that composed
+    /// the draft rather than guessed at here.
     #[derive(serde::Deserialize)]
     struct Draft {
         subject: String,
         body: String,
+        #[serde(default)]
+        invoice: Option<Uuid>,
+        #[serde(default)]
+        from: Option<String>,
     }
 
     // The last instant at which nothing has been spent, exactly as the payment
@@ -871,6 +883,31 @@ async fn letter(
         state.ports.clone(),
         gate_principal.clone(),
     );
+    // The invoice arm: the register writes the letter, this route only says
+    // which one and to whom — which is exactly what the approver was shown.
+    if let Some(invoice) = draft.invoice {
+        let from = draft.from.unwrap_or_default();
+        return match effects
+            .send_invoice(authorized, InvoiceId::from_uuid(invoice), &from)
+            .await
+        {
+            Ok(sent) => Ok(Json(json!({
+                "id": id.to_string(),
+                "state": "redeemed",
+                "decision_id": decision_id,
+                "email": { "provider_message_id": sent.as_str() },
+            }))),
+            Err(err) => Err(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                EMAIL_NOT_SENT,
+                "the approval was redeemed and the invoice did not leave",
+            )
+            .with_extension("state", json!("redeemed"))
+            .with_extension("decision_id", json!(decision_id))
+            .with_extension("detail", json!(err.to_string()))),
+        };
+    }
+
     let rendered = RenderedEmail {
         // Off the deployment's configuration, never off the row: an approval
         // does not get to choose who this company is.

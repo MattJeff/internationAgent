@@ -419,10 +419,14 @@ pub struct PolicyLimits {
     ///
     /// The founder's sentence: *« et pour moi on valide aussi la réponse »*. A
     /// reply is drafted by a seat that has just read the customer's mail, so a
-    /// reply is, by construction, composed in an
-    /// [`Untrusted`](crate::untrusted::TrustLabel::Untrusted) turn. That is the
-    /// bit this reads, and it is read off [`ActionCtx::trust`] — the same bit
-    /// the taint wire reads, one notch down the risk axis.
+    /// reply is, by construction, composed in a turn that read something from
+    /// outside. That is the pair of bits this reads:
+    /// [`ActionCtx::trust`] — the same bit the taint wire reads, one notch down
+    /// the risk axis — **and** [`ActionCtx::read_outside`], which is what
+    /// separates "a stranger's words reached this turn" from "this turn was
+    /// shown a fenced list of our own". The second is not decoration; without
+    /// it this field is the "every email waits" spelling, for the measured
+    /// reason in `read_outside`'s docs.
     ///
     /// # Why the taint bit and not "they wrote to us first"
     ///
@@ -443,22 +447,31 @@ pub struct PolicyLimits {
     /// has ~1 615 prospects loaded; first touches are what the founder
     /// delegated in the same breath (*« tu prépares les séquences, tu lances »*),
     /// and a queue with 1 615 lines in it is a queue nobody reads, which is
-    /// worse than no queue at all because it looks like supervision. An
-    /// operator who does want that spelling has it: an employee layer with the
-    /// web channel dropped makes every turn trusted and this field then never
-    /// fires — which is the honest way to say "this seat writes only our own
-    /// words".
+    /// worse than no queue at all because it looks like supervision.
+    ///
+    /// **And a rule written on `trust` alone would have been that option under
+    /// another name.** That is the one thing the walk of 2026-09-16 changed
+    /// about this field: `loops::initiative` fences the work board, the diary
+    /// and an appointment's own subject into nearly every cadence turn, so a
+    /// sequence's *first touch* is already `Untrusted` before it calls a tool.
+    /// [`ActionCtx::read_outside`] is what keeps the two apart, and it is a
+    /// distinction `app::gate::TaintOrigin` already drew one layer above the
+    /// gate without the gate being told.
     ///
     /// # What it over-covers, deliberately
     ///
-    /// A *cold* email written after the seat read the prospect's site is also
-    /// composed in an untrusted turn, so it waits too. That is the rule read
+    /// A *cold* email written after the seat **successfully** read the
+    /// prospect's site waits too — the page is a named outside source and
+    /// `turn.rs` flips both bits on the tool result. That is the rule read
     /// strictly rather than an accident: an email whose content came out of
     /// somebody else's page is exactly as much "words we did not choose" as a
     /// reply is, and `rolepack_sales` makes reading the prospect's flow a
     /// *precondition* of writing to them — so on the selling vertical this is
     /// close to "every email a seller sends is read by a human first", which is
     /// what a first campaign should look like and not what a hundredth should.
+    /// An operator who does not want that narrows `Channel::Web` out of the
+    /// seat's layer, which is the honest way to say "this seat writes only from
+    /// what we told it".
     ///
     /// # The security half
     ///
@@ -1767,7 +1780,17 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
             }
             match channel_rules(Channel::Email) {
                 Some(reason) => Decision::deny(reason),
-                None if *untrusted_email_needs_approval && ctx.trust.is_untrusted() => {
+                None if *untrusted_email_needs_approval
+                    && ctx.trust.is_untrusted()
+                    // **Both, and the second is the one that makes this field
+                    // shippable.** `trust` alone is `Untrusted` on nearly every
+                    // cadence turn — the board and the diary are fenced lists
+                    // and they taint — so keying on it would queue a first
+                    // touch that read nothing, which is the "every email
+                    // waits" spelling this field was chosen *instead* of. See
+                    // `ActionCtx::read_outside` for the measurement.
+                    && ctx.read_outside =>
+                {
                     Decision::RequireApproval {
                         reason: ApprovalReason::UntrustedEmail,
                         // `{to:?}`, as the payment arm quotes its payee: this
@@ -2732,6 +2755,21 @@ mod tests {
 
         // And the field is what decides. Same tainted turn, policy silent.
         assert!(evaluate(&effective(&permissive()), &reply, &tainted).is_allow());
+
+        // **The half that keeps this from being "every email waits".** A turn
+        // tainted only by our own fenced lists — the board, the diary, an
+        // appointment's subject — reads `Untrusted` and has no origin, which is
+        // what a sequence's first touch looks like on this build. It goes.
+        let ours = ActionCtx {
+            trust: TrustLabel::Untrusted,
+            read_outside: false,
+            ..ctx()
+        };
+        assert!(
+            evaluate(&policy, &reply, &ours).is_allow(),
+            "a first touch that read nothing from outside was put in the queue: this field \
+             would then be the option it was chosen instead of"
+        );
     }
 
     /// A refusal the rules can make is never dressed up as a question for a

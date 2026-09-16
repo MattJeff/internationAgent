@@ -975,6 +975,32 @@ pub struct ActionCtx {
     pub actor: Actor,
     /// Provenance of the input that produced the action.
     pub trust: TrustLabel,
+    /// Whether a **named source outside this company** reached this turn: an
+    /// inbound message, a page the browser read, an MCP server's answer, a
+    /// recalled document.
+    ///
+    /// # Why this is not the same question as [`Self::trust`]
+    ///
+    /// Because `Untrusted` is broader than "somebody else's words", and the gap
+    /// is where a rule written on `trust` alone goes wrong. `app::gate`'s
+    /// `TaintOrigin` is `None` for the fenced lists this company shows a seat
+    /// about *itself* — the work board, the diary, an appointment's own subject
+    /// — and `Some` only for a source it can name. `loops::initiative` attaches
+    /// the board and the diary to nearly every cadence turn, so a seat with one
+    /// open work item runs `Untrusted` turns forever without anything from
+    /// outside having been read.
+    ///
+    /// Measured, on the walk of 2026-09-16: a sequence's first-touch turn wrote
+    /// `trust_label: untrusted` on its very first audit row, before it called a
+    /// single tool, with no `channel` and no `taint_sources` beside it — the
+    /// signature of an origin-less taint. The same seat's later rows carried
+    /// `channel` and `taint_sources: 1`. A policy keyed on `trust` alone would
+    /// have treated the two identically; they are not the same turn.
+    ///
+    /// Host-supplied, like [`Self::contact`] and [`Self::spent_today`]: the
+    /// model does not get to declare that it read nothing. `true` is the safe
+    /// value, so [`ActionCtx::new`] starts there.
+    pub read_outside: bool,
     /// Whether the counterparty is already known to this employee.
     pub contact: ContactStanding,
     /// Spend already booked today. `None` means nothing has been spent —
@@ -1006,12 +1032,18 @@ pub struct ActionCtx {
 }
 
 impl ActionCtx {
-    /// The safest context: untrusted input, unknown counterparty, no history,
-    /// no authority over anybody. Callers widen from here as they learn more.
+    /// The safest context: untrusted input read from outside, unknown
+    /// counterparty, no history, no authority over anybody. Callers widen from
+    /// here as they learn more.
     pub const fn new(actor: Actor, now: DateTime<Utc>) -> Self {
         Self {
             actor,
             trust: TrustLabel::Untrusted,
+            // `true`, and it is the only field of this constructor whose safe
+            // value is not the *absence* of something. The rest deny by being
+            // empty; this one asks for a human by being set, so a caller that
+            // has not worked out where its text came from gets the human.
+            read_outside: true,
             contact: ContactStanding::New,
             spent_today: None,
             new_contacts_today: 0,
