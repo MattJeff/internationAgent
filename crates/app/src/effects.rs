@@ -47,7 +47,9 @@
 use std::sync::Arc;
 
 use agentos_domain::action::{Action, Domain, E164, EmailAddress, McpTool};
-use agentos_domain::ids::{AppointmentId, DecisionId, IdempotencyKey, InvoiceId, Slug, WorkItemId};
+use agentos_domain::ids::{
+    AppointmentId, ApprovalId, DecisionId, IdempotencyKey, InvoiceId, Slug, WorkItemId,
+};
 use agentos_domain::money::Money;
 use agentos_domain::revenue::QuoteId;
 use agentos_domain::untrusted::{TrustLabel, Untrusted};
@@ -61,6 +63,7 @@ use agentos_providers::telephony::{
     OpenWindow, OutboundCall, OutboundSms, OutboundWhatsapp, TelephonyProvider,
 };
 use agentos_providers::{ProviderBinding, ProviderError};
+use agentos_store::approvals;
 use agentos_store::audit::{self, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::invoices;
@@ -1401,6 +1404,39 @@ impl Effects {
     /// and nothing but the caller's care kept them equal.
     pub const fn principal(&self) -> &Principal {
         &self.principal
+    }
+
+    /// Put the letter a seat wants to send on the approval row the gate just
+    /// filed for it.
+    ///
+    /// **Not an effect**, and it is here rather than in `turn.rs` only because
+    /// this is the type that holds a `Db` and a `Principal`. Nothing leaves the
+    /// building: it writes three strings the same turn produced onto a row the
+    /// same transaction chain created, and the gate has already ruled — there
+    /// is no second decision to make and none is made.
+    ///
+    /// Errors are swallowed into `false` on purpose. The caller is on a refusal
+    /// path that is about to tell the model "pending approval", and turning a
+    /// failed annotation into a failed *turn* would trade a letter a human
+    /// cannot read for a letter that was never written. The consequence is
+    /// named where it bites: `routes::approvals::approve` refuses to send an
+    /// approval that carries no draft, so the worst case is a row an approver
+    /// cannot act on rather than a letter nobody read going out.
+    pub async fn attach_email_draft(&self, id: ApprovalId, draft: &Value) -> bool {
+        let attached = async {
+            let mut tx = self.db.tenant_tx(self.principal.tenant_id).await.ok()?;
+            let done = approvals::attach_draft(&mut tx, id, draft).await.ok()?;
+            tx.commit().await.ok()?;
+            Some(done)
+        }
+        .await;
+        if attached != Some(true) {
+            tracing::warn!(
+                approval = %id.as_uuid(),
+                "an escalated email could not be shown to its approver; it will not be sendable"
+            );
+        }
+        attached == Some(true)
     }
 
     /// Send the rendered email to the address on the token.

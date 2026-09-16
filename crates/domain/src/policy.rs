@@ -2679,7 +2679,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// **The half `app::gate` says this suite owns.**
     ///
     /// `an_untrusted_turn_puts_no_line_in_the_approval_queue` over there checks

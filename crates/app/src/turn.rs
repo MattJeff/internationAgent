@@ -2016,7 +2016,19 @@ fn performed<T>(
 /// exactly what makes the taint impossible to drop. The two arms of a `match`
 /// may each move the body, so nothing is cloned.
 macro_rules! gated {
+    // The ordinary spelling: a refusal becomes the string the model reads.
     ($self:ident, $trust:expr, $origin:expr, $subject:expr, |$ok:ident| $effect:expr) => {
+        gated!($self, $trust, $origin, $subject, |$ok| $effect, |denied| refusal(denied))
+    };
+    // …and the same gate, with something to do on the way out. One arm has it
+    // — the email, which has to leave its draft on the approval row the gate
+    // just filed, because the gate rules on an address and the words are here.
+    // Delegating rather than copying keeps the trust branch below written once:
+    // it is two spellings on purpose (`A` and `Untrusted<A>` are different
+    // types and produce different tokens), and a second copy of that is the
+    // drift where one of them forgets the origin.
+    ($self:ident, $trust:expr, $origin:expr, $subject:expr, |$ok:ident| $effect:expr,
+     |$denied:ident| $on_denied:expr) => {
         match $trust {
             TrustLabel::Trusted => match $self
                 .gate
@@ -2024,7 +2036,7 @@ macro_rules! gated {
                 .await
             {
                 Ok($ok) => $effect,
-                Err(denied) => return refusal(denied),
+                Err($denied) => return $on_denied,
             },
             TrustLabel::Untrusted => {
                 match $self
@@ -2033,7 +2045,7 @@ macro_rules! gated {
                     .await
                 {
                     Ok($ok) => $effect,
-                    Err(denied) => return refusal(denied),
+                    Err($denied) => return $on_denied,
                 }
             }
         }
@@ -2605,10 +2617,35 @@ impl Turn {
                         .await
                         .unwrap_or_default();
                 }
-                let sent = gated!(self, trust, origin, subject, |ok| self
-                    .effects
-                    .send_email(ok, body)
-                    .await);
+                // **Le brouillon, relevé avant que la macro ne consomme le
+                // corps.** Un tour teinté sur une politique qui demande une
+                // relecture rend `PendingApproval` : la Gate a déposé une ligne
+                // qui ne porte que l'adresse, parce qu'elle statue sur un
+                // destinataire et n'a jamais vu une phrase. Ces trois chaînes
+                // sont ce qu'il y a à lire, et sans elles approuver reviendrait
+                // à dire oui à « peut-on écrire à claire@… ».
+                //
+                // `to` vient de la décision, pas du modèle — la même valeur que
+                // `send_email` lira sur le jeton — donc l'adresse montrée est
+                // l'adresse servie.
+                let draft = json!({
+                    "to": to.to_string(),
+                    "subject": body.subject,
+                    "body": body.body_text,
+                });
+                let sent = gated!(
+                    self,
+                    trust,
+                    origin,
+                    subject,
+                    |ok| self.effects.send_email(ok, body).await,
+                    |denied| {
+                        if let Denied::PendingApproval(id) = denied {
+                            self.effects.attach_email_draft(id, &draft).await;
+                        }
+                        refusal(denied)
+                    }
+                );
                 let sent = match sent {
                     Ok(sent) => sent,
                     Err(EffectError::Unavailable(err)) => return Err(TurnError::Unavailable(err)),
