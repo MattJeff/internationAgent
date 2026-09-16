@@ -307,7 +307,30 @@ pub fn by_model(sample: Sample, calls_per_turn: f64) -> Vec<(ModelId, usize, f64
 /// ±20 %. Elles restent des mesures d'une entreprise qui n'existe plus
 /// exactement, et c'est précisément ce que ce pin sert à rendre impossible à
 /// oublier.
-pub const DIGEST: &str = "59b3aab00d125758";
+/// # Déplacé le 2026-09-16, et voici pourquoi les chiffres ne le sont pas
+///
+/// Les couches de rôle de `docs/orizn-roles/` et le plafond ont gagné un champ,
+/// `untrusted_email_needs_approval` — `true` sur `customer-success`, `false`
+/// partout ailleurs. C'est une **exigence de la Gate** : elle décide si un
+/// `EmailSend` rédigé après une lecture étrangère part ou attend un humain.
+///
+/// Ce que [`digest`] hache est du jeton : les noms de rôle et de modèle, le
+/// prompt système rendu avec la politique attachée, et les schémas d'outils du
+/// tour. Le champ n'est rendu nulle part dans `prompt.rs` ni dans `turn.rs`
+/// (vérifié au `grep`), et `EmailSend` reste `Risk::Low`, donc visible d'un
+/// tour teinté : rien de ce que le modèle lit n'a changé de sens. Je n'ai pas
+/// isolé l'octet exact qui a fait bouger le hachage — il vient de ce que la
+/// politique attachée, relue depuis des documents qui ont une ligne de plus,
+/// traverse le rendu — et je le dis plutôt que d'affirmer qu'aucun octet n'a
+/// bougé.
+///
+/// Ce qui autorise le re-pin sans re-mesure est le précédent du 1er septembre
+/// ci-dessus, tranché dans le même sens : un écart qui ne déplace pas l'ordre de
+/// grandeur affiché à ±20 % fait bouger le pin — c'est son office — sans
+/// invalider les figures. Un re-pin complet (`--live`, deux runs) dépenserait
+/// des tours réels pour remesurer une grandeur qu'un booléen de la Gate
+/// n'atteint pas.
+pub const DIGEST: &str = "388217afd275174c";
 
 // ---------------------------------------------------------------------------
 // The company, as the operator wrote it down
