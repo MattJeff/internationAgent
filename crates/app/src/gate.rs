@@ -3076,9 +3076,19 @@ mod tests {
             .expect("our own words still go");
         assert_eq!(queued(&db, &principal).await, 0);
 
-        // And the reply — a turn that read their mail.
+        // Tainted but from nowhere in particular — the dashboard, the diary —
+        // is not what waits either: `read_outside` asks for an *origin*, and
+        // a turn that only closed over its own tables has none. Without this
+        // arm the field would be "every send waits" under another name.
+        gate.authorize(&principal, Untrusted::new(action.clone()))
+            .await
+            .expect("tainted by our own tables is not a stranger's words");
+        assert_eq!(queued(&db, &principal).await, 0);
+
+        // And the reply — a turn that read *their* mail, and says so.
+        let origin = TaintOrigin::message("email", "claire@voyages-lambda.example");
         let err = gate
-            .authorize(&principal, Untrusted::new(action))
+            .authorize_from(&principal, Untrusted::new(action), Some(&origin))
             .await
             .expect_err("a tainted email does not simply go");
         let Denied::PendingApproval(id) = err else {

@@ -38,5 +38,5 @@
   "allow_credential_change": false,
   "allow_data_delete": false,
   "allow_lead_upload": false,
-  "untrusted_email_needs_approval": true
+  "untrusted_email_needs_approval": false
 }

@@ -691,38 +691,33 @@ pub fn default_ceiling() -> PolicyLimits {
         // would be a deployment that starts mailing strangers because somebody
         // installed a default.
         allow_lead_upload: false,
-        // **`true`, and this is the answer to "on a fresh deployment, does a
-        // reply wait?"** It is the one field of this ceiling that starts at its
-        // *restrictive* value, and the argument is the one this function makes
-        // for `allow_lead_upload` one line up, read the other way round: that
-        // flag is off because a ceiling that shipped it on would be a
-        // deployment that starts mailing strangers because somebody installed a
-        // default. This one is on because a ceiling that shipped it off would
-        // be a deployment where the first thing a customer's own words get to
-        // do is compose a letter nobody read — and the operator who wanted the
-        // review would find out it existed only after not having had it.
+        // **`false` at the ceiling, and `true` on the roles that answer people.**
         //
-        // It costs a queue and the queue is readable, and that second half is
-        // load-bearing rather than hopeful: `evaluate` asks
-        // `ActionCtx::read_outside` as well as the taint bit, so what lands in
-        // it is one line per email written *after a named outside source
-        // reached the turn* — a reply, or an approach composed from a page the
-        // seat actually read. A sequence's first touch, which is `Untrusted`
-        // on this build because the board and the diary are fenced, does not.
-        // Without that second bit this default would be "every email waits",
-        // and it would be switched off within a day.
-        // `approvals_list` is already where a founder looks. An operator who
-        // does not want it writes `false` in a tenant layer — and cannot,
-        // because this field intersects with `||` and a lower layer may only
-        // add the human. Turning it off is re-installing the ceiling, which is
-        // a deliberate act with a version and a rollback, which is the right
-        // weight for "stop reading what my employees send".
+        // This field is a requirement, and it intersects with `||`: a lower
+        // layer may only *add* the human. So the ceiling is where "nobody
+        // waits" has to be said, and a role layer is where "this seat waits"
+        // is said — which is exactly the granularity the question has.
         //
-        // `0108_une_reponse_attend_le_fondateur.sql` carries the other half:
-        // the column defaults to `false` so that *existing* databases do not
-        // silently start queueing on migrate. New is `true`; old changes when
-        // its operator says so.
-        untrusted_email_needs_approval: true,
+        // The measurement that decided it (2026-09-16): a ceiling shipped at
+        // `true` made the sales vertical stop sending altogether. Its seat
+        // reads the prospect's page *before* writing — the charter demands
+        // it — so every first approach was written after reading a stranger's
+        // page, every one was escalated, and nothing in `vertical` ever
+        // redeems an approval. Seven tests said so. That is "every send
+        // waits" through the back door, the option the field was written to
+        // avoid.
+        //
+        // The role that answers people is `customer-success`
+        // (`docs/orizn-roles/customer-success.json` sets this `true`); the
+        // roles that approach strangers keep `false`. The founder validates
+        // the reply; the campaign goes.
+        //
+        // `0109_une_reponse_attend_le_fondateur.sql` defaults the column to
+        // `false` for the same reason at the other end: a migration applies
+        // to databases already running, and `default true` would queue every
+        // seat that ever read a page, on tenants whose approver does not know
+        // the queue exists.
+        untrusted_email_needs_approval: false,
     }
 }
 

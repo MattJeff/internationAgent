@@ -48,13 +48,25 @@
 -- des locataires dont l'approbateur ne sait pas encore que la file existe.
 -- Une colonne ne prend pas cette décision à la place d'un opérateur.
 --
--- La décision pour un déploiement neuf est ailleurs, et elle est **oui** :
--- `agentos_store::policy::default_ceiling` la pose à `true`, donc toute base
--- qui exécute `agentos-server policy install` sort avec la relecture allumée.
--- Une base existante la garde à `false` jusqu'à ce que son opérateur
--- réinstalle le plafond — ce qui est une ligne de commande, pas une surprise au
--- redémarrage. `docs/orizn-ceiling.json` la porte aussi à `true` : c'est le
--- plafond du fondateur, et c'est sa phrase.
+-- La décision pour un déploiement neuf est ailleurs, et elle se prend **par
+-- rôle**, pas d'un bloc. `agentos_store::policy::default_ceiling` pose le
+-- plafond à `false` ; `docs/orizn-roles/customer-success.json` pose `true` sur
+-- le rôle qui répond à des gens. Le champ est une exigence qui s'intersecte en
+-- `||`, donc une couche de rôle peut ajouter l'humain là où le plafond ne l'a
+-- pas mis — c'est exactement la granularité de la question.
+--
+-- Ce qui a tranché, mesuré le 2026-09-16 : un plafond livré à `true` faisait
+-- **cesser d'envoyer** le vertical de vente. Son siège lit la page du prospect
+-- *avant* d'écrire — la charte l'exige —, donc chaque première approche était
+-- rédigée après une lecture étrangère, chaque une était escaladée, et rien dans
+-- `vertical` ne rachète jamais une approbation. Sept tests l'ont dit. C'était
+-- « tous les envois attendent » par la porte de derrière, l'option contre
+-- laquelle ce champ a été écrit.
+--
+-- La phrase qui en sort est meilleure que les deux options du cahier des
+-- charges : **les sièges qui répondent à des gens attendent, les sièges qui
+-- approchent des inconnus n'attendent pas.** Le fondateur valide la réponse ;
+-- la campagne part.
 
 alter table policy_layers
   add column if not exists untrusted_email_needs_approval boolean not null default false;
