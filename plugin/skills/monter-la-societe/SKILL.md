@@ -22,6 +22,20 @@ rôles, et il n'y a plus de chemin. La seule route qui écrive la **première** 
 **complet par rôle** — un champ omis n'est pas « ne touche pas », c'est un refus. Ces documents
 sont livrés avec ce geste ; ils se lisent, ils ne se rédigent pas. Voir le pas 2.
 
+**Troisième garde : chaque pas porte une barrière, et une barrière se franchit sur place.**
+Pas à la fin, pas « je vérifierai tout d'un coup une fois que ça tournera ». Cinq des six pas
+posent quelque chose que le pas suivant tient pour acquis, et le seul moment où la réponse est
+encore petite et lisible est juste après l'avoir écrite.
+
+| pas | ce qu'on relit **avant** de passer au suivant |
+|---|---|
+| 1 le modèle | `company_health_get` ne dit plus `no_model` |
+| 2 la société | `employees_list` rend un siège par ligne du tableau |
+| 3 le domaine | `domains_list` le dit **`verified`** |
+| 4 les chartes | `initiatives_get` rend **un plan** sur chaque siège chargé |
+| 5 les prospects | le `dry_run` rend **zéro refus** avant l'import réel |
+| 6 la séquence | `sequences_runs_list` rend chaque inscrit **actif** |
+
 ---
 
 ## 0. Ce que tu ne peux pas deviner — et rien de plus
@@ -146,6 +160,9 @@ l'oubli produit une campagne qui a l'air lancée et dont pas un mail ne part.
 1. **`domains_register`** avec le domaine du pas 0. Le premier domaine déclaré devient la
    primaire. 409 `domain_taken` s'il est à quelqu'un d'autre ; un 200 au lieu d'un 201 veut dire
    qu'il était déjà là, ce qui n'est pas une erreur.
+   **Lis sa réponse avant d'aller plus loin : certains fournisseurs vérifient à vue**, et elle
+   rend alors le domaine déjà `verified`. Dans ce cas les deux pas suivants n'ont rien à faire
+   — passe à la barrière. Chez un fournisseur réel il sera `pending`, et alors :
 2. **`domains_dns_publish`** rend les enregistrements à poser, et sait les poser chez Cloudflare
    si le fondateur te donne un jeton — **ne le demande pas de toi-même** : s'il n'en propose pas,
    rends-lui les enregistrements et dis-lui de les poser chez son registrar. Ce geste ne touche
@@ -213,7 +230,11 @@ Deux listes, deux questions, jamais la même réponse recopiée.
    pas 0). Le corps est le **CSV lui-même**, pas du JSON : les huit premières colonnes de
    l'export Smartlead, en-tête compris, 1 Mio au plus.
 3. **Lis le rapport.** Il **nomme chaque ligne refusée avec son numéro** — c'est exactement ce
-   pour quoi ce mode existe.
+   pour quoi ce mode existe. Regarde aussi `country` : la colonne `location` d'un export
+   Smartlead est de la **prose** (« États-Unis »), elle ne devient jamais un pays, et le rapport
+   rend `ZZ` quand rien ne l'a dit. Le paramètre `country` vaut pour **tout** le fichier — une
+   liste qui mélange les pays s'importe donc en un appel par pays, ou s'assume en `ZZ`, et une
+   liste en `ZZ` ne se segmente plus par pays ensuite. Dis-le au fondateur, ne choisis pas seul.
    - **Zéro refus** → passe au 4.
    - **Un seul refus** → n'importe pas. Corrige le fichier, rejoue à blanc. Une liste presque
      bonne est un en-tête de travers dans neuf cas sur dix, et l'import réel ne se défait pas.
@@ -247,7 +268,8 @@ Le rapport ne rend **aucun identifiant**. C'est normal, et c'est le pas 6 qui va
 **Lis ensuite `sequences_runs_list`.** Chaque inscrit doit y avoir une position, et le run doit
 être **actif** avec une prochaine échéance.
 
-- Actif → la marche est finie. Va au récapitulatif.
+- Actif → la marche est finie. **Actif veut dire « la position est posée », pas « un mail est
+  parti »** : le premier pas se joue au réveil du siège, à l'heure que `next_at` porte.
 - `not_sent` → le siège a été réveillé et rien n'est parti. Dans l'ordre : `domains_primary_get`
   (plafond journalier épuisé, la cause la plus fréquente), puis `initiatives_get` sur ce siège
   (pas de charte — c'est le pas 4 qu'on a sauté), puis `company_health_get`.
@@ -261,6 +283,12 @@ Récapitule en cinq lignes, et pas une de plus : le handle et le nom de la soci�
 agents s'arrêtent**, le domaine et son plafond du jour, un siège par ligne avec sa cadence et
 l'étape de provisionnement qui n'est pas encore revenue (`employees_get` la nomme), et le nombre
 d'inscrits sur la séquence.
+
+Et dis-lui où regarder après le premier réveil, parce qu'un siège qui ne trouve rien à faire ne
+se plaint nulle part ailleurs : `company_health_get` — `last_success_at` cesse d'être `null` dès
+qu'un tour aboutit —, puis `events_list` pour ce que le siège a tenté, puis
+**`desk_messages_list` sur le fauteuil**, où un employé sans constat dépose sa question. Un tour
+qui aboutit sans rien envoyer est le cas ordinaire du premier jour, pas une panne.
 
 Si le fondateur veut parler à un employé, c'est **`desk_messages_send`**, et deux choses lui
 manquent tant qu'il ne les sait pas :
