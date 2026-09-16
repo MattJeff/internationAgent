@@ -557,6 +557,9 @@ mod tests {
             allow_credential_change: false,
             allow_data_delete: false,
             allow_lead_upload: true,
+            // A tenant that asks for no review, so a team that asks for one is
+            // still within it — the direction this field runs.
+            untrusted_email_needs_approval: false,
         }
     }
 
@@ -1120,6 +1123,7 @@ mod tests {
             allow_credential_change,
             allow_data_delete,
             allow_lead_upload,
+            untrusted_email_needs_approval,
         } = inner;
 
         let spend_ok = match (spend, outer.spend) {
@@ -1156,6 +1160,13 @@ mod tests {
             // above: a head may take the capability away from a team, never
             // hand it one the tenant does not hold.
             && (!*allow_lead_upload || outer.allow_lead_upload)
+            // **The opposite direction to the four above, and that is the
+            // point.** The others are permissions: inner may hold one only if
+            // outer does. This is a requirement: inner may *add* the human, and
+            // is only outside its tenant when it drops one the tenant asked
+            // for. Written the other way round, a team would be "tighter" for
+            // deleting a review its tenant demanded.
+            && (*untrusted_email_needs_approval || !outer.untrusted_email_needs_approval)
     }
 
     fn universe() -> (Vec<Channel>, Vec<CallingCode>, Vec<Domain>, Vec<McpTool>) {
@@ -1249,6 +1260,12 @@ mod tests {
                         allow_credential_change: cred,
                         allow_data_delete: del,
                         allow_lead_upload: lead,
+                        // Not generated, for `allowed_models`' reason one field
+                        // up — the tuple is at proptest's arity limit. The
+                        // clause it would exercise is the one direction this
+                        // struct reverses, and it is pinned by an example
+                        // instead: `a_team_may_not_delete_a_review_its_tenant_asked_for`.
+                        untrusted_email_needs_approval: false,
                     }
                 },
             )

@@ -641,7 +641,14 @@ impl PolicyGate {
         // logged a decision it never made would be worse than one that logged
         // nothing.
         let outcome = self
-            .decide(&mut tx, principal, &subject, action.trust(), now)
+            .decide(
+                &mut tx,
+                principal,
+                &subject,
+                action.trust(),
+                origin.is_some(),
+                now,
+            )
             .await?;
 
         let mut extra = Map::new();
@@ -860,6 +867,15 @@ impl PolicyGate {
         principal: &Principal,
         action: &Action,
         trust: TrustLabel,
+        // Whether a `TaintOrigin` reached this turn — a source outside this
+        // company that can be *named*. Passed beside `trust` rather than
+        // derived from it, because they are different questions: see
+        // `ActionCtx::read_outside`. `authorize_from` is the only caller and it
+        // hands `origin.is_some()`, which is where the distinction is already
+        // drawn — `Context::with_untrusted` records no origin for the board and
+        // the diary, `with_untrusted_from` and `Reply::Untrusted` record one
+        // for a message and for a page.
+        read_outside: bool,
         now: DateTime<Utc>,
     ) -> Result<Outcome, Denied> {
         // 0. The company, before anything at all. One row by primary key, in
@@ -1005,6 +1021,7 @@ impl PolicyGate {
         let ctx = ActionCtx {
             actor: principal.action_actor(),
             trust,
+            read_outside,
             contact,
             spent_today,
             new_contacts_today,
@@ -3022,6 +3039,91 @@ mod tests {
     /// derived from `ActionKind::ALL`: a *future* arm answering `RequireApproval`
     /// for a `Risk::Low` action would slip past the wire unseen here.
     /// `domain::policy`'s own suite owns that half.
+    /// **The other half of the test below, and the one it says it cannot see.**
+    ///
+    /// `an_untrusted_turn_puts_no_line_in_the_approval_queue` proves a hostile
+    /// page cannot file a *high-risk* row, and names its own blind spot: a
+    /// low-risk arm that escalates would slip past it. There is one now, and it
+    /// is deliberate — `PolicyLimits::untrusted_email_needs_approval`, whose
+    /// whole purpose is to put a row in that queue for exactly the turns the
+    /// other test wants kept out of it.
+    ///
+    /// The two are not in conflict, and the difference is what the escalation
+    /// replaces. High risk: a refusal, so a row is a new path. An email: the
+    /// mail leaving, so a row is a path removed. `domain::policy::evaluate`
+    /// carries that argument beside the wire; this asserts the consequence
+    /// against the real table, which is where it can actually be wrong.
+    #[tokio::test]
+    async fn a_tainted_email_puts_exactly_one_line_in_the_queue_when_the_policy_asks() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+        let gate = with_policy(
+            &db,
+            &principal,
+            Scope::Tenant,
+            &PolicyLimits {
+                untrusted_email_needs_approval: true,
+                ..limits()
+            },
+        )
+        .await;
+
+        let action = email("claire@voyages-lambda.example");
+
+        // Trusted first: the first touch of a sequence is not what waits.
+        gate.authorize(&principal, action.clone())
+            .await
+            .expect("our own words still go");
+        assert_eq!(queued(&db, &principal).await, 0);
+
+        // Tainted but from nowhere in particular — the dashboard, the diary —
+        // is not what waits either: `read_outside` asks for an *origin*, and
+        // a turn that only closed over its own tables has none. Without this
+        // arm the field would be "every send waits" under another name.
+        gate.authorize(&principal, Untrusted::new(action.clone()))
+            .await
+            .expect("tainted by our own tables is not a stranger's words");
+        assert_eq!(queued(&db, &principal).await, 0);
+
+        // And the reply — a turn that read *their* mail, and says so.
+        let origin = TaintOrigin::message("email", "claire@voyages-lambda.example");
+        let err = gate
+            .authorize_from(&principal, Untrusted::new(action), Some(&origin))
+            .await
+            .expect_err("a tainted email does not simply go");
+        let Denied::PendingApproval(id) = err else {
+            panic!("expected a human in the path, got {err:?}");
+        };
+        assert_eq!(
+            queued(&db, &principal).await,
+            1,
+            "one email, one line — no amplification over what would have been sent"
+        );
+
+        // The row is the email's, and it carries no letter yet: the gate rules
+        // on an address and never sees a `RenderedEmail`. `app::turn` is what
+        // puts the words on it, and `routes::approvals` refuses to send a row
+        // that has none.
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let (kind, draft): (String, Option<serde_json::Value>) =
+            sqlx::query_as("SELECT action_kind, action->'draft' FROM approvals WHERE id = $1")
+                .bind(id.as_uuid())
+                .fetch_one(&mut **tx)
+                .await
+                .expect("the row");
+        tx.commit().await.expect("commit");
+        assert_eq!(kind, "email_send");
+        assert!(draft.is_none(), "the gate invented a letter it never saw");
+
+        // And the field is what decides: the same turn, a policy that is silent.
+        let quiet = with_policy(&db, &principal, Scope::Tenant, &limits()).await;
+        quiet
+            .authorize(&principal, Untrusted::new(email("someone@else.example")))
+            .await
+            .expect("a policy that does not ask does not queue");
+        assert_eq!(queued(&db, &principal).await, 1);
+    }
+
     #[tokio::test]
     async fn an_untrusted_turn_puts_no_line_in_the_approval_queue() {
         let Some(db) = db().await else { return };

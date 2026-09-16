@@ -403,6 +403,86 @@ pub struct PolicyLimits {
     /// [`max_turns_per_day`]: PolicyLimits::max_turns_per_day
     /// [`allowed_models`]: PolicyLimits::allowed_models
     pub allow_lead_upload: bool,
+    /// Does an email composed in a turn that read outside text wait for a
+    /// human before it leaves?
+    ///
+    /// **The one field in this struct whose safe value is `true`**, and the
+    /// only one that intersects with `||`. Every other flag here is an
+    /// `allow_*`: permission, narrowed by `&&`, safe when `false`. This one is
+    /// a *requirement*, so "narrower" is `true` and [`PolicyLimits::intersect`]
+    /// ORs it — a tenant, a role or an employee layer may add the human and can
+    /// never take one away that the platform wrote. Spell it `&&` and a
+    /// platform that demands review is switched off by any layer below it,
+    /// silently, in the one direction this file refuses everywhere else.
+    ///
+    /// # What it is for
+    ///
+    /// The founder's sentence: *« et pour moi on valide aussi la réponse »*. A
+    /// reply is drafted by a seat that has just read the customer's mail, so a
+    /// reply is, by construction, composed in a turn that read something from
+    /// outside. That is the pair of bits this reads:
+    /// [`ActionCtx::trust`] — the same bit the taint wire reads, one notch down
+    /// the risk axis — **and** [`ActionCtx::read_outside`], which is what
+    /// separates "a stranger's words reached this turn" from "this turn was
+    /// shown a fenced list of our own". The second is not decoration; without
+    /// it this field is the "every email waits" spelling, for the measured
+    /// reason in `read_outside`'s docs.
+    ///
+    /// # Why the taint bit and not "they wrote to us first"
+    ///
+    /// Because the gate has no such fact and the nearest one is the wrong one.
+    /// [`ContactStanding::Known`] means *this seat has already been allowed to
+    /// act toward this address* — `app::gate::contacts` derives it from
+    /// `audit_log` — so it is true of every follow-up we send a silent prospect
+    /// and false of a stranger who writes to us cold. Gating on it would queue
+    /// touch two of every sequence and let the first reply from an unknown
+    /// sender through: the exact inverse of what was asked. Making it the right
+    /// fact means a new [`ActionCtx`] field fed by a `messages` lookup, i.e. a
+    /// second source of truth about "did they write to us" beside the thread
+    /// itself, which is the kind of duplicate the gate does not keep.
+    ///
+    /// # Why not "every email waits"
+    ///
+    /// That was the other option and it is the one that gets turned off. Orizn
+    /// has ~1 615 prospects loaded; first touches are what the founder
+    /// delegated in the same breath (*« tu prépares les séquences, tu lances »*),
+    /// and a queue with 1 615 lines in it is a queue nobody reads, which is
+    /// worse than no queue at all because it looks like supervision.
+    ///
+    /// **And a rule written on `trust` alone would have been that option under
+    /// another name.** That is the one thing the walk of 2026-09-16 changed
+    /// about this field: `loops::initiative` fences the work board, the diary
+    /// and an appointment's own subject into nearly every cadence turn, so a
+    /// sequence's *first touch* is already `Untrusted` before it calls a tool.
+    /// [`ActionCtx::read_outside`] is what keeps the two apart, and it is a
+    /// distinction `app::gate::TaintOrigin` already drew one layer above the
+    /// gate without the gate being told.
+    ///
+    /// # What it over-covers, deliberately
+    ///
+    /// A *cold* email written after the seat **successfully** read the
+    /// prospect's site waits too — the page is a named outside source and
+    /// `turn.rs` flips both bits on the tool result. That is the rule read
+    /// strictly rather than an accident: an email whose content came out of
+    /// somebody else's page is exactly as much "words we did not choose" as a
+    /// reply is, and `rolepack_sales` makes reading the prospect's flow a
+    /// *precondition* of writing to them — so on the selling vertical this is
+    /// close to "every email a seller sends is read by a human first", which is
+    /// what a first campaign should look like and not what a hundredth should.
+    /// An operator who does not want that narrows `Channel::Web` out of the
+    /// seat's layer, which is the honest way to say "this seat writes only from
+    /// what we told it".
+    ///
+    /// # The security half
+    ///
+    /// [`evaluate`]'s taint wire stops a high-risk action derived from foreign
+    /// text. [`crate::action::Action::EmailSend`] is `Risk::Low` on purpose —
+    /// see `Action::risk`, and the `InternalSend` argument it shares — so the
+    /// one effect a prompt injection can still reach today is *this company
+    /// emailing somebody with words a stranger chose*, with nothing between it
+    /// and the outside. This is the field that puts a person there, for the
+    /// operators who want one, without touching the wire or the risk axis.
+    pub untrusted_email_needs_approval: bool,
 }
 
 impl PolicyLimits {
@@ -468,6 +548,14 @@ impl PolicyLimits {
             allow_credential_change: self.allow_credential_change && other.allow_credential_change,
             allow_data_delete: self.allow_data_delete && other.allow_data_delete,
             allow_lead_upload: self.allow_lead_upload && other.allow_lead_upload,
+            // `||`, and it is the only one on this list. The four above are
+            // permissions, where narrower is `false`; this is a requirement,
+            // where narrower is `true`. See the field's docs: `&&` here would
+            // let any layer below the platform delete a human the platform put
+            // in the path, which is the direction nothing else in this file
+            // allows.
+            untrusted_email_needs_approval: self.untrusted_email_needs_approval
+                || other.untrusted_email_needs_approval,
         })
     }
 }
@@ -1044,6 +1132,13 @@ pub enum ApprovalReason {
     ContractSignature,
     CredentialChange,
     BulkDataDelete,
+    /// An email composed in a turn that had read outside text, on a policy that
+    /// asks for a human. **The only reason on this list attached to a
+    /// `Risk::Low` action** — see
+    /// [`PolicyLimits::untrusted_email_needs_approval`] for why it belongs here
+    /// and [`evaluate`]'s taint wire for why a low-risk escalation from an
+    /// untrusted turn is not the breach the wire refuses.
+    UntrustedEmail,
 }
 
 impl ApprovalReason {
@@ -1054,6 +1149,7 @@ impl ApprovalReason {
             ApprovalReason::ContractSignature => "contract_signature",
             ApprovalReason::CredentialChange => "credential_change",
             ApprovalReason::BulkDataDelete => "bulk_data_delete",
+            ApprovalReason::UntrustedEmail => "untrusted_email",
         }
     }
 }
@@ -1125,6 +1221,55 @@ pub fn evaluate(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) -> D
     // `CrossTenantSecret` and `PerTransactionLimit` say more than
     // `UntrustedInput` does, and relabelling them would lose that. Deny is deny
     // either way, so nothing widens.
+    //
+    // ---------------------------------------------------------------------
+    // **Why `.risk().is_high()` and not "any `RequireApproval`"**, now that
+    // one low-risk arm escalates
+    // ---------------------------------------------------------------------
+    //
+    // `Action::EmailSend` escalates when
+    // `PolicyLimits::untrusted_email_needs_approval` is set, and it escalates
+    // precisely *because* the turn is untrusted — so it reaches this wire, from
+    // a tainted turn, as a `RequireApproval`, which is the exact shape the
+    // paragraph above says was once the bypass. It is not the same failure, and
+    // the difference is what the escalation is an alternative *to*.
+    //
+    // For a high-risk action the alternative is a refusal. Letting it escalate
+    // therefore *creates* a path that would not otherwise exist: a line in the
+    // founder's queue, whose payee and amount the hostile source chose,
+    // presented as their own employee's proposal — and pressing yes moves money
+    // to a stranger. The wire's job is to delete that path, and it still does.
+    //
+    // For `EmailSend` the alternative is **the email leaving**. Without this
+    // field a tainted turn mails whoever it likes, today, under the channel,
+    // suppression and budget rules and nothing else; `Risk::Low` is what makes
+    // that true and `Action::risk` argues at length for keeping it. So the
+    // escalation does not open a door, it closes one: the worst case of the
+    // feature is the behaviour without it. A hostile page that provokes a row
+    // here has spent one of the same `max_new_contacts_per_day` slots, one
+    // `MAX_TOUCHES`, one turn — there is no amplification, one row per email
+    // that was going to be sent anyway — and it has traded an unread email for
+    // an email a human reads first.
+    //
+    // The queue is not made writable by a stranger in the sense
+    // `grantable` refuses either. `DenyReason::UntrustedInput` is ungrantable
+    // because the *request* — "relax my taint check" — is a sentence the page
+    // wrote through the employee, and granting it widens a policy forever. This
+    // row asks nothing and grants nothing: it is one email, once, and the words
+    // on it are shown to the approver, which is the opposite of a request whose
+    // text the human never sees.
+    //
+    // And `app::turn::visible` is not contradicted. It withholds the *high-risk
+    // schemas* from an untrusted turn, which is why the escalation path was an
+    // inconsistency there; `send_email` is deliberately still offered to a
+    // tainted turn — `a_tainted_turn_keeps_send_email` in `app::turn` is that
+    // claim — so a verb the model can reach is answered by a human instead of
+    // by silence.
+    //
+    // The cost, named: a tainted turn that is refused by `may_decide`'s
+    // four eyes, or whose approver never presses anything, ends in an email
+    // that never goes and a seat that reported `pending_approval`. That is a
+    // deliberate deadline (`APPROVAL_TTL`), not a leak.
     if ctx.trust.is_untrusted()
         && action.risk().is_high()
         && !matches!(decision, Decision::Deny { .. })
@@ -1410,6 +1555,15 @@ pub fn always_denies(policy: &EffectivePolicy, kind: ActionKind) -> bool {
         // mail tool from every employee on the export path, i.e. from every
         // employee the founder has today.
         allow_lead_upload: _,
+        // Not read, and it cannot be: it withholds no `ActionKind` from
+        // anybody. It sends one email to a human instead of to its recipient,
+        // which is the opposite of "this kind is unreachable" — and this
+        // function's answer is what `app::prompt` uses to *delete a schema*
+        // from the catalogue. Reading it here would take `send_email` away from
+        // exactly the turns the field exists to supervise, leaving a tainted
+        // seat with no way to answer a customer at all. `evaluate` is its
+        // reader, per action, where the trust label is known.
+        untrusted_email_needs_approval: _,
     } = policy.limits();
 
     let closed = |channel: Channel| !allowed_channels.contains(&channel);
@@ -1548,6 +1702,7 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
         // our own code performs it, and `may_upload_leads` is where that is
         // asked.
         allow_lead_upload: _,
+        untrusted_email_needs_approval,
     } = policy.limits();
 
     // Both of these are free functions above rather than closures here, because
@@ -1602,12 +1757,50 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
     // Every variant written out by name. No `_` arm — that is the whole point
     // of this file.
     match action {
+        // **The one arm here that escalates a `Risk::Low` action**, and the
+        // order of its three questions is the whole of its meaning. The
+        // denylist first and the channel second, exactly as before: a refusal
+        // the rules can make is never dressed up as a question for a human, and
+        // an operator who has blocked a domain is not asked again about it.
+        // Only what the rules would have *allowed* reaches the third question.
+        //
+        // `approval_above` one arm down is the model, with one difference worth
+        // saying out loud: a payment carries the number the human judges
+        // (`Action::PaymentCreate { amount, payee }`), and `Action::EmailSend`
+        // carries only the address. The sentence a human is being asked to
+        // approve is not in this crate and cannot be — the gate rules on
+        // recipients, not on prose. So this arm's `summary` names the recipient
+        // and says where the words came from, and `app::turn` is what puts the
+        // draft itself on the row. An approval queue that showed only "may we
+        // email claire@…" would be a button nobody can press honestly, and that
+        // half is owed by the layer that holds the `RenderedEmail`.
         Action::EmailSend { to } => {
             if blocked(to.domain()) {
                 return Decision::deny(DenyReason::DomainDenied);
             }
             match channel_rules(Channel::Email) {
                 Some(reason) => Decision::deny(reason),
+                None if *untrusted_email_needs_approval
+                    && ctx.trust.is_untrusted()
+                    // **Both, and the second is the one that makes this field
+                    // shippable.** `trust` alone is `Untrusted` on nearly every
+                    // cadence turn — the board and the diary are fenced lists
+                    // and they taint — so keying on it would queue a first
+                    // touch that read nothing, which is the "every email
+                    // waits" spelling this field was chosen *instead* of. See
+                    // `ActionCtx::read_outside` for the measurement.
+                    && ctx.read_outside =>
+                {
+                    Decision::RequireApproval {
+                        reason: ApprovalReason::UntrustedEmail,
+                        // `{to:?}`, as the payment arm quotes its payee: this
+                        // address was chosen inside a turn that had read a
+                        // stranger's text, and an unquoted one would let it
+                        // dress itself up as the rest of the sentence in the
+                        // founder's queue.
+                        summary: format!("email {to:?} — drafted in a turn that read outside text"),
+                    }
+                }
                 None => Decision::Allow,
             }
         }
@@ -2008,6 +2201,12 @@ mod tests {
             allow_credential_change: true,
             allow_data_delete: true,
             allow_lead_upload: true,
+            // `false`, and it is the one field of this fixture where
+            // "everything switched on" would be the wrong reading. The others
+            // are permissions and `true` is the permissive value; this is a
+            // requirement and `true` would put a human in front of half the
+            // suite's email assertions. The tests that want it name it.
+            untrusted_email_needs_approval: false,
         }
     }
 
@@ -2499,6 +2698,164 @@ mod tests {
                 reason: DenyReason::NoSpendPolicy
             }
         );
+    }
+
+    /// **The half `app::gate` says this suite owns.**
+    ///
+    /// `an_untrusted_turn_puts_no_line_in_the_approval_queue` over there checks
+    /// the four high-risk arms against the real table and names what it cannot
+    /// see: *"a future arm answering `RequireApproval` for a `Risk::Low` action
+    /// would slip past the wire unseen here."* This is that arm, and this is
+    /// that check — the escalation is meant to survive the wire, so the test
+    /// that would have caught it accidentally is the one that has to assert it
+    /// deliberately.
+    ///
+    /// The argument for why surviving is right is beside the wire in
+    /// [`evaluate`]. In one line: for a high-risk action the alternative to
+    /// escalating is a refusal, so escalating creates a path; for an email the
+    /// alternative is the mail leaving, so escalating deletes one.
+    #[test]
+    fn a_tainted_email_reaches_a_human_and_the_taint_wire_lets_it() {
+        let asks = PolicyLimits {
+            untrusted_email_needs_approval: true,
+            ..permissive()
+        };
+        let policy = effective(&asks);
+        let to = EmailAddress::parse("claire@example.com").unwrap();
+        let reply = Action::EmailSend { to: to.clone() };
+        let tainted = ActionCtx {
+            trust: TrustLabel::Untrusted,
+            ..ctx()
+        };
+
+        // The reply — drafted in a turn that read the customer's mail.
+        assert!(
+            matches!(
+                evaluate(&policy, &reply, &tainted),
+                Decision::RequireApproval {
+                    reason: ApprovalReason::UntrustedEmail,
+                    ..
+                }
+            ),
+            "a tainted email did not reach a human: {:?}",
+            evaluate(&policy, &reply, &tainted)
+        );
+        // And it is not `UntrustedInput`: the wire reads the risk axis, and
+        // this action is `Low` there. Asserted on the *kind of answer* rather
+        // than on the enum's shape, because "not a deny" is exactly what the
+        // wire would take away.
+        assert!(
+            !matches!(evaluate(&policy, &reply, &tainted), Decision::Deny { .. }),
+            "the taint wire swallowed a low-risk escalation"
+        );
+
+        // A turn that read nothing outside still sends without asking: the
+        // first touch of a sequence is not what the founder wanted to validate.
+        assert!(evaluate(&policy, &reply, &ctx()).is_allow());
+
+        // And the field is what decides. Same tainted turn, policy silent.
+        assert!(evaluate(&effective(&permissive()), &reply, &tainted).is_allow());
+
+        // **The half that keeps this from being "every email waits".** A turn
+        // tainted only by our own fenced lists — the board, the diary, an
+        // appointment's subject — reads `Untrusted` and has no origin, which is
+        // what a sequence's first touch looks like on this build. It goes.
+        let ours = ActionCtx {
+            trust: TrustLabel::Untrusted,
+            read_outside: false,
+            ..ctx()
+        };
+        assert!(
+            evaluate(&policy, &reply, &ours).is_allow(),
+            "a first touch that read nothing from outside was put in the queue: this field \
+             would then be the option it was chosen instead of"
+        );
+    }
+
+    /// A refusal the rules can make is never dressed up as a question for a
+    /// human. The three questions of the arm are ordered, and the order is
+    /// load-bearing: an operator who blocked a domain is not asked about it
+    /// again, and a seat with no email channel does not file a row.
+    #[test]
+    fn a_tainted_email_the_rules_refuse_is_refused_and_not_queued() {
+        let tainted = ActionCtx {
+            trust: TrustLabel::Untrusted,
+            ..ctx()
+        };
+
+        let blocked = PolicyLimits {
+            untrusted_email_needs_approval: true,
+            denied_domains: [domain("example.com")].into_iter().collect(),
+            ..permissive()
+        };
+        assert_eq!(
+            evaluate(
+                &effective(&blocked),
+                &Action::EmailSend {
+                    to: EmailAddress::parse("claire@example.com").unwrap()
+                },
+                &tainted
+            ),
+            Decision::Deny {
+                reason: DenyReason::DomainDenied
+            }
+        );
+
+        let mute = PolicyLimits {
+            untrusted_email_needs_approval: true,
+            allowed_channels: BTreeSet::new(),
+            ..permissive()
+        };
+        assert_eq!(
+            evaluate(
+                &effective(&mute),
+                &Action::EmailSend {
+                    to: EmailAddress::parse("claire@example.com").unwrap()
+                },
+                &tainted
+            ),
+            Decision::Deny {
+                reason: DenyReason::NoRule
+            }
+        );
+    }
+
+    /// The one field here that intersects with `||`, checked in the direction
+    /// that costs something: a layer below cannot delete a human the layer
+    /// above asked for. Spelled `&&`, every assertion below flips.
+    #[test]
+    fn a_review_a_higher_layer_asked_for_cannot_be_dropped_by_a_lower_one() {
+        let asks = PolicyLimits {
+            untrusted_email_needs_approval: true,
+            ..permissive()
+        };
+        let silent = permissive();
+        let tainted = ActionCtx {
+            trust: TrustLabel::Untrusted,
+            ..ctx()
+        };
+        let reply = Action::EmailSend {
+            to: EmailAddress::parse("claire@example.com").unwrap(),
+        };
+
+        // Platform asks, every layer below is silent: the human stays.
+        let stack = EffectivePolicy::try_new(&asks, &silent, &silent, &silent).unwrap();
+        assert!(matches!(
+            evaluate(&stack, &reply, &tainted),
+            Decision::RequireApproval { .. }
+        ));
+
+        // And one employee layer can add it under three silent ones.
+        let stack = EffectivePolicy::try_new(&silent, &silent, &silent, &asks).unwrap();
+        assert!(matches!(
+            evaluate(&stack, &reply, &tainted),
+            Decision::RequireApproval { .. }
+        ));
+
+        // `narrows` agrees with the arithmetic rather than paraphrasing it:
+        // asking is within silent, silent is not within asking.
+        assert!(asks.narrows(&silent).unwrap());
+        assert!(!silent.narrows(&asks).unwrap());
     }
 
     #[test]

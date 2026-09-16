@@ -241,7 +241,7 @@ const SELECT_ACTIVE_LAYERS: &str = "\
            l.allowed_mcp_tools, l.allowed_a2a_peers, l.allowed_models, \
            l.max_new_contacts_per_day, l.max_turns_per_day, \
            l.allow_file_upload, l.allow_credential_change, l.allow_data_delete, \
-           l.allow_lead_upload \
+           l.allow_lead_upload, l.untrusted_email_needs_approval \
     FROM policy_layers l \
     JOIN policy_versions v ON v.id = l.version_id \
     WHERE v.active AND ( \
@@ -691,6 +691,33 @@ pub fn default_ceiling() -> PolicyLimits {
         // would be a deployment that starts mailing strangers because somebody
         // installed a default.
         allow_lead_upload: false,
+        // **`false` at the ceiling, and `true` on the roles that answer people.**
+        //
+        // This field is a requirement, and it intersects with `||`: a lower
+        // layer may only *add* the human. So the ceiling is where "nobody
+        // waits" has to be said, and a role layer is where "this seat waits"
+        // is said — which is exactly the granularity the question has.
+        //
+        // The measurement that decided it (2026-09-16): a ceiling shipped at
+        // `true` made the sales vertical stop sending altogether. Its seat
+        // reads the prospect's page *before* writing — the charter demands
+        // it — so every first approach was written after reading a stranger's
+        // page, every one was escalated, and nothing in `vertical` ever
+        // redeems an approval. Seven tests said so. That is "every send
+        // waits" through the back door, the option the field was written to
+        // avoid.
+        //
+        // The role that answers people is `customer-success`
+        // (`docs/orizn-roles/customer-success.json` sets this `true`); the
+        // roles that approach strangers keep `false`. The founder validates
+        // the reply; the campaign goes.
+        //
+        // `0109_une_reponse_attend_le_fondateur.sql` defaults the column to
+        // `false` for the same reason at the other end: a migration applies
+        // to databases already running, and `default true` would queue every
+        // seat that ever read a page, on tenants whose approver does not know
+        // the queue exists.
+        untrusted_email_needs_approval: false,
     }
 }
 
@@ -849,9 +876,10 @@ pub async fn install_ceiling(
                 allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
                 allowed_models, max_new_contacts_per_day, max_turns_per_day, \
                 allow_file_upload, allow_credential_change, allow_data_delete, \
-                allow_lead_upload) \
+                allow_lead_upload, untrusted_email_needs_approval) \
              VALUES ($1, $2, NULL, 'platform', NULL, NULL, \
-                     $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+                     $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, \
+                     $20)",
         )
         .bind(Uuid::now_v7())
         .bind(version),
@@ -968,6 +996,7 @@ struct Columns {
     credential_change: bool,
     data_delete: bool,
     lead_upload: bool,
+    untrusted_email_needs_approval: bool,
 }
 
 impl Columns {
@@ -1023,10 +1052,11 @@ impl Columns {
             credential_change: limits.allow_credential_change,
             data_delete: limits.allow_data_delete,
             lead_upload: limits.allow_lead_upload,
+            untrusted_email_needs_approval: limits.untrusted_email_needs_approval,
         }
     }
 
-    /// Append all seventeen, in declaration order. Consumes `self` because sqlx
+    /// Append all eighteen, in declaration order. Consumes `self` because sqlx
     /// encodes on `bind`, so nothing here has to outlive the call.
     fn bind_to<'q>(
         self,
@@ -1050,6 +1080,7 @@ impl Columns {
             .bind(self.credential_change)
             .bind(self.data_delete)
             .bind(self.lead_upload)
+            .bind(self.untrusted_email_needs_approval)
     }
 }
 
@@ -1195,14 +1226,14 @@ pub async fn install(
             allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
             allowed_models, max_new_contacts_per_day, max_turns_per_day, \
             allow_file_upload, allow_credential_change, allow_data_delete, \
-            allow_lead_upload) \
+            allow_lead_upload, untrusted_email_needs_approval) \
          VALUES \
            ($1, $2, NULL, 'platform', NULL, NULL, \
             $9, $10, $11, $12, $13, $14, $15, '{}', $17, $18, $19, $20, $21, $22, $23, $24, \
-            $25), \
+            $25, $26), \
            ($3, $4, $5, $6, $7, $8, \
             $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, \
-            $25) \
+            $25, $26) \
          ON CONFLICT (id) DO UPDATE SET \
            spend_currency = coalesce(policy_layers.spend_currency, excluded.spend_currency), \
            max_per_transaction_minor = \
@@ -1224,9 +1255,19 @@ pub async fn install(
            allow_credential_change = \
              policy_layers.allow_credential_change OR excluded.allow_credential_change, \
            allow_data_delete = policy_layers.allow_data_delete OR excluded.allow_data_delete, \
-           allow_lead_upload = policy_layers.allow_lead_upload OR excluded.allow_lead_upload",
+           allow_lead_upload = policy_layers.allow_lead_upload OR excluded.allow_lead_upload, \
+           untrusted_email_needs_approval = \
+             policy_layers.untrusted_email_needs_approval \
+             AND excluded.untrusted_email_needs_approval",
+        // `AND`, and it is the only merge on this list that is not the same
+        // operator `PolicyLimits::intersect` uses for its column. Every clause
+        // above *widens the fixture ceiling* so that the layer being installed
+        // beside it is contained in it — `greatest`, `||`, `OR`. Widening a
+        // requirement is `false`, so widening this one is `AND`. Written `OR`,
+        // a single fixture that asks for review would pin the ceiling to
+        // `true` for every later test in the same database.
     );
-    // $9..=$25 are the seventeen limit columns, in `Columns` declaration order —
+    // $9..=$26 are the eighteen limit columns, in `Columns` declaration order —
     // the same order and the same mapping `install_ceiling` writes them with.
     let insert = Columns::from(limits).bind_to(
         statement
@@ -1610,14 +1651,14 @@ pub async fn install_layer_tx(
             allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
             allowed_models, max_new_contacts_per_day, max_turns_per_day, \
             allow_file_upload, allow_credential_change, allow_data_delete, \
-            allow_lead_upload) \
+            allow_lead_upload, untrusted_email_needs_approval) \
          SELECT gen_random_uuid(), $1, tenant_id, layer, role_name, employee_id, \
                 spend_currency, max_per_transaction_minor, max_per_day_minor, \
                 approval_above_minor, allowed_channels, allowed_calling_codes, \
                 allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
                 allowed_models, max_new_contacts_per_day, max_turns_per_day, \
                 allow_file_upload, allow_credential_change, allow_data_delete, \
-                allow_lead_upload \
+                allow_lead_upload, untrusted_email_needs_approval \
            FROM policy_layers \
           WHERE version_id = $2 \
             AND NOT (layer = $3 AND role_name IS NOT DISTINCT FROM $4 \
@@ -1640,9 +1681,10 @@ pub async fn install_layer_tx(
                 allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
                 allowed_models, max_new_contacts_per_day, max_turns_per_day, \
                 allow_file_upload, allow_credential_change, allow_data_delete, \
-                allow_lead_upload) \
+                allow_lead_upload, untrusted_email_needs_approval) \
              VALUES ($1, $2, $3, $4, $5, $6, \
-                     $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)",
+                     $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, \
+                     $23, $24)",
         )
         .bind(Uuid::now_v7())
         .bind(next)
@@ -1734,6 +1776,7 @@ struct LayerRow {
     allow_credential_change: bool,
     allow_data_delete: bool,
     allow_lead_upload: bool,
+    untrusted_email_needs_approval: bool,
 }
 
 impl LayerRow {
@@ -1844,6 +1887,7 @@ impl LayerRow {
                 allow_credential_change: self.allow_credential_change,
                 allow_data_delete: self.allow_data_delete,
                 allow_lead_upload: self.allow_lead_upload,
+                untrusted_email_needs_approval: self.untrusted_email_needs_approval,
             },
         ))
     }

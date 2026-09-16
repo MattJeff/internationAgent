@@ -1,0 +1,72 @@
+-- 0109_une_reponse_attend_le_fondateur : la colonne qui met un humain entre un
+-- tour teinté et un e-mail sortant.
+--
+-- « Je te dis réponds et tu réponds — sauf si tu peux faire beaucoup mieux, bien
+-- sûr. […] Et pour moi **on valide aussi la réponse**. »  C'est la phrase que
+-- cette colonne exécute, et elle n'a jamais eu d'endroit où vivre : la Gate
+-- n'escaladait que pour le paiement, la signature, la clé et l'effacement, tous
+-- `Risk::High`, et un e-mail était soit parti soit refusé au moment du tour.
+--
+-- ---------------------------------------------------------------------------
+-- POURQUOI CE N'EST PAS UN CHANGEMENT DE RISQUE
+-- ---------------------------------------------------------------------------
+--
+-- Passer `Action::EmailSend` à `Risk::High` casserait deux choses que le code
+-- argumente longuement. Le fil de teinte (`domain::policy::evaluate`) refuse
+-- tout acte à haut risque né d'un texte étranger : un siège qui vient de lire
+-- le mail d'un client ne pourrait donc plus jamais y répondre — ce qui est
+-- exactement la fonctionnalité. Et `app::turn::visible` retire les schémas à
+-- haut risque d'un tour teinté : le verbe disparaîtrait des tours qui en ont le
+-- plus besoin.
+--
+-- Donc c'est une **exigence de politique** et non une propriété de l'acte, et
+-- elle vit avec les quinze autres, dans `policy_layers`.
+--
+-- ---------------------------------------------------------------------------
+-- LA POLARITÉ, ET POURQUOI ELLE EST À CONTRE-SENS DES QUATRE AUTRES BOOLÉENS
+-- ---------------------------------------------------------------------------
+--
+-- `allow_file_upload`, `allow_credential_change`, `allow_data_delete` et
+-- `allow_lead_upload` sont des permissions : `false` est la valeur sûre, elles
+-- s'intersectent en `AND`, et le `merge` de cette table (voir la fonction
+-- d'upsert dans `agentos_store::policy`) les remonte dans ce sens-là.
+--
+-- Celle-ci est une **exigence** : `true` est la valeur sûre, elle s'intersecte
+-- en `OR`, et une couche basse peut ajouter l'humain sans jamais pouvoir
+-- retirer celui qu'une couche haute a posé. Écrite en `AND`, une plateforme qui
+-- exige une relecture serait désactivée par n'importe quel locataire, en
+-- silence, dans la seule direction que ce dépôt refuse partout ailleurs.
+--
+-- ---------------------------------------------------------------------------
+-- LE DÉFAUT, ET CE QU'IL NE DÉCIDE PAS
+-- ---------------------------------------------------------------------------
+--
+-- `default false`, et ce n'est **pas** la réponse à « est-ce que les réponses
+-- attendent sur un déploiement neuf ». Une migration s'applique à des bases qui
+-- tournent déjà ; un `default true` mettrait en file, d'un coup et sans que
+-- personne l'ait demandé, chaque e-mail de chaque siège qui a lu une page — sur
+-- des locataires dont l'approbateur ne sait pas encore que la file existe.
+-- Une colonne ne prend pas cette décision à la place d'un opérateur.
+--
+-- La décision pour un déploiement neuf est ailleurs, et elle se prend **par
+-- rôle**, pas d'un bloc. `agentos_store::policy::default_ceiling` pose le
+-- plafond à `false` ; `docs/orizn-roles/customer-success.json` pose `true` sur
+-- le rôle qui répond à des gens. Le champ est une exigence qui s'intersecte en
+-- `||`, donc une couche de rôle peut ajouter l'humain là où le plafond ne l'a
+-- pas mis — c'est exactement la granularité de la question.
+--
+-- Ce qui a tranché, mesuré le 2026-09-16 : un plafond livré à `true` faisait
+-- **cesser d'envoyer** le vertical de vente. Son siège lit la page du prospect
+-- *avant* d'écrire — la charte l'exige —, donc chaque première approche était
+-- rédigée après une lecture étrangère, chaque une était escaladée, et rien dans
+-- `vertical` ne rachète jamais une approbation. Sept tests l'ont dit. C'était
+-- « tous les envois attendent » par la porte de derrière, l'option contre
+-- laquelle ce champ a été écrit.
+--
+-- La phrase qui en sort est meilleure que les deux options du cahier des
+-- charges : **les sièges qui répondent à des gens attendent, les sièges qui
+-- approchent des inconnus n'attendent pas.** Le fondateur valide la réponse ;
+-- la campagne part.
+
+alter table policy_layers
+  add column if not exists untrusted_email_needs_approval boolean not null default false;

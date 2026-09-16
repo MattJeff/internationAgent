@@ -54,8 +54,31 @@
 //!
 //! ```json
 //! { "action": {…}, "action_hash": "…", "nonce": "…",
-//!   "requested_by": "…", "required_role": "…" }
+//!   "requested_by": "…", "required_role": "…", "draft": {…} }
 //! ```
+//!
+//! # `draft`, the fifth, and the one that is not hashed
+//!
+//! [`attach_draft`] puts the words a human is being asked to approve on the
+//! row: the recipient, the subject and the body of an email a tainted turn
+//! wants to send. It is deliberately **outside** the hash, and that is not an
+//! oversight — `action_hash` binds `Action::EmailSend { to }`, which is the
+//! address and nothing else, because the address is what the gate ruled on and
+//! the prose is not something `domain::policy` has ever seen.
+//!
+//! What stops the swap the hash would otherwise prevent — approve one letter,
+//! send another — is that there is no second copy to swap *to*: the send path
+//! reads the body **off this row** (`routes::approvals::approve`), exactly as
+//! it already reads a payment's memo off `reason` rather than off the
+//! approver's request body. The request body carries the `Action`; the words
+//! come from here. So the only text that can be sent is the text that was
+//! shown.
+//!
+//! It is written in a second statement rather than in [`create`] because the
+//! caller that *has* the prose is not the caller that files the row: the gate
+//! rules on an `Action` and never sees a `RenderedEmail`. A row whose attach
+//! failed carries no draft, and the send path refuses it rather than sending
+//! something nobody read — the failure is a letter that does not go.
 //!
 //! ponytail: envelope-in-jsonb instead of four real columns. `approvals` is
 //! `0001_core.sql`'s; promote them in a migration of their own when someone
@@ -311,6 +334,30 @@ VALUES (
         'required_role', $7::text),
     $8, $9, $10, $11, $12, $13, $14)
 RETURNING action->>'action_hash', action->>'nonce'";
+
+/// Put the draft a human is being asked to approve on an approval row.
+///
+/// Additive, into the envelope [`create`] wrote, and only onto a row that is
+/// still `pending` and still has no draft: a draft is written once, by the turn
+/// that composed it, and nothing may rewrite the words after they have been put
+/// in front of an approver. `Ok(false)` means no row matched — already decided,
+/// already drafted, or not this tenant's — and the caller treats that as "the
+/// approver will see a row with no letter on it", which is refused at the send.
+pub async fn attach_draft(
+    tx: &mut TenantTx<'_>,
+    id: ApprovalId,
+    draft: &Value,
+) -> Result<bool, StoreError> {
+    let done = sqlx::query(
+        "UPDATE approvals SET action = action || jsonb_build_object('draft', $2::text::jsonb) \
+          WHERE id = $1 AND state = 'pending' AND action->'draft' IS NULL",
+    )
+    .bind(id.as_uuid())
+    .bind(draft.to_string())
+    .execute(&mut ***tx)
+    .await?;
+    Ok(done.rows_affected() == 1)
+}
 
 /// File an approval request for one exact action and mint its nonce.
 ///

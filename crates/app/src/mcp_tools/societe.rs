@@ -1242,6 +1242,10 @@ pub fn tools() -> Vec<ToolDef> {
                     "allow_credential_change": { "type": "boolean" },
                     "allow_data_delete": { "type": "boolean" },
                     "allow_lead_upload": { "type": "boolean" },
+                    "untrusted_email_needs_approval": {
+                        "type": "boolean",
+                        "description": "Un e-mail rédigé dans un tour qui a lu du texte étranger — une réponse, presque toujours — attend l'accord d'un humain sur `approvals_list`, brouillon compris. **Le seul champ de ce document qui ne se desserre pas** : `false` ici ne retire pas la relecture que le plafond de la plateforme demande, il dit seulement que ce rôle n'en ajoute pas. Pour ne plus relire, c'est le plafond, et c'est `agentos-server policy install`.",
+                    },
                 },
                 "required": [
                     "role", "spend", "allowed_channels", "allowed_calling_codes",
@@ -1249,6 +1253,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "allowed_a2a_peers", "allowed_models", "max_new_contacts_per_day",
                     "max_turns_per_day", "allow_file_upload", "allow_credential_change",
                     "allow_data_delete", "allow_lead_upload",
+                    "untrusted_email_needs_approval",
                 ],
             }),
             &[],
@@ -2119,6 +2124,7 @@ mod tests {
                 "allow_credential_change",
                 "allow_data_delete",
                 "allow_lead_upload",
+                "untrusted_email_needs_approval",
             ],
         );
         demands("policy_role_get", &[]);

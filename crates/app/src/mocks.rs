@@ -53,7 +53,7 @@ use agentos_providers::browser_chrome::{ChromeBrowser, CookieJar, MemoryCookieJa
 use agentos_providers::browser_http::{HttpBrowser, UrlVet};
 use agentos_providers::captcha::NoSolver;
 use agentos_providers::cdp::CdpWebsocket;
-use agentos_providers::email::{EmailProvider, MockEmailProvider};
+use agentos_providers::email::EmailProvider;
 use agentos_providers::email_resend::ResendEmailProvider;
 use agentos_providers::embedder::Embedder;
 use agentos_providers::embedder_openai::OpenAiEmbedder;
@@ -143,6 +143,14 @@ pub use agentos_providers::mail_domain::{MailDomains, MockMailDomains};
 // must not swallow — has to implement `PaymentProvider` in the binary, which
 // means naming what `pay` returns.
 pub use agentos_providers::email::ProviderMessageId;
+
+// And the mail double, for the fifth time and the same reason turned one notch
+// further: `routes::approvals` is now the only caller of `Effects::send_email`
+// outside a turn — approving an escalated letter sends it — and the only thing
+// that test is about is *which words left*. `sent_emails()` is the only place in
+// this workspace where an outbound body is readable, it is on this type, and the
+// binary may not name `agentos-providers`.
+pub use agentos_providers::email::MockEmailProvider;
 
 // And the vault, for the fourth time and the same reason: the provisioner's
 // identity canary is written and read from the binary, which may not name

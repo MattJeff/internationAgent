@@ -844,6 +844,32 @@ async fn assert_the_company_is_orizn(db: &Db, tenant: TenantId, seats: &HashMap<
             );
         }
 
+        // **The one switch that is asserted per role**, and it is not in the
+        // loop above because it is not that kind of field: the four there are
+        // permissions and `false` is their safe value, this is a requirement
+        // and `true` is. The loader takes the OR rather than the AND, so a
+        // role document can *add* the human where `docs/orizn-ceiling.json`
+        // did not — which is the point, and which is why it is worth a line
+        // here per role rather than a trust that nobody edited the documents.
+        //
+        // What it means on the running company, in the founder's words: *« et
+        // pour moi on valide aussi la réponse »*. A reply drafted by the seat
+        // that answers people waits on `approvals_list` with its letter
+        // attached, and goes out when somebody holding the approver key says
+        // so.
+        //
+        // Per role, not per company — measured on 2026-09-16: a ceiling
+        // shipped at `true` stopped the sales vertical from sending at all,
+        // because its seat reads the prospect's page before writing and
+        // nothing in `vertical` redeems an approval. The seats that answer
+        // people wait; the seats that approach strangers do not.
+        assert_eq!(
+            limits.untrusted_email_needs_approval,
+            role == "customer-success",
+            "{role}: only the seat that answers people waits for the founder; every other \
+             seat's first approach must go, or the campaign never leaves"
+        );
+
         // **Can this seat actually do the thing the columns above describe?**
         //
         // The columns are values; this is the rule they produce. It is here

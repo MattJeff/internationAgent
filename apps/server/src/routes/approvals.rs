@@ -169,11 +169,13 @@
 
 use std::sync::Arc;
 
-use agentos_app::effects::{ContractSign, Effects, McpCaller, PaymentCreate, Ports};
+use agentos_app::effects::{
+    ContractSign, Effects, EmailSend, McpCaller, PaymentCreate, Ports, RenderedEmail,
+};
 use agentos_app::gate::{PolicyGate, Principal as GatePrincipal};
 use agentos_app::signature;
-use agentos_domain::action::{Action, ActionKind};
-use agentos_domain::ids::{ApprovalId, EmployeeId};
+use agentos_domain::action::{Action, ActionKind, EmailAddress};
+use agentos_domain::ids::{ApprovalId, EmployeeId, InvoiceId};
 use agentos_domain::policy::DenyReason;
 use agentos_store::audit::{self, AuditActor, AuditEvent, AuditKind};
 use agentos_store::capability;
@@ -207,6 +209,7 @@ macro_rules! view_sql {
         concat!(
             "SELECT id, state, employee_id, action_kind, \
                     action->'action'         AS action, \
+                    action->'draft'          AS draft, \
                     reason                   AS summary, \
                     risk, \
                     action->>'requested_by'  AS requested_by, \
@@ -274,6 +277,20 @@ struct ApprovalView {
     action: Option<Value>,
     /// The gate's one-line rendering of it. Display only.
     summary: Option<String>,
+    /// **The letter itself**, when this approval is one: `to`, `subject`,
+    /// `body`, as the turn that composed it wrote them.
+    ///
+    /// The one field on this view that is neither the gate's words nor an
+    /// operator's — the body of an email a seat drafted, often after reading a
+    /// stranger's, so it is *their* prose arriving on a screen. Nothing here
+    /// renders it into a sentence of ours: it is a `Value`, it is serialised
+    /// under its own key, and the approver reads it as what it is.
+    ///
+    /// `null` on every approval that is not an email, and also on an email
+    /// whose draft could not be attached — which is why
+    /// [`approve`] refuses to send one rather than treating an absent letter as
+    /// an empty one.
+    draft: Option<Value>,
     risk: Option<String>,
     requested_by: Option<String>,
     required_role: Option<String>,
@@ -415,6 +432,13 @@ struct Decidable {
     /// the fact. This one is `policy::evaluate`'s own words about the action that
     /// *was* hashed.
     summary: String,
+    /// The letter, for an email approval, read **off the row** for
+    /// [`Decidable::summary`]'s reason and a sharper one: the words are the
+    /// thing being approved, so taking them from the approver's request body
+    /// would let the text that is sent differ from the text that was shown.
+    /// `None` for every other kind of approval, and for an email whose draft
+    /// never landed.
+    draft: Option<Value>,
 }
 
 /// Load the decision-relevant half of an approval. No `state` filter: whether
@@ -427,7 +451,8 @@ async fn decidable(tx: &mut TenantTx<'_>, id: Uuid) -> Result<Option<Decidable>,
                 coalesce(action->>'requested_by', '')  AS requested_by, \
                 coalesce(action->>'required_role', '') AS required_role, \
                 coalesce(action->>'nonce', '')         AS nonce, \
-                coalesce(reason, '')                  AS summary \
+                coalesce(reason, '')                  AS summary, \
+                action->'draft'                        AS draft \
            FROM approvals WHERE id = $1",
     )
     .bind(id)
@@ -622,16 +647,19 @@ async fn approve(
     };
     let approval_id = ApprovalId::from_uuid(id);
 
-    // **Two arms with an executor now**, and the second one is the signature.
-    // Everything else is still minted, reported and dropped — there is nothing
-    // on the far side of those tokens to hand them to.
+    // **Three arms with an executor now**: the payment, the signature, and the
+    // letter. Everything else is still minted, reported and dropped — there is
+    // nothing on the far side of those tokens to hand them to.
     //
     // The match is before the redemption and each arm redeems exactly once,
-    // which is the property this whole function rests on and which a third arm
+    // which is the property this whole function rests on and which a fourth arm
     // must keep.
     let Action::PaymentCreate { amount, payee } = body.action else {
         if let Action::ContractSign { title } = body.action {
             return sign(&state, &gate_principal, approval_id, &row, title, id).await;
+        }
+        if let Action::EmailSend { to } = body.action {
+            return letter(&state, &gate_principal, approval_id, &row, to, id).await;
         }
         let authorized = state
             .gate
@@ -720,6 +748,11 @@ async fn approve(
 /// `mcp_servers`. So the question is asked of that tenant's fleet.
 const NO_SIGNATURE_CONNECTOR: &str = "no_signature_connector";
 
+/// `PAYMENT_NOT_PERFORMED` pour une lettre : l'approbation est dépensée et le
+/// fournisseur n'a pas pris le message. Les deux faits sont vrais et ils se
+/// contredisent, donc les deux sont dans la réponse.
+const EMAIL_NOT_SENT: &str = "email_not_sent";
+
 /// The envelope this approval was filed for is already out at the provider.
 ///
 /// Refused **before** the redemption, so a second press does not spend a
@@ -762,6 +795,176 @@ const ENVELOPE_NOT_SENT: &str = "envelope_not_sent";
 /// leave. `Effects::send_for_signature` commits a `provider_intents` row before
 /// the request leaves, so the recovery is a person reading
 /// `provisioning::unsettled_calls` against the provider's own console.
+/// **Send the letter the approver just read, and nothing else.**
+///
+/// [`approve`]'s third executor, and the one whose whole argument is about
+/// *which copy of the words gets sent*. The request body carries an
+/// `Action::EmailSend { to }` — that is what the hash is taken over, that is
+/// what `redeem_approval` re-hashes, and it is the address and nothing more.
+/// The subject and the body are read off `approvals.action->'draft'`, which is
+/// the same row the queue rendered, for the reason [`Decidable::summary`] gives
+/// about a payment memo and one that bites harder here: a body field would let
+/// an approver — or anything holding their credential — approve one letter and
+/// send another, and a human validation that does not bind the text is a
+/// ceremony rather than a control.
+///
+/// So there is exactly one copy of the prose in this system, it is on the row,
+/// it is what was displayed, and it is what leaves. A row with no draft is
+/// refused rather than sent empty: an approval nobody could read is not an
+/// approval, and the approval stays `pending` so that the failure is a letter
+/// that did not go.
+///
+/// # What this does *not* take, and it is a real hole
+///
+/// The day's cold-contact slot. `PolicyGate::take_contact` runs on the `Allow`
+/// arm of a ruling, and an escalation is not that arm — so an approved first
+/// email to a stranger is sent without being counted against
+/// `max_new_contacts_per_day`, which is the number an operator answers a
+/// supervisory authority for. A payment does not have this problem because
+/// `approve` reserves the money explicitly at redemption; there is no matching
+/// call here, and adding one would need the policy back, which
+/// `redeem_approval` argues at length for *not* reloading.
+///
+/// ponytail: left uncounted, and named rather than half-fixed. It bites only
+/// on an approved approach to somebody new — a reply is `ContactStanding::Known`
+/// and spends no slot either way. Close it the day the queue is where cold mail
+/// actually goes, by giving `redeem_approval` the ledger call the payment arm
+/// already makes.
+///
+/// `in_reply_to` is deliberately absent. The thread this was a reply to is on
+/// the seat's turn and not on the row, so the letter goes out as its own
+/// message — the same thing that happens today when
+/// `Effects::reply_target` finds nothing, and a worse-looking email is a better
+/// outcome than a route that reconstructs a thread from an identifier it did
+/// not rule on.
+async fn letter(
+    state: &Approvals,
+    gate_principal: &GatePrincipal,
+    approval_id: ApprovalId,
+    row: &Decidable,
+    to: EmailAddress,
+    id: Uuid,
+) -> Result<Json<Value>, ApiError> {
+    /// The letter, off the row.
+    ///
+    /// `invoice` and `from` are the invoice path's: a turn's `send_invoice` is
+    /// an `Action::EmailSend` exactly like `send_email` is, and once the turn is
+    /// over nothing else can tell the two apart. Without that key an approved
+    /// invoice would go out as `body` — a sentence *about* a document, in place
+    /// of the document — which is the one way this route could send something
+    /// nobody wrote. With it, the executor is chosen by the seat that composed
+    /// the draft rather than guessed at here.
+    ///
+    /// Not covered by a test, and named: exercising the invoice arm needs a
+    /// `closed_won` opportunity and an issued invoice, which is a fixture three
+    /// tables deep for one `if let`. What it rests on instead is that `turn.rs`
+    /// is the only writer of an invoice draft and writes the key in the same
+    /// `json!` as the body — a forgotten key would send that body, and the body
+    /// says in its own words that it is not a letter.
+    #[derive(serde::Deserialize)]
+    struct Draft {
+        subject: String,
+        body: String,
+        #[serde(default)]
+        invoice: Option<Uuid>,
+        #[serde(default)]
+        from: Option<String>,
+    }
+
+    // The last instant at which nothing has been spent, exactly as the payment
+    // arm checks its rail before redeeming: an approval put through the
+    // redemption to discover there was nothing to send would be burned for
+    // nothing.
+    let Some(draft) = row.draft.clone() else {
+        return Err(ApiError::conflict(
+            "approval_has_no_draft",
+            "this approval carries no letter, so there is nothing that was read and nothing to \
+             send",
+        )
+        .with_extension("state", json!("pending")));
+    };
+    let Ok(draft) = serde_json::from_value::<Draft>(draft) else {
+        return Err(ApiError::conflict(
+            "approval_has_no_draft",
+            "this approval's letter is not one this build can read",
+        )
+        .with_extension("state", json!("pending")));
+    };
+
+    let authorized = state
+        .gate
+        .redeem_approval(gate_principal, approval_id, &row.nonce, EmailSend { to })
+        .await?;
+    let decision_id = authorized.decision_id().as_uuid().to_string();
+
+    // Attributed to the **seat** the approval names, not to the human who
+    // pressed the button — the payment arm's rule, for its reason: the audit
+    // row, the day's contact slot and the sending domain are the seat's, and
+    // the approver is already on the gate's own row for this `decision_id` as
+    // the actor that redeemed it.
+    let effects = Effects::new(
+        state.db.clone(),
+        state.ports.clone(),
+        gate_principal.clone(),
+    );
+    // The invoice arm: the register writes the letter, this route only says
+    // which one and to whom — which is exactly what the approver was shown.
+    if let Some(invoice) = draft.invoice {
+        let from = draft.from.unwrap_or_default();
+        return match effects
+            .send_invoice(authorized, InvoiceId::from_uuid(invoice), &from)
+            .await
+        {
+            Ok(sent) => Ok(Json(json!({
+                "id": id.to_string(),
+                "state": "redeemed",
+                "decision_id": decision_id,
+                "email": { "provider_message_id": sent.as_str() },
+            }))),
+            Err(err) => Err(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                EMAIL_NOT_SENT,
+                "the approval was redeemed and the invoice did not leave",
+            )
+            .with_extension("state", json!("redeemed"))
+            .with_extension("decision_id", json!(decision_id))
+            .with_extension("detail", json!(err.to_string()))),
+        };
+    }
+
+    let rendered = RenderedEmail {
+        // Off the deployment's configuration, never off the row: an approval
+        // does not get to choose who this company is.
+        // Vide, et c'est la seule valeur honnête : `Effects::send_email`
+        // choisit l'expéditeur lui-même (`sending_domain::pick_from` — le fil,
+        // sinon le domaine vérifié le moins chargé) et ne lit jamais ce champ
+        // sur ce chemin. Y écrire une adresse donnerait à lire un choix qui
+        // n'en est pas un.
+        from: String::new(),
+        subject: draft.subject,
+        body_text: draft.body,
+        in_reply_to: None,
+    };
+    match effects.send_email(authorized, rendered).await {
+        Ok(sent) => Ok(Json(json!({
+            "id": id.to_string(),
+            "state": "redeemed",
+            "decision_id": decision_id,
+            "email": { "provider_message_id": sent.id.as_str() },
+        }))),
+        // Both facts, because they disagree and both are true — the payment
+        // arm's shape. The approval is spent whatever this says.
+        Err(err) => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            EMAIL_NOT_SENT,
+            "the approval was redeemed and the email did not leave",
+        )
+        .with_extension("state", json!("redeemed"))
+        .with_extension("decision_id", json!(decision_id))
+        .with_extension("detail", json!(err.to_string()))),
+    }
+}
+
 async fn sign(
     state: &Approvals,
     gate_principal: &GatePrincipal,
@@ -1911,6 +2114,133 @@ mod tests {
         assert_eq!(answer["code"], json!("role_required"));
 
         assert_eq!(state_of(&db, tenant, id).await, "pending");
+    }
+
+    // -- the letter --------------------------------------------------------
+
+    /// **What a founder actually reads, and what leaves when they say yes.**
+    ///
+    /// The whole point of escalating an email is that validating it means
+    /// something, and it only means something if the words are on the screen
+    /// and the words that are sent are those words. Three claims, in order:
+    ///
+    /// 1. the queue renders `to`, `subject` and `body`;
+    /// 2. approving sends **exactly** those, to the address that was hashed;
+    /// 3. an approval with no draft is refused and stays `pending`, because an
+    ///    approval nobody could read is not an approval.
+    ///
+    /// The row is filed by hand rather than by asking the gate, for the reason
+    /// `an_approval_no_evaluator_ever_ruled_on_is_still_redeemable` gives: what
+    /// is under test is this route, and `crates/domain`'s
+    /// `a_tainted_email_reaches_a_human_and_the_taint_wire_lets_it` owns the
+    /// half about when the gate escalates.
+    #[tokio::test]
+    async fn approving_a_letter_sends_the_letter_that_was_shown() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db).await;
+        // Sans domaine verifie, `pick_from` rend `Exhausted` et rien ne part.
+        agentos_app::sending_domain::adopt_for_tests(&db, tenant).await;
+
+        let to = "claire@voyages-lambda.example";
+        let action = Action::EmailSend {
+            to: to.parse().expect("an address"),
+        };
+        let subject = "Vos formalites d'entree";
+        let body = "Bonjour Claire, voici ce que nous avons vu. - le vendeur";
+
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let filed = agentos_store::approvals::create(
+            &mut tx,
+            &agentos_store::approvals::NewApproval {
+                employee_id: Some(employee),
+                action: &action,
+                requested_by: "seat",
+                required_role: "approver",
+                reason: Some("email - drafted in a turn that read outside text"),
+                expires_at: now + chrono::Duration::hours(24),
+            },
+            now,
+        )
+        .await
+        .expect("file");
+        let id = filed.id();
+        agentos_store::approvals::attach_draft(
+            &mut tx,
+            id,
+            &json!({ "to": to, "subject": subject, "body": body }),
+        )
+        .await
+        .expect("attach the draft");
+        tx.commit().await.expect("commit");
+
+        // 1. The queue shows the letter.
+        let email_port = Arc::new(agentos_app::mocks::MockEmailProvider::new());
+        let ports = Ports {
+            email: email_port.clone(),
+            ..agentos_app::mocks::ports()
+        };
+        let gate = PolicyGate::new(db.clone());
+        let app = mount_ports(&db, &gate, keys(tenant, "approver", SECRET), ports);
+        let (status, queue) = call(&app, "/v1/approvals", SECRET, None).await;
+        assert_eq!(status, StatusCode::OK, "{queue}");
+        let draft = &queue["approvals"][0]["draft"];
+        assert_eq!(draft["to"], json!(to), "{queue}");
+        assert_eq!(draft["subject"], json!(subject), "{queue}");
+        assert_eq!(
+            draft["body"],
+            json!(body),
+            "a queue that shows no body is a button nobody can press honestly: {queue}"
+        );
+
+        // 2. Approving sends those words and no others. The body of the request
+        //    carries only the action - there is nowhere in it to put prose.
+        let uri = format!("/v1/approvals/{}/approve", id.as_uuid());
+        let (status, answer) = call(&app, &uri, SECRET, Some(json!({ "action": &action }))).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["state"], json!("redeemed"), "{answer}");
+
+        let sent = email_port.sent_emails();
+        assert_eq!(sent.len(), 1, "one approval, one letter");
+        assert_eq!(sent[0].to, vec![to.to_owned()]);
+        assert_eq!(sent[0].subject, subject);
+        assert_eq!(
+            sent[0].body_text, body,
+            "the letter that left is not the letter that was approved"
+        );
+
+        // 3. And one with no draft is refused rather than sent empty.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let mute = agentos_store::approvals::create(
+            &mut tx,
+            &agentos_store::approvals::NewApproval {
+                employee_id: Some(employee),
+                action: &action,
+                requested_by: "seat",
+                required_role: "approver",
+                reason: Some("email"),
+                expires_at: now + chrono::Duration::hours(24),
+            },
+            now,
+        )
+        .await
+        .expect("file");
+        tx.commit().await.expect("commit");
+
+        let uri = format!("/v1/approvals/{}/approve", mute.id().as_uuid());
+        let (status, answer) = call(&app, &uri, SECRET, Some(json!({ "action": &action }))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+        assert_eq!(answer["code"], json!("approval_has_no_draft"), "{answer}");
+        assert_eq!(
+            state_of(&db, tenant, mute.id()).await,
+            "pending",
+            "a row nobody could read was burned instead of being left alone"
+        );
+        assert_eq!(
+            email_port.sent_count(),
+            1,
+            "a draftless approval sent something"
+        );
     }
 
     // -- deny --------------------------------------------------------------

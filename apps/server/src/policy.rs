@@ -628,7 +628,7 @@ async fn rollback(url: &str) -> Result<String, String> {
 ///
 /// Kept honest by `every_field_of_policy_limits_is_named_here`, which asks
 /// serde for the list instead of trusting this one.
-const LAYER_FIELDS: [&str; 14] = [
+const LAYER_FIELDS: [&str; 15] = [
     "spend",
     "allowed_channels",
     "allowed_calling_codes",
@@ -643,6 +643,7 @@ const LAYER_FIELDS: [&str; 14] = [
     "allow_credential_change",
     "allow_data_delete",
     "allow_lead_upload",
+    "untrusted_email_needs_approval",
 ];
 
 /// One ceiling or one layer, parsed — and **refused if it is not complete**.

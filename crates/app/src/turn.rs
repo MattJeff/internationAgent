@@ -2016,7 +2016,21 @@ fn performed<T>(
 /// exactly what makes the taint impossible to drop. The two arms of a `match`
 /// may each move the body, so nothing is cloned.
 macro_rules! gated {
+    // The ordinary spelling: a refusal becomes the string the model reads.
     ($self:ident, $trust:expr, $origin:expr, $subject:expr, |$ok:ident| $effect:expr) => {
+        gated!($self, $trust, $origin, $subject, |$ok| $effect, |denied| {
+            refusal(denied)
+        })
+    };
+    // …and the same gate, with something to do on the way out. One arm has it
+    // — the email, which has to leave its draft on the approval row the gate
+    // just filed, because the gate rules on an address and the words are here.
+    // Delegating rather than copying keeps the trust branch below written once:
+    // it is two spellings on purpose (`A` and `Untrusted<A>` are different
+    // types and produce different tokens), and a second copy of that is the
+    // drift where one of them forgets the origin.
+    ($self:ident, $trust:expr, $origin:expr, $subject:expr, |$ok:ident| $effect:expr,
+     |$denied:ident| $on_denied:expr) => {
         match $trust {
             TrustLabel::Trusted => match $self
                 .gate
@@ -2024,7 +2038,7 @@ macro_rules! gated {
                 .await
             {
                 Ok($ok) => $effect,
-                Err(denied) => return refusal(denied),
+                Err($denied) => return $on_denied,
             },
             TrustLabel::Untrusted => {
                 match $self
@@ -2033,7 +2047,7 @@ macro_rules! gated {
                     .await
                 {
                     Ok($ok) => $effect,
-                    Err(denied) => return refusal(denied),
+                    Err($denied) => return $on_denied,
                 }
             }
         }
@@ -2605,10 +2619,35 @@ impl Turn {
                         .await
                         .unwrap_or_default();
                 }
-                let sent = gated!(self, trust, origin, subject, |ok| self
-                    .effects
-                    .send_email(ok, body)
-                    .await);
+                // **Le brouillon, relevé avant que la macro ne consomme le
+                // corps.** Un tour teinté sur une politique qui demande une
+                // relecture rend `PendingApproval` : la Gate a déposé une ligne
+                // qui ne porte que l'adresse, parce qu'elle statue sur un
+                // destinataire et n'a jamais vu une phrase. Ces trois chaînes
+                // sont ce qu'il y a à lire, et sans elles approuver reviendrait
+                // à dire oui à « peut-on écrire à claire@… ».
+                //
+                // `to` vient de la décision, pas du modèle — la même valeur que
+                // `send_email` lira sur le jeton — donc l'adresse montrée est
+                // l'adresse servie.
+                let draft = json!({
+                    "to": to.to_string(),
+                    "subject": body.subject,
+                    "body": body.body_text,
+                });
+                let sent = gated!(
+                    self,
+                    trust,
+                    origin,
+                    subject,
+                    |ok| self.effects.send_email(ok, body).await,
+                    |denied| {
+                        if let Denied::PendingApproval(id) = denied {
+                            self.effects.attach_email_draft(id, &draft).await;
+                        }
+                        refusal(denied)
+                    }
+                );
                 let sent = match sent {
                     Ok(sent) => sent,
                     Err(EffectError::Unavailable(err)) => return Err(TurnError::Unavailable(err)),
@@ -3028,10 +3067,45 @@ impl Turn {
                 // between the two reads; from a turn that refusal is otherwise
                 // unreachable, since the address on the token *is* the
                 // register's answer and the model never supplied one.
-                let sent = gated!(self, trust, origin, EmailSend { to }, |ok| self
-                    .effects
-                    .send_invoice(ok, id, &self.from)
-                    .await);
+                // Le brouillon, pour la raison de `send_email` et avec ce que
+                // ce verbe a de particulier : il n'y en a pas. Le corps d'une
+                // facture n'est pas rédigé par le modèle — `Effects::send_invoice`
+                // l'assemble depuis le registre et y attache le PDF — donc
+                // l'approbateur ne peut pas relire des mots, il peut relire
+                // QUELLE facture part et à qui. C'est ce qu'il y a à décider ici,
+                // et une ligne sans rien à lire serait une ligne que
+                // `routes::approvals` refuse d'envoyer : un client qui demande
+                // sa facture ne recevrait plus jamais rien.
+                let draft = json!({
+                    "to": to.to_string(),
+                    "subject": format!("invoice {id}"),
+                    "body": "The invoice document as this company's register holds it, with the \
+                             PDF attached. The wording is not a seat's — `Effects::send_invoice` \
+                             assembles it from the register — so what is being approved here is \
+                             the recipient and which invoice, not a sentence.",
+                    // **La clé qui change l'exécuteur**, et sans elle
+                    // l'approbation enverrait le texte ci-dessus à la place de
+                    // la facture. `routes::approvals::letter` la lit et appelle
+                    // `send_invoice` plutôt que `send_email` : une ligne
+                    // `approvals` porte un `Action::EmailSend` dans les deux
+                    // cas, et rien d'autre ne distingue les deux verbes une
+                    // fois le tour fini.
+                    "invoice": id.as_uuid().to_string(),
+                    "from": self.from,
+                });
+                let sent = gated!(
+                    self,
+                    trust,
+                    origin,
+                    EmailSend { to },
+                    |ok| self.effects.send_invoice(ok, id, &self.from).await,
+                    |denied| {
+                        if let Denied::PendingApproval(approval) = denied {
+                            self.effects.attach_email_draft(approval, &draft).await;
+                        }
+                        refusal(denied)
+                    }
+                );
                 // The contact's address is not repeated back: it is a row in
                 // our register, and a register row can have arrived from a
                 // page. The model chose the invoice; that is what it is told.
