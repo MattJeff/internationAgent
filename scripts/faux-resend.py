@@ -248,6 +248,8 @@ def main():
     a.add_argument("--port", type=int, default=0, help="0 = un port libre")
     a.add_argument("--journal", help="un JSON par envoi, en ajout")
     a.add_argument("--etat", help="où retenir domaines et courrier entre deux lancements")
+    a.add_argument("--sonde", action="store_true",
+                   help="se parler à soi-même, vérifier les sept routes, et sortir")
     args = a.parse_args()
     JOURNAL = args.journal
     ETAT = args.etat
@@ -259,6 +261,8 @@ def main():
         COURRIER.update(retrouve.get("courrier", {}))
 
     serveur = ThreadingHTTPServer(("127.0.0.1", args.port), Faux)
+    if args.sonde:
+        return sonder(serveur)
     # La seule ligne que le script qui le lance lit, et il la lit avant de
     # continuer : un `sleep` à la place serait trop court ou trop long.
     print(f"http://127.0.0.1:{serveur.server_address[1]}", flush=True)
@@ -266,6 +270,62 @@ def main():
         serveur.serve_forever()
     except KeyboardInterrupt:
         pass
+
+
+def sonder(serveur):
+    """`--sonde` : le faux se parle à lui-même et vérifie ses sept routes.
+
+    Un faux qui ment est pire qu'un faux absent : la marche passerait au vert
+    sur un chemin qui ne ressemble pas au vrai. Ceci est le seul endroit où ce
+    fichier est mis à l'épreuve autrement qu'en s'en servant.
+    """
+    import urllib.error, urllib.request
+
+    base = f"http://127.0.0.1:{serveur.server_address[1]}"
+    threading.Thread(target=serveur.serve_forever, daemon=True).start()
+
+    def appel(methode, chemin, corps=None, entetes=None, jeton=True):
+        e = {"Content-Type": "application/json", **(entetes or {})}
+        if jeton:
+            e["Authorization"] = "Bearer re_sonde"
+        req = urllib.request.Request(
+            base + chemin,
+            data=json.dumps(corps).encode() if corps is not None else None,
+            headers=e,
+            method=methode,
+        )
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as err:
+            return err.code, json.loads(err.read() or b"{}")
+
+    assert appel("GET", "/domains", jeton=False)[0] == 401, "sans jeton, 401"
+    assert appel("GET", "/domains")[1] == {"data": []}, "compte vide au départ"
+
+    code, d = appel("POST", "/domains", {"name": "sonde.example.com"})
+    assert code == 201 and d["status"] == "pending", d
+    assert appel("POST", "/domains", {"name": "sonde.example.com"})[0] == 200, "créer cherche d'abord"
+    assert len(appel("GET", "/domains")[1]["data"]) == 1, "un seul domaine"
+    assert "records" not in appel("GET", "/domains")[1]["data"][0], "le listing n'en porte pas"
+
+    appel("POST", f"/domains/{d['id']}/verify")
+    assert appel("GET", f"/domains/{d['id']}")[1]["status"] == "verified"
+
+    envoi = {"from": "a@sonde.example.com", "to": ["b@ailleurs.test"], "subject": "s", "text": "t"}
+    un = appel("POST", "/emails", envoi, {"Idempotency-Key": "k"})[1]["id"]
+    deux = appel("POST", "/emails", envoi, {"Idempotency-Key": "k"})[1]["id"]
+    assert un == deux, "la même clé rend le même id"
+    assert appel("POST", "/emails", envoi, {"Idempotency-Key": "autre"})[1]["id"] != un
+    assert appel("GET", f"/emails/{un}")[1]["subject"] == "s", "un envoi se relit"
+
+    entrant = appel("POST", "/_faux/inbound", {"from": "c@ailleurs.test", "to": ["a@sonde.example.com"]})[1]["id"]
+    lu = appel("GET", f"/emails/{entrant}")[1]
+    assert lu["from"] == "c@ailleurs.test" and lu["headers"][0]["name"] == "From", lu
+    assert appel("GET", "/emails/00000000-0000-0000-0000-000000000000")[0] == 404
+
+    print("sonde : les sept routes répondent ce que l'adaptateur attend")
+    return 0
 
 
 if __name__ == "__main__":
