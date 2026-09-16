@@ -84,23 +84,97 @@ variable d'environnement après coup.
   minutes ; c'est un abonnement individuel qui paie, et la même page parle
   d'« ordinary, individual usage ».
 * **Ce n'est pas multi-locataire.** Une machine, une session, un locataire.
-* **Ce n'est pas une démonstration à distance.** Le serveur écoute sur
-  `127.0.0.1`. Ce n'est pas un durcissement de plus, c'est ce qui rend la phrase
-  « il n'y a qu'un humain, devant son terminal » vraie.
+* **Ce n'est pas une démonstration à distance** — sauf sous `--recevoir`, et il
+  faut le dire franchement. `APP_BIND` reste `127.0.0.1` dans tous les cas ; ce
+  qui change, c'est qu'un tunnel rapide relaie une adresse publique vers ce
+  port, donc pendant qu'il tourne, l'instance EST joignable depuis Internet.
+  Ce qui tient alors n'est plus le fait d'écouter sur la boucle locale, c'est la
+  porte : `/v1/webhooks/{chemin}` a un chemin opaque, vérifie une signature
+  avant d'écrire un octet, et tout le reste de l'API demande une clé. Arrêter le
+  tunnel — `--arreter` — referme la porte, et l'adresse ne revient jamais.
 
-## 4. Les faux adaptateurs, et le drapeau qui les enlève
+## 4. Les faux adaptateurs, et ce qui les enlève
 
-Par défaut, `email`, `telephony`, `browser` et `embedder` sont faux, et le
-serveur le dit au démarrage, à `warn`, à chaque fois. Un tour va jusqu'au bout —
-la Gate décide, la séquence avance, le journal s'écrit — mais **rien ne sort de
-la machine**. C'est le défaut parce qu'un e-mail est irréversible et qu'un
-prospect réel n'est pas un décor de démonstration.
+Par défaut, `telephony` et `embedder` sont faux, et le serveur le dit au
+démarrage, à `warn`, à chaque fois. `email` l'est aussi sans `--reel`. Un tour
+va jusqu'au bout — la Gate décide, la séquence avance, le journal s'écrit — mais
+**rien ne sort de la machine**. C'est le défaut parce qu'un e-mail est
+irréversible et qu'un prospect réel n'est pas un décor de démonstration.
 
 `--reel` remplace le seul adaptateur qui compte, l'e-mail, par Resend. Il exige
 `EMAIL_API_KEY`, il exige `AGENT_EMAIL_DOMAIN` — un domaine **vérifié**, sinon
 Resend refuse chaque envoi — et il exige un `OUI` tapé à la main après avoir
-écrit ce que ça implique. Les trois autres restent faux : il n'y a pas de raison
-d'acheter un numéro de téléphone pour prouver qu'un e-mail part.
+écrit ce que ça implique. Le téléphone et l'embedder restent faux : il n'y a pas
+de raison d'acheter un numéro pour prouver qu'un e-mail part.
+
+**Le navigateur, lui, n'est plus faux.** Si `/Applications/Google Chrome.app`
+existe, le script le lance en `--headless=new` avec un `--user-data-dir` sous
+l'état, pose `BROWSER_CDP_URL`, et l'arrête par son pid avec `--arreter` ;
+`/readyz` rend alors `browser_js: true` et un `browser_endpoints` non nul. Sans
+Chrome, `MockBrowser` répond `no_such_element` à chaque lecture — un siège dont
+la charte exige de lire le site d'un prospect avant d'écrire renonce toujours,
+et il le fait en silence, la charte satisfaite — donc le script le **dit** au
+lieu de laisser croire. Le port de débogage est `CDP_PORT` (9222 par défaut) ;
+un port déjà occupé par quelque chose qui répond à `/json/version` est adopté
+tel quel, un port occupé par autre chose est un refus.
+
+### La répétition générale de `--reel`, sans clé et sans destinataire
+
+`--reel` n'était prouvable que par ses refus : personne n'avait vu un envoi
+aller jusqu'au `provider_message_id`. `scripts/faux-resend.py` sert les six
+routes de Resend que le chemin touche — le dépôt en avait déjà un, `FakeResend`,
+mais enfermé dans `#[cfg(test)]`, donc inlançable — et `EMAIL_API_BASE` pointe
+l'adaptateur **réel** dessus :
+
+```sh
+python3 scripts/faux-resend.py --port 8081 \
+  --journal /tmp/envois.jsonl --etat /tmp/faux-resend.json &
+EMAIL_API_KEY=re_faux AGENT_EMAIL_DOMAIN=envoi.example.com \
+  EMAIL_API_BASE=http://127.0.0.1:8081 scripts/ce-soir.sh --reel
+```
+
+`EMAIL_API_BASE` est **refusée par le serveur sans `AGENTOS_ALLOW_MOCKS`**, et
+le refus est à cet endroit parce que c'est la même question que les faux
+adaptateurs posent : à qui la clé du fournisseur est présentée. L'adaptateur
+n'est pas un faux pour autant — la ligne de démarrage dit toujours
+`email=resend` — il parle simplement à quelqu'un d'autre, et le script ne
+demande pas de `OUI` quand c'est le cas : il n'y a rien à confirmer quand rien
+ne sort de la machine.
+
+## 4 bis. Recevoir : `--recevoir`
+
+Pour qu'un e-mail **arrive**, il faut deux choses qu'aucune des deux n'était là.
+
+1. **Une ligne `webhook_endpoints`** (`0053`). Seul
+   `POST /v1/platform/webhooks` l'écrit, derrière `AGENTOS_PLATFORM_KEYS` — et
+   c'est délibéré : aucun handler n'accepte un `auth::Principal` pour cette
+   table, parce qu'un locataire qui écrirait sa propre ligne pourrait nommer un
+   chemin et se mettre à ramasser le courrier d'un autre. `--recevoir` tire une
+   clé de plate-forme, la pose dans l'environnement du serveur, appelle cette
+   route-là, et imprime le chemin opaque qu'elle rend.
+2. **Une adresse publique.** Un portable n'en a pas. `cloudflared tunnel --url`
+   ouvre un **tunnel rapide** : une adresse `https://…trycloudflare.com`, sans
+   compte et sans dépense, `brew install cloudflared`. Le script le lance
+   **avant** le serveur, parce que `PUBLIC_HOST` est lu au démarrage et que
+   c'est lui qui écrit le lien de désabonnement d'un e-mail — pointé sur
+   `127.0.0.1`, ce lien est mort chez le destinataire, et Google et Yahoo le
+   lisent (RFC 8058).
+
+Ce que ça coûte : **l'adresse change à chaque lancement**, donc le webhook est à
+recoller chez le fournisseur à chaque fois. C'est le prix de ne demander ni
+compte ni carte. Un **tunnel nommé** (`cloudflared tunnel create`) garderait
+l'adresse ; il demande le compte Cloudflare du fondateur et un `cloudflared
+login`, et ce script ne le fait pas et ne le fera pas tout seul. Le **secret**,
+lui, ne bouge pas : il vit dans `secrets.env`, et ré-inscrire le webhook fait
+tourner le secret en **gardant** le chemin.
+
+**La signature est vérifiée sur ce chemin**, et c'est ce qui rend un tunnel
+public tenable. `routes::webhooks` lit le corps en octets **avant** toute
+désérialisation, résout le chemin, puis vérifie : pour `email` c'est le schéma
+Standard Webhooks — HMAC-SHA256 sur `id.horodatage.corps`, avec la fenêtre de
+rejeu de `REPLAY_WINDOW_SECS`. Une livraison non signée, ou signée d'un autre
+secret, est un **401 avant qu'une ligne soit écrite** ; un chemin inconnu est un
+404 et non un 401, pour ne pas dire à un sondeur quelles portes existent.
 
 ## 5. Où le script s'arrête, et pourquoi
 
@@ -116,6 +190,11 @@ la raison d'être du script :
 * `policy install` pose le plafond. **Aucune route ne l'écrit.** Sans lui la
   Gate est fermée : chaque action est refusée en `no_platform_policy` et
   `/readyz` reste rouge.
+
+Sous `--recevoir` il y en a une quatrième, et elle est du même genre :
+`AGENTOS_PLATFORM_KEYS` est lue au démarrage comme l'autre, donc la clé qui peut
+écrire `webhook_endpoints` ne peut pas être créée en parlant au serveur. Le
+script la pose, puis appelle la vraie route avec.
 
 Il s'arrête là. Créer la société, poser les chartes, importer, enrôler — c'est
 le geste que le fondateur veut faire depuis son terminal, et un script qui le
@@ -157,6 +236,18 @@ les deux endroits où ça s'arrête si on les oublie :
    de le voir avant d'avoir importé la moitié d'un fichier.
 6. `sequences_create`, puis `sequences_enroll`, puis `sequences_runs_list`.
 
+**Ce qui n'arrivera pas au bout, et ce n'est pas une panne** — mesuré le
+2026-09-17, marche complète contre le faux Resend : un siège
+`sales-development` enrôlé sur une séquence prend son tour, lit son brief, et
+**refuse d'écrire**. `rolepack_sales` livre `max_new_contacts_per_day: 0`, donc
+démarcher un inconnu est fermé, et le siège l'écrit sur le bureau du fondateur
+plutôt que de s'arrêter en silence. C'est la bonne réponse : la lever demande
+un opérateur qui répond de la base légale, et aucun script ne le fait à sa
+place. Ce qui part, en revanche, c'est une **réponse** — quelqu'un écrit à
+`support@…`, la boucle entrante pose le message, le siège `customer-success`
+répond, et la ligne `messages` porte le `provider_message_id` du fournisseur.
+C'est ce chemin-là qui a été suivi de bout en bout.
+
 ## 7. Quand ça ne marche pas
 
 | ce qu'on lit | ce que c'est |
@@ -167,3 +258,7 @@ les deux endroits où ça s'arrête si on les oublie :
 | le tour rend `no_charter` | pas d'`initiatives_set` sur ce siège. |
 | `cli_spawn_failed` / `cli_failed` | `claude` n'est pas sur le `PATH` du serveur, ou sa session a expiré. Relance `claude` à la main. |
 | une file qui n'avance plus l'après-midi | le plafond journalier du domaine (`domains_cap_set`, 50 par défaut). |
+| un siège qui lit `no_such_element` sur chaque page | pas de Chrome : `/readyz` rend `browser_js: false`. Installe Google Chrome, ou lis la ligne que le script imprime. |
+| `EMAIL_API_BASE` refusée au démarrage | elle demande `AGENTOS_ALLOW_MOCKS=1`. Sur une machine de développement le script le pose ; ailleurs, c'est le refus qu'on veut. |
+| `422 not_found` sur `domains_verify` | le fournisseur ne connaît plus le `provider_domain_id` que `tenant_domains` retient. Avec le faux, c'est un redémarrage sans `--etat`. Le domaine primaire ne se retire pas : repartir d'une base neuve. |
+| le webhook répond 404 | l'URL collée chez le fournisseur n'est plus celle du tunnel du jour. Relis la ligne que `--recevoir` imprime. |

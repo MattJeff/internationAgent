@@ -127,7 +127,10 @@ installé ne voit pas `docs/`. `verifier-plugin.py` refuse une copie qui a déri
 
 **`embaucher`** — `teams_list` pour savoir sous quel `role_name` ses limites
 seront lues, `employees_create` (202 et non 201 : commandé, pas embauché) ou
-`org_apply` pour plus d'un siège, `teams_members_add` / `teams_members_set` pour
+`org_apply` pour plus d'un siège — **qui n'écrit pas une ligne de politique**, et
+la première couche d'un rôle appartient à `company_create`, pas à lui : c'est
+pour ça qu'il n'est jamais le deuxième geste d'une société neuve, où le suivant
+tomberait sur un 404 —, `teams_members_add` / `teams_members_set` pour
 la position, `teams_mission_set` + `initiatives_set` pour la charte — ni l'une ni
 l'autre n'est une limite —, `policy_role_get` puis `policy_role_set` et
 `spend_caps_set` pour les limites, et enfin `employees_get` + `controls_get`
