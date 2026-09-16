@@ -233,17 +233,18 @@ l'objectif, `clarify`, et `next_at`. Lis-la avant le siège suivant.
    pas 0). Le corps est le **CSV lui-même**, pas du JSON : les huit premières colonnes de
    l'export Smartlead, en-tête compris, 1 Mio au plus.
 3. **Lis le rapport.** Il **nomme chaque ligne refusée avec son numéro** — c'est exactement ce
-   pour quoi ce mode existe. Regarde aussi `country` : la colonne `location` d'un export
-   Smartlead est de la **prose** (« États-Unis »), elle ne devient jamais un pays, et le rapport
-   rend `ZZ` quand rien ne l'a dit. Le paramètre `country` vaut pour **tout** le fichier — une
-   liste qui mélange les pays s'importe donc en un appel par pays, ou s'assume en `ZZ`, et une
-   liste en `ZZ` ne se segmente plus par pays ensuite. Dis-le au fondateur, ne choisis pas seul.
+   pour quoi ce mode existe.
    - **Zéro refus** → passe au 4.
    - **Un seul refus** → n'importe pas. Corrige le fichier, rejoue à blanc. Une liste presque
      bonne est un en-tête de travers dans neuf cas sur dix, et l'import réel ne se défait pas.
    - Si le fondateur veut importer quand même, dis-lui **en toutes lettres** combien de lignes
      vont tomber et lesquelles, et attends qu'il le dise.
-4. Le **même appel sans `dry_run`**. Réimporter après correction est sûr : un compte est son
+4. **Regarde `country` dans le rapport** avant l'import réel. La colonne `location` d'un export
+   Smartlead est de la **prose** (« États-Unis ») : elle ne devient jamais un pays, et le rapport
+   rend `ZZ` quand rien ne l'a dit. Le paramètre `country` vaut pour **tout** le fichier — une
+   liste qui mélange les pays s'importe donc en un appel par pays, ou s'assume en `ZZ`, et une
+   liste en `ZZ` ne se segmente plus par pays ensuite. Dis-le au fondateur, ne choisis pas seul.
+5. Le **même appel sans `dry_run`**. Réimporter après correction est sûr : un compte est son
    domaine, un contact son adresse, rien ne se duplique.
 
 Le rapport ne rend **aucun identifiant**. C'est normal, et c'est le pas 6 qui va les chercher.
