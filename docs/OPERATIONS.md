@@ -262,8 +262,10 @@ back after producing the full report — the console requires a clean dry run
 before it enables the write. The response counts what `import` counts:
 `rows`, `accounts.{created,existing}`, `contacts.{created,existing,skipped}`
 (skipped = on the suppression list), `nameless`, `phones_dropped`,
-`linkedin_dropped`, `unknown_country`, and `errors[{line,reason}]` for every
-refused row. Refusals of the whole file are `400 bad_csv` (with the expected
+`linkedin_dropped`, `unknown_country`, `no_mail_domain`, `mx_unknown`, and
+`errors[{line,reason}]` for every refused row — including one line per address
+whose domain takes no mail, naming the address and which of the two it was.
+Refusals of the whole file are `400 bad_csv` (with the expected
 header in `detail`), `bad_segment`, `bad_country`; `415` on anything but
 `text/csv`; `413` over the body limit every route shares (1 MiB — the largest
 list on file is 141 KB).

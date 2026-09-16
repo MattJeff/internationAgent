@@ -93,6 +93,13 @@
 //!   matters is a real bounce rate — which only a week of sending gives. The
 //!   upgrade is one call to the same port next to `deliverability::check`.
 //!
+//! The half-measure that costs nothing today: the check is **before** the
+//! upsert, so re-running the same file re-asks about every address, and the
+//! report of a second run names the domains that have died since the first.
+//! What it will not do is retire the row it already wrote — there is no column
+//! for "this address stopped resolving", and adding one is a migration that
+//! wants a real bounce rate behind it too.
+//!
 //! **Not knowing is not a refusal.** `mail_domain` returns `Err` for a
 //! resolver that did not answer, and this module writes the row anyway and
 //! counts it in [`Report::mx_unknown`]. A broken resolver that silently

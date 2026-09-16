@@ -180,6 +180,13 @@ struct ImportView {
     linkedin_dropped: usize,
     /// Comptes créés avec le pays `ZZ`.
     unknown_country: usize,
+    /// Adresses dont le domaine ne prend pas de courrier : non écrites, et
+    /// chacune nommée dans `errors` avec laquelle des deux raisons c'était.
+    no_mail_domain: usize,
+    /// Adresses écrites **sans avoir été vérifiées**, parce que le résolveur
+    /// n'a pas répondu pour leur domaine. Un grand nombre ici veut dire que cet
+    /// import n'a rien vérifié du tout, et c'est le seul endroit où ça se voit.
+    mx_unknown: usize,
     errors: Vec<ErrorView>,
 }
 
@@ -234,6 +241,8 @@ impl ImportView {
             phones_dropped: report.phones_dropped,
             linkedin_dropped: report.linkedin_dropped,
             unknown_country: report.unknown_country,
+            no_mail_domain: report.no_mail_domain,
+            mx_unknown: report.mx_unknown,
             errors,
         }
     }
@@ -385,8 +394,14 @@ struct DiscoverView {
     /// Comptes créés avec le pays `ZZ`, dont la localisation n'est pas stockée
     /// non plus. Le nombre à lire avant de segmenter par pays.
     unknown_country: usize,
+    /// Adresses imprimées sur la page dont le domaine ne prend pas de courrier.
+    /// Une page d'annuaire vit plus longtemps que ses membres.
+    no_mail_domain: usize,
+    /// Adresses écrites sans avoir été vérifiées : le résolveur n'a pas répondu.
+    mx_unknown: usize,
     /// Ce qui n'a pas été fait, en toutes lettres — en pratique : le plafond
-    /// journalier épuisé, et combien d'adresses n'ont pas été regardées.
+    /// journalier épuisé, et combien d'adresses n'ont pas été regardées, plus
+    /// une ligne par adresse écartée avec sa raison.
     errors: Vec<ErrorView>,
 }
 
@@ -448,6 +463,8 @@ async fn discover(
         },
         nameless: report.nameless,
         unknown_country: report.unknown_country,
+        no_mail_domain: report.no_mail_domain,
+        mx_unknown: report.mx_unknown,
         errors: errors_of(report.refused),
     }))
 }
