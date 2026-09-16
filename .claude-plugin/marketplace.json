@@ -8,7 +8,7 @@
     {
       "name": "siglair",
       "displayName": "Siglair — piloter sa société depuis le terminal",
-      "description": "Branche le serveur MCP de siglair.com et ajoute quatre gestes de fondateur : le point du jour, lancer une campagne, répondre aux demandes, embaucher.",
+      "description": "Branche le serveur MCP de siglair.com et ajoute cinq gestes de fondateur : monter la société, le point du jour, lancer une campagne, répondre aux demandes, embaucher.",
       "source": "./plugin",
       "tags": ["siglair", "mcp", "operations", "outreach"]
     }

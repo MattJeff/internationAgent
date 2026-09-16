@@ -6,21 +6,21 @@ qu'on lit `company_health_get` avant de croire un chiffre, qu'un import se fait 
 blanc d'abord, qu'une action d'approbation se recopie octet par octet.
 
 Ce plugin est cette moitié manquante. Une commande d'installation, et le
-fondateur a **quatre gestes nommés** plutôt qu'un catalogue.
+fondateur a **cinq gestes nommés** plutôt qu'un catalogue.
 
 ---
 
 ## 1. L'installation, en trois lignes
 
 ```
-/plugin marketplace add MattJeff/InternationalAgent
+/plugin marketplace add MattJeff/internationAgent
 /plugin install siglair@siglair
 ```
 
 et, quand l'installateur demande la **clé d'API du locataire**, la coller.
 
 Vérifier : `/mcp` doit montrer `siglair` connecté, et `/help` (onglet *Custom
-commands*) les quatre gestes sous le préfixe `siglair:`.
+commands*) les cinq gestes sous le préfixe `siglair:`.
 
 Le dépôt est privé : `/plugin marketplace add` sur une source GitHub privée
 suppose un `gh` authentifié sur la machine du fondateur.
@@ -53,10 +53,10 @@ que pour viser un déploiement de recette. Il n'est pas sensible.
 **Si une version de Claude Code ne demande pas la clé à l'installation**, le
 chemin de repli est celui de `docs/MCP_SERVEUR.md` §2 — `claude mcp add
 --transport http siglair https://siglair.com/v1/mcp/server --header
-"Authorization: Bearer <clé>"` — et les quatre skills fonctionnent par-dessus
+"Authorization: Bearer <clé>"` — et les cinq skills fonctionnent par-dessus
 sans changement, puisqu'ils ne nomment que des outils.
 
-## 3. Les quatre gestes
+## 3. Les cinq gestes
 
 Un geste n'est pas une liste d'outils : il dit **dans quel ordre** appeler, ce
 qu'on lit entre deux étapes, et ce qu'il ne faut jamais faire. Chacun porte une
@@ -68,6 +68,7 @@ phrase de garde.
 | **`lancer-une-campagne`** | de l'import d'une liste au premier envoi | Jamais `sequences_enroll` avant que `domains_primary_get` ait rendu le domaine **vérifié**. |
 | **`repondre-aux-demandes`** | vider la file humaine | Ne jamais reformuler l'action d'une approbation ; ne jamais approuver sa propre demande. |
 | **`embaucher`** | un siège, sa place, sa charte, ses limites | `policy_role_set` est un document entier : un champ manquant est un retrait. |
+| **`monter-la-societe`** | « monte-moi l'entreprise », depuis rien | Jamais `org_apply` sur une société neuve : il embauche sans poser une seule couche de limites. |
 
 **`point-du-jour`** — **six appels, parcourus pour la première fois le
 2026-09-12** sur une société neuve, une qui tourne et une à l'arrêt. Il en
@@ -110,18 +111,35 @@ recopiée sans un octet de différence ou `approvals_deny` avec une note, puis l
 couche — et enfin `desk_messages_send` depuis un fauteuil pour dire à l'employé ce qui a
 été décidé et pourquoi.
 
+**`monter-la-societe`** — **le geste qui vient avant les quatre autres**, et le seul qui parte
+de rien : `model_connect` `{"path":"cli"}`, `company_create`, `domains_register` →
+`domains_verify`, `initiatives_set` sur chaque siège, `prospects_import` à blanc puis réel,
+`sequences_create` → `contacts_list` → `sequences_enroll` → `sequences_runs_list`. Il existe
+parce que le fondateur ne doit pas avoir à savoir que `org_apply` est un piège sur une société
+neuve : cette route embauche et **n'écrit aucune couche de limites**, une couche absente hérite
+du plafond de la plateforme, et `policy_role_set` ne peut pas la créer après coup — il rend 404.
+Il porte **six barrières**, une par pas, annoncées en tête : ce qu'on relit *avant* de passer au
+suivant, et quoi faire quand ce n'est pas ça. Et il **embarque ses chiffres** plutôt que de les
+faire inventer : `company_create` réclame un document de limites complet par rôle, et les six
+gabarits de `skills/monter-la-societe/gabarits/` sont les documents du fondateur —
+`docs/orizn-roles/*.json` et `docs/orizn-org.json` — copiés à l'octet près, parce qu'un plugin
+installé ne voit pas `docs/`. `verifier-plugin.py` refuse une copie qui a dérivé.
+
 **`embaucher`** — `teams_list` pour savoir sous quel `role_name` ses limites
 seront lues, `employees_create` (202 et non 201 : commandé, pas embauché) ou
-`org_apply` pour plus d'un siège, `teams_members_add` / `teams_members_set` pour
+`org_apply` pour plus d'un siège — **qui n'écrit pas une ligne de politique**, et
+la première couche d'un rôle appartient à `company_create`, pas à lui : c'est
+pour ça qu'il n'est jamais le deuxième geste d'une société neuve, où le suivant
+tomberait sur un 404 —, `teams_members_add` / `teams_members_set` pour
 la position, `teams_mission_set` + `initiatives_set` pour la charte — ni l'une ni
 l'autre n'est une limite —, `policy_role_get` puis `policy_role_set` et
 `spend_caps_set` pour les limites, et enfin `employees_get` + `controls_get`
 pour vérifier qu'il s'est provisionné.
 
-## 4. Les trois commandes courtes
+## 4. Les quatre commandes courtes
 
-`plugin/commands/{point,campagne,demandes}.md` donnent une invocation brève avec
-un argument. **Elles ne s'appellent pas `/siglair-point`** : la documentation dit
+`plugin/commands/{point,campagne,demandes,societe}.md` donnent une invocation
+brève avec un argument. **Elles ne s'appellent pas `/siglair-point`** : la documentation dit
 que les skills d'un plugin sont *toujours* namespacés `/<nom-du-plugin>:<nom>`,
 et il n'existe aucun champ pour changer le séparateur. La forme atteignable la
 plus proche est donc, le plugin s'appelant `siglair` :
@@ -130,13 +148,15 @@ plus proche est donc, le plugin s'appelant `siglair` :
 /siglair:point 7d
 /siglair:campagne agences-marketing
 /siglair:demandes
+/siglair:societe Orizn
 ```
 
-Les quatre gestes complets restent invocables directement —
+Les cinq gestes complets restent invocables directement —
 `/siglair:point-du-jour`, `/siglair:lancer-une-campagne`,
-`/siglair:repondre-aux-demandes`, `/siglair:embaucher` — et les trois gestes de
+`/siglair:repondre-aux-demandes`, `/siglair:embaucher`,
+`/siglair:monter-la-societe` — et les trois gestes de
 lecture-décision sont aussi choisis tout seuls par le modèle quand la question
-les appelle. Les trois commandes courtes portent `disable-model-invocation:
+les appelle. Les quatre commandes courtes portent `disable-model-invocation:
 true` pour ne pas doubler les skills dans ce choix.
 
 ## 5. L'arborescence, et pourquoi le marketplace est à la racine
@@ -147,7 +167,9 @@ plugin/
   .claude-plugin/plugin.json         ← le manifeste, dont userConfig
   .mcp.json                          ← le serveur siglair, en http
   skills/{point-du-jour,lancer-une-campagne,repondre-aux-demandes,embaucher}/SKILL.md
-  commands/{point,campagne,demandes}.md
+  skills/monter-la-societe/SKILL.md
+  skills/monter-la-societe/gabarits/*.json   ← les limites que le geste recopie
+  commands/{point,campagne,demandes,societe}.md
 ```
 
 Le `marketplace.json` **doit** être à `<racine-du-dépôt>/.claude-plugin/` : c'est
@@ -185,10 +207,11 @@ python3 scripts/verifier-plugin.py
 
 Vérifié par ce script : chaque JSON parse, chaque `SKILL.md` porte un
 frontmatter délimité dont tous les champs sont documentés et dont le `name`
-correspond à son dossier, **chacun des 64 outils nommés par les quatre gestes
+correspond à son dossier, **chacun des 68 outils nommés par les cinq gestes
 existe encore dans `crates/app/src/mcp_tools/`**, aucun fichier ne contient
-`sk-`, `re_`, `whsec_` ni un `Bearer ` suivi d'un jeton, et la `source` du
-marketplace mène à un manifeste dont le nom correspond.
+`sk-`, `re_`, `whsec_` ni un `Bearer ` suivi d'un jeton, **les six gabarits de
+`monter-la-societe` sont encore les documents du fondateur à l'octet près**, et
+la `source` du marketplace mène à un manifeste dont le nom correspond.
 
 La troisième ligne est la seule qui mérite un script plutôt qu'une relecture :
 les 148 lignes du registre sont éditées par d'autres chantiers, et un outil
@@ -210,9 +233,42 @@ nommait pas le siège qui venait d'échouer ; `capability_requests_list` rendait
 un seuil sous un nom de date). Les deux autres gestes de lecture n'ont toujours
 été joués par personne.
 
+**Vérifié depuis le 2026-09-16 :** `monter-la-societe` a été **joué deux fois
+par un vrai `claude`**, en non interactif (`claude -p --plugin-dir ./plugin
+--mcp-config … --strict-mcp-config`), sur deux bases neuves montées et
+supprimées pour l'occasion, depuis « rien » jusqu'à quatre runs de séquence
+`active` et un premier tour abouti (`last_success_at` cesse d'être `null`). Le
+modèle a **choisi le geste lui-même** sur la phrase « monte-moi l'entreprise ».
+
+La première marche — 64 tours — a rendu trois défauts du geste, tous corrigés
+puis rejoués : les six relectures étaient **groupées à la fin** au lieu d'être
+posées entre deux pas (elles sont devenues une *barrière* par pas, annoncée en
+tête) ; le geste imposait `domains_dns_publish` → `domains_verify` alors que le
+fournisseur avait **déjà rendu le domaine vérifié** à l'enregistrement ; et
+l'import laissait `country: ZZ`, parce que la colonne `location` d'un export
+Smartlead est de la prose et que `country` vaut pour **tout** le fichier — une
+liste qui mélange les pays s'importe en un appel par pays. La seconde marche,
+sur le geste corrigé, a fait **38 tours au lieu de 64** et franchi les six
+barrières en place.
+
+Une quatrième correction vient de la mesure et pas d'un écart : la barrière du
+pas 4 réclamait un `initiatives_get` après chaque `initiatives_set`, et
+l'écriture **rend déjà** `plan`, `clarify` et `next_at` dans sa propre réponse.
+Quatre appels de moins, et `initiatives_get` reste nommé pour ce qu'il sert
+vraiment — relire une charte posée un autre jour, diagnostiquer un run mort en
+`not_sent`.
+
+Ce que la marche a rendu et qui n'est pas dans le geste : sur un déploiement
+sans JavaScript ni proxy navigateur, la séquence reste `active`, le siège prend
+ses tours, **aucun refus n'est enregistré** et pas un mail ne part — la charte du
+commercial lui interdit d'écrire sans un défaut reproduit, et aucune page ne se
+charge. Le geste dit désormais où regarder (`events_list`, puis
+`desk_messages_list` sur le fauteuil, où l'employé dépose son « sans constat »),
+mais `browser_js` ne se bascule par aucune route et **ce mur reste entier**.
+
 **Non vérifié, et ça ne peut pas l'être depuis un worktree :** l'installation
 elle-même. Le marketplace n'est atteignable qu'une fois la branche poussée sur
-`MattJeff/InternationalAgent`, donc personne n'a encore vu `/plugin marketplace
+`MattJeff/internationAgent`, donc personne n'a encore vu `/plugin marketplace
 add` résoudre ce catalogue, ni l'installateur demander la clé, ni
 `${user_config.cle_api}` être remplacé dans l'en-tête `Authorization`, ni le
 serveur `siglair` apparaître dans `/mcp`. Tant que quelqu'un ne l'a pas fait une

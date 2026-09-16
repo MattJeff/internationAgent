@@ -1,0 +1,27 @@
+{
+  "spend": null,
+  "allowed_channels": [
+    "email",
+    "internal",
+    "web"
+  ],
+  "allowed_calling_codes": [],
+  "allowed_domains": [
+    "booking.com",
+    "orizn.app"
+  ],
+  "denied_domains": [],
+  "allowed_mcp_tools": [],
+  "allowed_a2a_peers": [],
+  "allowed_models": [
+    "claude-haiku-4-5",
+    "claude-sonnet-5"
+  ],
+  "max_new_contacts_per_day": 5,
+  "max_turns_per_day": 30,
+  "allow_file_upload": false,
+  "allow_credential_change": false,
+  "allow_data_delete": false,
+  "allow_lead_upload": false,
+  "untrusted_email_needs_approval": false
+}

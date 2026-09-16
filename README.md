@@ -263,7 +263,7 @@ hand you the right answer.
 — the morning read, launching a campaign, clearing the approval queue, hiring a
 seat — each of which says in which *order* to call, what to read between two
 steps, and the one thing never to do. `.claude-plugin/marketplace.json` at the
-repo root makes `/plugin marketplace add MattJeff/InternationalAgent` resolve it.
+repo root makes `/plugin marketplace add MattJeff/internationAgent` resolve it.
 The tenant key is a `sensitive` `userConfig` field, so it lives in the keychain
 and never in a file a client would commit. `docs/PLUGIN.md` has the install, the
 gestures and the dated sources.

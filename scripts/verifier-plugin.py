@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Ce que le plugin Claude Code promet, et qu'aucun compilateur ne relit.
 
-Quatre choses, parce que ce sont les quatre qui se cassent en silence :
+Cinq choses, parce que ce sont les cinq qui se cassent en silence :
 le frontmatter de chaque skill, **chaque outil cité par un geste existe encore
 dans le registre Rust** (c'est celle qui compte — les 116 lignes sont éditées par
 d'autres chantiers, et un outil renommé rend un skill faux sans rien casser),
-l'absence de secret, et le chemin du marketplace vers son manifeste.
+l'absence de secret, **les gabarits de limites embarqués par `monter-la-societe`
+sont encore les documents du fondateur à l'octet près**, et le chemin du
+marketplace vers son manifeste.
 
     python3 scripts/verifier-plugin.py
 """
@@ -60,7 +62,15 @@ noise = {"dry_run", "user_config", "last_failure_detail", "outstanding_minor", "
          # Le champ que `work_items_list` rend et que `point-du-jour` doit
          # pouvoir nommer : c'est lui qui mene du tableau au texte recu.
          "conversation_id",
-         "to_next_rate", "no_target", "on_track", "raised_after_denials"}
+         "to_next_rate", "no_target", "on_track", "raised_after_denials",
+         # Les codes de refus et les champs d'objectif que `monter-la-societe`
+         # nomme, parce qu'un geste qui dit « si ca refuse, recommence » sans
+         # dire ce qu'on lit fait deviner. Aucun n'est un outil.
+         "cli_failed", "cli_spawn_failed", "domain_taken", "no_charter",
+         "no_model", "no_platform_policy", "not_sent", "objective_field",
+         "role_layer_exists", "tenant_mismatch", "unreachable_colleague",
+         "window_exists", "corporate_travel", "escalate_to",
+         "first_response_hours", "target_accounts", "next_at", "browser_js"}
 missing = sorted(t for t in cited - noise if t not in registry)
 if missing:
     bad.append(f"outils cites et absents du registre : {missing}")
@@ -71,7 +81,7 @@ else:
 # `every_written_count_is_the_registry_s_own` cote Rust : un nombre tape dans de
 # la prose est vrai le jour ou il est ecrit. Celui-ci disait 55 pendant que les
 # gestes en citaient 60.
-attendu = f"chacun des {len(cited - noise)} outils nommes par les quatre gestes"
+attendu = f"chacun des {len(cited - noise)} outils nommes par les cinq gestes"
 plugin_md = open("docs/PLUGIN.md", encoding="utf-8").read()
 plugin_md_sans_accents = (plugin_md.replace("\u00e9", "e").replace("\u00e8", "e")
                           .replace("\u00ea", "e").replace("\u00e0", "a"))
@@ -90,6 +100,20 @@ for p in sorted(glob.glob("plugin/**/*", recursive=True) + [".claude-plugin/mark
         if re.search(pat, t):
             bad.append(f"{p}: secret possible, motif {pat}")
 print("OK aucun sk- / re_ / whsec_ / Bearer litteral" if not any("secret" in b for b in bad) else "")
+
+# 3b. les gabarits embarques sont les documents du fondateur, a l'octet pres.
+# Le plugin doit etre lisible une fois installe, donc il porte sa copie ; une copie
+# qui derive est un modele qui pose des limites que personne n'a ecrites.
+for src, dst in [("docs/orizn-org.json", "organigramme.json")] + [
+        (f"docs/orizn-roles/{r}.json", f"{r}.json")
+        for r in ("direction", "sales-development", "customer-success", "growth", "finance")]:
+    emb = os.path.join("plugin/skills/monter-la-societe/gabarits", dst)
+    if not os.path.isfile(emb):
+        bad.append(f"{emb}: gabarit absent")
+    elif open(emb, "rb").read() != open(src, "rb").read():
+        bad.append(f"{emb} a derive de {src} — le gabarit est une copie, pas une variante")
+    else:
+        print(f"OK gabarit {dst} == {src}")
 
 # 4. le marketplace pointe sur un plugin qui existe
 mk = json.load(open(".claude-plugin/marketplace.json"))

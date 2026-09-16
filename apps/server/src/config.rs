@@ -592,6 +592,39 @@ impl Config {
         // variable holding the same string.
         let webhooks = parse_webhooks(&get("AGENTOS_WEBHOOK_SECRETS").unwrap_or_default())?;
 
+        // `EMAIL_API_BASE` : la répétition générale de `--reel`, contre
+        // `scripts/faux-resend.py` plutôt que contre `api.resend.com`.
+        //
+        // **Refusée sans `AGENTOS_ALLOW_MOCKS`**, et le refus est au même
+        // endroit que les autres parce que c'est la même question : à qui la
+        // clé du fournisseur est-elle présentée. Un adaptateur redirigé n'est
+        // pas un faux — il est réel et il parle à quelqu'un d'autre — donc il
+        // n'entre pas dans `mock_adapters`, il est simplement interdit là où
+        // les faux le sont. La forme est vérifiée ici pour que l'erreur tombe
+        // au démarrage et pas au premier envoi.
+        let email_api_base = match get("EMAIL_API_BASE") {
+            None => None,
+            Some(raw) => {
+                if !allow_mocks {
+                    return Err(ConfigError::Invalid {
+                        var: "EMAIL_API_BASE",
+                        detail: "rediriger l'API du fournisseur d'e-mail demande \
+                                 AGENTOS_ALLOW_MOCKS=1 : la clé EMAIL_API_KEY serait présentée \
+                                 à cette adresse-là. Ne la pose pas sur un déploiement."
+                            .to_owned(),
+                    });
+                }
+                let trimmed = raw.trim().trim_end_matches('/').to_owned();
+                if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+                    return Err(ConfigError::Invalid {
+                        var: "EMAIL_API_BASE",
+                        detail: format!("{raw:?} n'est pas une origine `http(s)://hôte[:port]`"),
+                    });
+                }
+                Some(trimmed)
+            }
+        };
+
         // Parsed here rather than in `routes::mcp`, because this file is the one
         // place that reads the environment and a second `std::env::var` is how a
         // deployment ends up with two answers about what it is registered for.
@@ -616,6 +649,7 @@ impl Config {
                     .iter()
                     .find(|hook| hook.provider == "email")
                     .map_or_else(String::new, |hook| hook.secret.clone()),
+                api_base: email_api_base.clone(),
                 // The tenant's default, and the unsubscribe origin when
                 // there is no `PUBLIC_HOST`; see `EmailCredentials::domain`.
                 domain: agent_email_domain.clone(),
@@ -1383,6 +1417,52 @@ mod tests {
             parse(&env),
             Err(ConfigError::Invalid {
                 var: "BROWSER_FETCH",
+                ..
+            })
+        ));
+    }
+
+    /// **Rediriger Resend demande de dire tout haut que c'est un bac à sable.**
+    ///
+    /// `EMAIL_API_BASE` est ce qui fait passer la répétition de `--reel` par
+    /// `scripts/faux-resend.py`. La variable présente la clé `EMAIL_API_KEY` à
+    /// l'adresse qu'elle nomme, donc la poser sans `AGENTOS_ALLOW_MOCKS` est un
+    /// refus au démarrage et pas un envoi mal adressé au premier tour.
+    #[test]
+    fn redirecting_the_email_api_needs_the_development_switch_and_an_origin() {
+        let mut env = complete();
+        env.insert("EMAIL_API_BASE", "http://127.0.0.1:8081".to_owned());
+        assert!(
+            matches!(
+                parse(&env),
+                Err(ConfigError::Invalid {
+                    var: "EMAIL_API_BASE",
+                    ..
+                })
+            ),
+            "une redirection sans AGENTOS_ALLOW_MOCKS doit refuser"
+        );
+
+        env.insert("AGENTOS_ALLOW_MOCKS", "1".to_owned());
+        let config = parse(&env).expect("valid");
+        assert_eq!(
+            config
+                .credentials
+                .email
+                .as_ref()
+                .expect("selected")
+                .api_base
+                .as_deref(),
+            Some("http://127.0.0.1:8081"),
+        );
+        // Et l'adaptateur reste le vrai : une redirection n'est pas un faux.
+        assert!(config.adapter_summary().contains("email=resend"));
+
+        env.insert("EMAIL_API_BASE", "127.0.0.1:8081".to_owned());
+        assert!(matches!(
+            parse(&env),
+            Err(ConfigError::Invalid {
+                var: "EMAIL_API_BASE",
                 ..
             })
         ));
