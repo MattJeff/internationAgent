@@ -31,7 +31,8 @@
 #
 # La répétition générale de `--reel`, sans clé Resend et sans destinataire :
 #
-#   python3 scripts/faux-resend.py --port 8081 --journal /tmp/envois.jsonl &
+#   python3 scripts/faux-resend.py --port 8081 \
+#     --journal /tmp/envois.jsonl --etat /tmp/faux-resend.json &
 #   EMAIL_API_KEY=re_faux AGENT_EMAIL_DOMAIN=… EMAIL_API_BASE=http://127.0.0.1:8081 \
 #     scripts/ce-soir.sh --reel
 #
@@ -70,7 +71,7 @@ for arg in "$@"; do
     --recevoir) RECEVOIR=1 ;;
     --arreter) ACTION=arreter ;;
     --effacer) ACTION=effacer ;;
-    -h|--help) sed -n '3,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '3,41p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "je ne connais pas « $arg ». --reel, --recevoir, --arreter, --effacer, --help." >&2; exit 2 ;;
   esac
 done
