@@ -399,6 +399,12 @@ impl RolePack {
                 allow_credential_change: false,
                 allow_data_delete: false,
                 allow_lead_upload: false,
+                // `false`: this pack does not itself ask for the review, it
+                // just does not take one away — the field intersects with `||`,
+                // so the platform ceiling's answer stands. Where the decision
+                // for a fresh deployment lives is
+                // `agentos_store::policy::default_ceiling`, and it is `true`.
+                untrusted_email_needs_approval: false,
             },
         }
     }

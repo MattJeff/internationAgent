@@ -403,7 +403,8 @@ mod tests {
             "allow_file_upload": false,
             "allow_credential_change": false,
             "allow_data_delete": false,
-            "allow_lead_upload": false
+            "allow_lead_upload": false,
+            "untrusted_email_needs_approval": false
         })
     }
 

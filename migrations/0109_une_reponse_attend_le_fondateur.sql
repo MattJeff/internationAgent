@@ -1,0 +1,60 @@
+-- 0109_une_reponse_attend_le_fondateur : la colonne qui met un humain entre un
+-- tour teinté et un e-mail sortant.
+--
+-- « Je te dis réponds et tu réponds — sauf si tu peux faire beaucoup mieux, bien
+-- sûr. […] Et pour moi **on valide aussi la réponse**. »  C'est la phrase que
+-- cette colonne exécute, et elle n'a jamais eu d'endroit où vivre : la Gate
+-- n'escaladait que pour le paiement, la signature, la clé et l'effacement, tous
+-- `Risk::High`, et un e-mail était soit parti soit refusé au moment du tour.
+--
+-- ---------------------------------------------------------------------------
+-- POURQUOI CE N'EST PAS UN CHANGEMENT DE RISQUE
+-- ---------------------------------------------------------------------------
+--
+-- Passer `Action::EmailSend` à `Risk::High` casserait deux choses que le code
+-- argumente longuement. Le fil de teinte (`domain::policy::evaluate`) refuse
+-- tout acte à haut risque né d'un texte étranger : un siège qui vient de lire
+-- le mail d'un client ne pourrait donc plus jamais y répondre — ce qui est
+-- exactement la fonctionnalité. Et `app::turn::visible` retire les schémas à
+-- haut risque d'un tour teinté : le verbe disparaîtrait des tours qui en ont le
+-- plus besoin.
+--
+-- Donc c'est une **exigence de politique** et non une propriété de l'acte, et
+-- elle vit avec les quinze autres, dans `policy_layers`.
+--
+-- ---------------------------------------------------------------------------
+-- LA POLARITÉ, ET POURQUOI ELLE EST À CONTRE-SENS DES QUATRE AUTRES BOOLÉENS
+-- ---------------------------------------------------------------------------
+--
+-- `allow_file_upload`, `allow_credential_change`, `allow_data_delete` et
+-- `allow_lead_upload` sont des permissions : `false` est la valeur sûre, elles
+-- s'intersectent en `AND`, et le `merge` de cette table (voir la fonction
+-- d'upsert dans `agentos_store::policy`) les remonte dans ce sens-là.
+--
+-- Celle-ci est une **exigence** : `true` est la valeur sûre, elle s'intersecte
+-- en `OR`, et une couche basse peut ajouter l'humain sans jamais pouvoir
+-- retirer celui qu'une couche haute a posé. Écrite en `AND`, une plateforme qui
+-- exige une relecture serait désactivée par n'importe quel locataire, en
+-- silence, dans la seule direction que ce dépôt refuse partout ailleurs.
+--
+-- ---------------------------------------------------------------------------
+-- LE DÉFAUT, ET CE QU'IL NE DÉCIDE PAS
+-- ---------------------------------------------------------------------------
+--
+-- `default false`, et ce n'est **pas** la réponse à « est-ce que les réponses
+-- attendent sur un déploiement neuf ». Une migration s'applique à des bases qui
+-- tournent déjà ; un `default true` mettrait en file, d'un coup et sans que
+-- personne l'ait demandé, chaque e-mail de chaque siège qui a lu une page — sur
+-- des locataires dont l'approbateur ne sait pas encore que la file existe.
+-- Une colonne ne prend pas cette décision à la place d'un opérateur.
+--
+-- La décision pour un déploiement neuf est ailleurs, et elle est **oui** :
+-- `agentos_store::policy::default_ceiling` la pose à `true`, donc toute base
+-- qui exécute `agentos-server policy install` sort avec la relecture allumée.
+-- Une base existante la garde à `false` jusqu'à ce que son opérateur
+-- réinstalle le plafond — ce qui est une ligne de commande, pas une surprise au
+-- redémarrage. `docs/orizn-ceiling.json` la porte aussi à `true` : c'est le
+-- plafond du fondateur, et c'est sa phrase.
+
+alter table policy_layers
+  add column if not exists untrusted_email_needs_approval boolean not null default false;

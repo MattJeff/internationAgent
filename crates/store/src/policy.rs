@@ -241,7 +241,7 @@ const SELECT_ACTIVE_LAYERS: &str = "\
            l.allowed_mcp_tools, l.allowed_a2a_peers, l.allowed_models, \
            l.max_new_contacts_per_day, l.max_turns_per_day, \
            l.allow_file_upload, l.allow_credential_change, l.allow_data_delete, \
-           l.allow_lead_upload \
+           l.allow_lead_upload, l.untrusted_email_needs_approval \
     FROM policy_layers l \
     JOIN policy_versions v ON v.id = l.version_id \
     WHERE v.active AND ( \
@@ -691,6 +691,31 @@ pub fn default_ceiling() -> PolicyLimits {
         // would be a deployment that starts mailing strangers because somebody
         // installed a default.
         allow_lead_upload: false,
+        // **`true`, and this is the answer to "on a fresh deployment, does a
+        // reply wait?"** It is the one field of this ceiling that starts at its
+        // *restrictive* value, and the argument is the one this function makes
+        // for `allow_lead_upload` one line up, read the other way round: that
+        // flag is off because a ceiling that shipped it on would be a
+        // deployment that starts mailing strangers because somebody installed a
+        // default. This one is on because a ceiling that shipped it off would
+        // be a deployment where the first thing a customer's own words get to
+        // do is compose a letter nobody read — and the operator who wanted the
+        // review would find out it existed only after not having had it.
+        //
+        // It costs a queue and the queue is readable: one line per email a
+        // tainted turn drafts, which on a first campaign is a handful, and
+        // `approvals_list` is already where a founder looks. An operator who
+        // does not want it writes `false` in a tenant layer — and cannot,
+        // because this field intersects with `||` and a lower layer may only
+        // add the human. Turning it off is re-installing the ceiling, which is
+        // a deliberate act with a version and a rollback, which is the right
+        // weight for "stop reading what my employees send".
+        //
+        // `0108_une_reponse_attend_le_fondateur.sql` carries the other half:
+        // the column defaults to `false` so that *existing* databases do not
+        // silently start queueing on migrate. New is `true`; old changes when
+        // its operator says so.
+        untrusted_email_needs_approval: true,
     }
 }
 
@@ -849,9 +874,10 @@ pub async fn install_ceiling(
                 allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
                 allowed_models, max_new_contacts_per_day, max_turns_per_day, \
                 allow_file_upload, allow_credential_change, allow_data_delete, \
-                allow_lead_upload) \
+                allow_lead_upload, untrusted_email_needs_approval) \
              VALUES ($1, $2, NULL, 'platform', NULL, NULL, \
-                     $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+                     $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, \
+                     $20)",
         )
         .bind(Uuid::now_v7())
         .bind(version),
@@ -968,6 +994,7 @@ struct Columns {
     credential_change: bool,
     data_delete: bool,
     lead_upload: bool,
+    untrusted_email_needs_approval: bool,
 }
 
 impl Columns {
@@ -1023,10 +1050,11 @@ impl Columns {
             credential_change: limits.allow_credential_change,
             data_delete: limits.allow_data_delete,
             lead_upload: limits.allow_lead_upload,
+            untrusted_email_needs_approval: limits.untrusted_email_needs_approval,
         }
     }
 
-    /// Append all seventeen, in declaration order. Consumes `self` because sqlx
+    /// Append all eighteen, in declaration order. Consumes `self` because sqlx
     /// encodes on `bind`, so nothing here has to outlive the call.
     fn bind_to<'q>(
         self,
@@ -1050,6 +1078,7 @@ impl Columns {
             .bind(self.credential_change)
             .bind(self.data_delete)
             .bind(self.lead_upload)
+            .bind(self.untrusted_email_needs_approval)
     }
 }
 
@@ -1195,14 +1224,14 @@ pub async fn install(
             allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
             allowed_models, max_new_contacts_per_day, max_turns_per_day, \
             allow_file_upload, allow_credential_change, allow_data_delete, \
-            allow_lead_upload) \
+            allow_lead_upload, untrusted_email_needs_approval) \
          VALUES \
            ($1, $2, NULL, 'platform', NULL, NULL, \
             $9, $10, $11, $12, $13, $14, $15, '{}', $17, $18, $19, $20, $21, $22, $23, $24, \
-            $25), \
+            $25, $26), \
            ($3, $4, $5, $6, $7, $8, \
             $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, \
-            $25) \
+            $25, $26) \
          ON CONFLICT (id) DO UPDATE SET \
            spend_currency = coalesce(policy_layers.spend_currency, excluded.spend_currency), \
            max_per_transaction_minor = \
@@ -1224,9 +1253,19 @@ pub async fn install(
            allow_credential_change = \
              policy_layers.allow_credential_change OR excluded.allow_credential_change, \
            allow_data_delete = policy_layers.allow_data_delete OR excluded.allow_data_delete, \
-           allow_lead_upload = policy_layers.allow_lead_upload OR excluded.allow_lead_upload",
+           allow_lead_upload = policy_layers.allow_lead_upload OR excluded.allow_lead_upload, \
+           untrusted_email_needs_approval = \
+             policy_layers.untrusted_email_needs_approval \
+             AND excluded.untrusted_email_needs_approval",
+        // `AND`, and it is the only merge on this list that is not the same
+        // operator `PolicyLimits::intersect` uses for its column. Every clause
+        // above *widens the fixture ceiling* so that the layer being installed
+        // beside it is contained in it — `greatest`, `||`, `OR`. Widening a
+        // requirement is `false`, so widening this one is `AND`. Written `OR`,
+        // a single fixture that asks for review would pin the ceiling to
+        // `true` for every later test in the same database.
     );
-    // $9..=$25 are the seventeen limit columns, in `Columns` declaration order —
+    // $9..=$26 are the eighteen limit columns, in `Columns` declaration order —
     // the same order and the same mapping `install_ceiling` writes them with.
     let insert = Columns::from(limits).bind_to(
         statement
@@ -1734,6 +1773,7 @@ struct LayerRow {
     allow_credential_change: bool,
     allow_data_delete: bool,
     allow_lead_upload: bool,
+    untrusted_email_needs_approval: bool,
 }
 
 impl LayerRow {
@@ -1844,6 +1884,7 @@ impl LayerRow {
                 allow_credential_change: self.allow_credential_change,
                 allow_data_delete: self.allow_data_delete,
                 allow_lead_upload: self.allow_lead_upload,
+                untrusted_email_needs_approval: self.untrusted_email_needs_approval,
             },
         ))
     }
