@@ -9,7 +9,7 @@ pendant qu'une instance entière monte à côté de lui.
 
     python3 scripts/faux-resend.py --port 8081 --journal /tmp/envois.jsonl
 
-Cinq routes, parce que ce sont les cinq que la marche touche — lues dans
+Six routes, parce que ce sont les six que la marche touche — lues dans
 `ResendEmailProvider`, pas devinées :
 
     GET  /domains              `find_domain`, appelé par les trois autres
@@ -17,6 +17,13 @@ Cinq routes, parce que ce sont les cinq que la marche touche — lues dans
     POST /domains              `ensure_domain` crée, après avoir cherché
     POST /domains/{id}/verify  `verify_domain`
     POST /emails               `send` — c'est le `provider_message_id` qui revient
+    GET  /emails/{id}          `fetch_inbound` — ce que la boucle entrante lit
+                               après qu'un webhook lui a donné un `email_id`
+
+Et une septième qui n'existe pas chez Resend, `POST /_faux/inbound` : elle
+dépose le courrier qu'un tiers nous aurait écrit et rend l'`email_id` à mettre
+dans la livraison signée. C'est le seul endroit où ce fichier s'écarte du vrai,
+et le préfixe est là pour que ça se voie.
 
 **Il n'envoie rien.** C'est le fait, pas une précaution : chaque `POST /emails`
 est écrit dans le journal, une ligne de JSON par envoi, et rien ne quitte la
@@ -28,13 +35,28 @@ rendent le même id, et le second n'est pas journalisé. Sans ça une marche qui
 rejoue un pas de séquence lirait deux envois là où le produit n'en a fait qu'un.
 """
 
-import argparse, json, re, sys, threading, uuid
+import argparse, json, os, re, sys, threading, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 VERROU = threading.Lock()
 DOMAINES = {}  # id -> ligne
 PAR_CLE = {}  # Idempotency-Key -> id d'envoi
+COURRIER = {}  # id -> ce que `GET /emails/{id}` rend
 JOURNAL = None
+ETAT = None
+
+
+def retenir():
+    """Écrire l'état, s'il y a un fichier pour ça. Appelé sous VERROU.
+
+    Un vrai compte Resend ne perd pas ses domaines quand on redémarre quelque
+    chose. Sans ce fichier, relancer ce faux rendait 404 sur le
+    `provider_domain_id` que `tenant_domains` avait retenu, et la marche
+    s'arrêtait sur une panne que le vrai n'a pas.
+    """
+    if ETAT:
+        with open(ETAT, "w", encoding="utf-8") as f:
+            json.dump({"domaines": DOMAINES, "par_cle": PAR_CLE, "courrier": COURRIER}, f)
 
 
 def ligne_domaine(nom, statut):
@@ -117,8 +139,10 @@ class Faux(BaseHTTPRequestHandler):
             with VERROU:
                 d = DOMAINES.get(m.group(1))
             return self._rendre(200, d) if d else self._rendre(404, {"message": "Not found"})
-        if re.fullmatch(r"/emails/[0-9a-f-]+", self.path):
-            return self._rendre(404, {"message": "Not found"})
+        if m := re.fullmatch(r"/emails/([0-9a-f-]+)", self.path):
+            with VERROU:
+                e = COURRIER.get(m.group(1))
+            return self._rendre(200, e) if e else self._rendre(404, {"message": "Not found"})
         self._rendre(404, {"message": "Not found"})
 
     def do_POST(self):
@@ -132,6 +156,7 @@ class Faux(BaseHTTPRequestHandler):
                         return self._rendre(200, d)
                 d = ligne_domaine(nom, "pending")
                 DOMAINES[d["id"]] = d
+                retenir()
             return self._rendre(201, d)
 
         if m := re.fullmatch(r"/domains/([0-9a-f-]+)/verify", self.path):
@@ -146,7 +171,29 @@ class Faux(BaseHTTPRequestHandler):
                 d["status"] = "verified"
                 for r in d["records"]:
                     r["status"] = "verified"
+                retenir()
             return self._rendre(200, {"object": "domain", "id": d["id"]})
+
+        if self.path == "/_faux/inbound":
+            # Le courrier d'un tiers, déposé à la main. Resend n'a pas cette
+            # route ; la boucle entrante, elle, lit `/emails/{id}` comme sur le
+            # vrai, donc rien du chemin mesuré n'est court-circuité.
+            c = self._corps()
+            eid = str(uuid.uuid4())
+            with VERROU:
+                COURRIER[eid] = {
+                    "id": eid,
+                    "from": c.get("from", ""),
+                    "to": c.get("to", []),
+                    "subject": c.get("subject"),
+                    "text": c.get("text"),
+                    "html": None,
+                    "created_at": c.get("created_at"),
+                    "attachments": [],
+                    "headers": [{"name": "From", "value": c.get("from", "")}],
+                }
+                retenir()
+            return self._rendre(200, {"id": eid})
 
         if self.path == "/emails":
             corps = self._corps()
@@ -157,6 +204,21 @@ class Faux(BaseHTTPRequestHandler):
                 envoi_id = str(uuid.uuid4())
                 if cle:
                     PAR_CLE[cle] = envoi_id
+                # Relisible par `GET /emails/{id}`, comme chez Resend.
+                COURRIER[envoi_id] = {
+                    "id": envoi_id,
+                    "from": corps.get("from", ""),
+                    "to": corps.get("to", []),
+                    "subject": corps.get("subject"),
+                    "text": corps.get("text"),
+                    "html": None,
+                    "created_at": None,
+                    "attachments": [],
+                    "headers": [
+                        {"name": k, "value": v}
+                        for k, v in (corps.get("headers") or {}).items()
+                    ],
+                }
                 if JOURNAL:
                     with open(JOURNAL, "a", encoding="utf-8") as f:
                         f.write(
@@ -174,18 +236,27 @@ class Faux(BaseHTTPRequestHandler):
                             )
                             + "\n"
                         )
+                retenir()
             return self._rendre(200, {"id": envoi_id})
 
         self._rendre(404, {"message": "Not found"})
 
 
 def main():
-    global JOURNAL
+    global JOURNAL, ETAT
     a = argparse.ArgumentParser(description=__doc__)
     a.add_argument("--port", type=int, default=0, help="0 = un port libre")
     a.add_argument("--journal", help="un JSON par envoi, en ajout")
+    a.add_argument("--etat", help="où retenir domaines et courrier entre deux lancements")
     args = a.parse_args()
     JOURNAL = args.journal
+    ETAT = args.etat
+    if ETAT and os.path.exists(ETAT):
+        with open(ETAT, encoding="utf-8") as f:
+            retrouve = json.load(f)
+        DOMAINES.update(retrouve.get("domaines", {}))
+        PAR_CLE.update(retrouve.get("par_cle", {}))
+        COURRIER.update(retrouve.get("courrier", {}))
 
     serveur = ThreadingHTTPServer(("127.0.0.1", args.port), Faux)
     # La seule ligne que le script qui le lance lit, et il la lit avant de
