@@ -6,7 +6,7 @@ qu'on lit `company_health_get` avant de croire un chiffre, qu'un import se fait 
 blanc d'abord, qu'une action d'approbation se recopie octet par octet.
 
 Ce plugin est cette moitié manquante. Une commande d'installation, et le
-fondateur a **quatre gestes nommés** plutôt qu'un catalogue.
+fondateur a **cinq gestes nommés** plutôt qu'un catalogue.
 
 ---
 
@@ -20,7 +20,7 @@ fondateur a **quatre gestes nommés** plutôt qu'un catalogue.
 et, quand l'installateur demande la **clé d'API du locataire**, la coller.
 
 Vérifier : `/mcp` doit montrer `siglair` connecté, et `/help` (onglet *Custom
-commands*) les quatre gestes sous le préfixe `siglair:`.
+commands*) les cinq gestes sous le préfixe `siglair:`.
 
 Le dépôt est privé : `/plugin marketplace add` sur une source GitHub privée
 suppose un `gh` authentifié sur la machine du fondateur.
@@ -53,10 +53,10 @@ que pour viser un déploiement de recette. Il n'est pas sensible.
 **Si une version de Claude Code ne demande pas la clé à l'installation**, le
 chemin de repli est celui de `docs/MCP_SERVEUR.md` §2 — `claude mcp add
 --transport http siglair https://siglair.com/v1/mcp/server --header
-"Authorization: Bearer <clé>"` — et les quatre skills fonctionnent par-dessus
+"Authorization: Bearer <clé>"` — et les cinq skills fonctionnent par-dessus
 sans changement, puisqu'ils ne nomment que des outils.
 
-## 3. Les quatre gestes
+## 3. Les cinq gestes
 
 Un geste n'est pas une liste d'outils : il dit **dans quel ordre** appeler, ce
 qu'on lit entre deux étapes, et ce qu'il ne faut jamais faire. Chacun porte une
@@ -68,6 +68,7 @@ phrase de garde.
 | **`lancer-une-campagne`** | de l'import d'une liste au premier envoi | Jamais `sequences_enroll` avant que `domains_primary_get` ait rendu le domaine **vérifié**. |
 | **`repondre-aux-demandes`** | vider la file humaine | Ne jamais reformuler l'action d'une approbation ; ne jamais approuver sa propre demande. |
 | **`embaucher`** | un siège, sa place, sa charte, ses limites | `policy_role_set` est un document entier : un champ manquant est un retrait. |
+| **`monter-la-societe`** | « monte-moi l'entreprise », depuis rien | Jamais `org_apply` sur une société neuve : il embauche sans poser une seule couche de limites. |
 
 **`point-du-jour`** — **six appels, parcourus pour la première fois le
 2026-09-12** sur une société neuve, une qui tourne et une à l'arrêt. Il en
@@ -118,10 +119,10 @@ l'autre n'est une limite —, `policy_role_get` puis `policy_role_set` et
 `spend_caps_set` pour les limites, et enfin `employees_get` + `controls_get`
 pour vérifier qu'il s'est provisionné.
 
-## 4. Les trois commandes courtes
+## 4. Les quatre commandes courtes
 
-`plugin/commands/{point,campagne,demandes}.md` donnent une invocation brève avec
-un argument. **Elles ne s'appellent pas `/siglair-point`** : la documentation dit
+`plugin/commands/{point,campagne,demandes,societe}.md` donnent une invocation
+brève avec un argument. **Elles ne s'appellent pas `/siglair-point`** : la documentation dit
 que les skills d'un plugin sont *toujours* namespacés `/<nom-du-plugin>:<nom>`,
 et il n'existe aucun champ pour changer le séparateur. La forme atteignable la
 plus proche est donc, le plugin s'appelant `siglair` :
@@ -130,13 +131,15 @@ plus proche est donc, le plugin s'appelant `siglair` :
 /siglair:point 7d
 /siglair:campagne agences-marketing
 /siglair:demandes
+/siglair:societe Orizn
 ```
 
-Les quatre gestes complets restent invocables directement —
+Les cinq gestes complets restent invocables directement —
 `/siglair:point-du-jour`, `/siglair:lancer-une-campagne`,
-`/siglair:repondre-aux-demandes`, `/siglair:embaucher` — et les trois gestes de
+`/siglair:repondre-aux-demandes`, `/siglair:embaucher`,
+`/siglair:monter-la-societe` — et les trois gestes de
 lecture-décision sont aussi choisis tout seuls par le modèle quand la question
-les appelle. Les trois commandes courtes portent `disable-model-invocation:
+les appelle. Les quatre commandes courtes portent `disable-model-invocation:
 true` pour ne pas doubler les skills dans ce choix.
 
 ## 5. L'arborescence, et pourquoi le marketplace est à la racine
@@ -147,7 +150,9 @@ plugin/
   .claude-plugin/plugin.json         ← le manifeste, dont userConfig
   .mcp.json                          ← le serveur siglair, en http
   skills/{point-du-jour,lancer-une-campagne,repondre-aux-demandes,embaucher}/SKILL.md
-  commands/{point,campagne,demandes}.md
+  skills/monter-la-societe/SKILL.md
+  skills/monter-la-societe/gabarits/*.json   ← les limites que le geste recopie
+  commands/{point,campagne,demandes,societe}.md
 ```
 
 Le `marketplace.json` **doit** être à `<racine-du-dépôt>/.claude-plugin/` : c'est
@@ -185,7 +190,7 @@ python3 scripts/verifier-plugin.py
 
 Vérifié par ce script : chaque JSON parse, chaque `SKILL.md` porte un
 frontmatter délimité dont tous les champs sont documentés et dont le `name`
-correspond à son dossier, **chacun des 64 outils nommés par les quatre gestes
+correspond à son dossier, **chacun des 68 outils nommés par les cinq gestes
 existe encore dans `crates/app/src/mcp_tools/`**, aucun fichier ne contient
 `sk-`, `re_`, `whsec_` ni un `Bearer ` suivi d'un jeton, et la `source` du
 marketplace mène à un manifeste dont le nom correspond.
