@@ -3022,6 +3022,81 @@ mod tests {
     /// derived from `ActionKind::ALL`: a *future* arm answering `RequireApproval`
     /// for a `Risk::Low` action would slip past the wire unseen here.
     /// `domain::policy`'s own suite owns that half.
+    /// **The other half of the test below, and the one it says it cannot see.**
+    ///
+    /// `an_untrusted_turn_puts_no_line_in_the_approval_queue` proves a hostile
+    /// page cannot file a *high-risk* row, and names its own blind spot: a
+    /// low-risk arm that escalates would slip past it. There is one now, and it
+    /// is deliberate — `PolicyLimits::untrusted_email_needs_approval`, whose
+    /// whole purpose is to put a row in that queue for exactly the turns the
+    /// other test wants kept out of it.
+    ///
+    /// The two are not in conflict, and the difference is what the escalation
+    /// replaces. High risk: a refusal, so a row is a new path. An email: the
+    /// mail leaving, so a row is a path removed. `domain::policy::evaluate`
+    /// carries that argument beside the wire; this asserts the consequence
+    /// against the real table, which is where it can actually be wrong.
+    #[tokio::test]
+    async fn a_tainted_email_puts_exactly_one_line_in_the_queue_when_the_policy_asks() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+        let gate = with_policy(
+            &db,
+            &principal,
+            Scope::Tenant,
+            &PolicyLimits {
+                untrusted_email_needs_approval: true,
+                ..limits()
+            },
+        )
+        .await;
+
+        let action = email("claire@voyages-lambda.example");
+
+        // Trusted first: the first touch of a sequence is not what waits.
+        gate.authorize(&principal, action.clone())
+            .await
+            .expect("our own words still go");
+        assert_eq!(queued(&db, &principal).await, 0);
+
+        // And the reply — a turn that read their mail.
+        let err = gate
+            .authorize(&principal, Untrusted::new(action))
+            .await
+            .expect_err("a tainted email does not simply go");
+        let Denied::PendingApproval(id) = err else {
+            panic!("expected a human in the path, got {err:?}");
+        };
+        assert_eq!(
+            queued(&db, &principal).await,
+            1,
+            "one email, one line — no amplification over what would have been sent"
+        );
+
+        // The row is the email's, and it carries no letter yet: the gate rules
+        // on an address and never sees a `RenderedEmail`. `app::turn` is what
+        // puts the words on it, and `routes::approvals` refuses to send a row
+        // that has none.
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let (kind, draft): (String, Option<serde_json::Value>) =
+            sqlx::query_as("SELECT action_kind, action->'draft' FROM approvals WHERE id = $1")
+                .bind(id.as_uuid())
+                .fetch_one(&mut **tx)
+                .await
+                .expect("the row");
+        tx.commit().await.expect("commit");
+        assert_eq!(kind, "email_send");
+        assert!(draft.is_none(), "the gate invented a letter it never saw");
+
+        // And the field is what decides: the same turn, a policy that is silent.
+        let quiet = with_policy(&db, &principal, Scope::Tenant, &limits()).await;
+        quiet
+            .authorize(&principal, Untrusted::new(email("someone@else.example")))
+            .await
+            .expect("a policy that does not ask does not queue");
+        assert_eq!(queued(&db, &principal).await, 1);
+    }
+
     #[tokio::test]
     async fn an_untrusted_turn_puts_no_line_in_the_approval_queue() {
         let Some(db) = db().await else { return };

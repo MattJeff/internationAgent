@@ -866,7 +866,11 @@ async fn letter(
     // row, the day's contact slot and the sending domain are the seat's, and
     // the approver is already on the gate's own row for this `decision_id` as
     // the actor that redeemed it.
-    let effects = Effects::new(state.db.clone(), state.ports.clone(), gate_principal.clone());
+    let effects = Effects::new(
+        state.db.clone(),
+        state.ports.clone(),
+        gate_principal.clone(),
+    );
     let rendered = RenderedEmail {
         // Off the deployment's configuration, never off the row: an approval
         // does not get to choose who this company is.
@@ -2049,6 +2053,133 @@ mod tests {
         assert_eq!(answer["code"], json!("role_required"));
 
         assert_eq!(state_of(&db, tenant, id).await, "pending");
+    }
+
+    // -- the letter --------------------------------------------------------
+
+    /// **What a founder actually reads, and what leaves when they say yes.**
+    ///
+    /// The whole point of escalating an email is that validating it means
+    /// something, and it only means something if the words are on the screen
+    /// and the words that are sent are those words. Three claims, in order:
+    ///
+    /// 1. the queue renders `to`, `subject` and `body`;
+    /// 2. approving sends **exactly** those, to the address that was hashed;
+    /// 3. an approval with no draft is refused and stays `pending`, because an
+    ///    approval nobody could read is not an approval.
+    ///
+    /// The row is filed by hand rather than by asking the gate, for the reason
+    /// `an_approval_no_evaluator_ever_ruled_on_is_still_redeemable` gives: what
+    /// is under test is this route, and `crates/domain`'s
+    /// `a_tainted_email_reaches_a_human_and_the_taint_wire_lets_it` owns the
+    /// half about when the gate escalates.
+    #[tokio::test]
+    async fn approving_a_letter_sends_the_letter_that_was_shown() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db).await;
+        // Sans domaine verifie, `pick_from` rend `Exhausted` et rien ne part.
+        agentos_app::sending_domain::adopt_for_tests(&db, tenant).await;
+
+        let to = "claire@voyages-lambda.example";
+        let action = Action::EmailSend {
+            to: to.parse().expect("an address"),
+        };
+        let subject = "Vos formalites d'entree";
+        let body = "Bonjour Claire, voici ce que nous avons vu. - le vendeur";
+
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let filed = agentos_store::approvals::create(
+            &mut tx,
+            &agentos_store::approvals::NewApproval {
+                employee_id: Some(employee),
+                action: &action,
+                requested_by: "seat",
+                required_role: "approver",
+                reason: Some("email - drafted in a turn that read outside text"),
+                expires_at: now + chrono::Duration::hours(24),
+            },
+            now,
+        )
+        .await
+        .expect("file");
+        let id = filed.id();
+        agentos_store::approvals::attach_draft(
+            &mut tx,
+            id,
+            &json!({ "to": to, "subject": subject, "body": body }),
+        )
+        .await
+        .expect("attach the draft");
+        tx.commit().await.expect("commit");
+
+        // 1. The queue shows the letter.
+        let email_port = Arc::new(agentos_app::mocks::MockEmailProvider::new());
+        let ports = Ports {
+            email: email_port.clone(),
+            ..agentos_app::mocks::ports()
+        };
+        let gate = PolicyGate::new(db.clone());
+        let app = mount_ports(&db, &gate, keys(tenant, "approver", SECRET), ports);
+        let (status, queue) = call(&app, "/v1/approvals", SECRET, None).await;
+        assert_eq!(status, StatusCode::OK, "{queue}");
+        let draft = &queue["approvals"][0]["draft"];
+        assert_eq!(draft["to"], json!(to), "{queue}");
+        assert_eq!(draft["subject"], json!(subject), "{queue}");
+        assert_eq!(
+            draft["body"],
+            json!(body),
+            "a queue that shows no body is a button nobody can press honestly: {queue}"
+        );
+
+        // 2. Approving sends those words and no others. The body of the request
+        //    carries only the action - there is nowhere in it to put prose.
+        let uri = format!("/v1/approvals/{}/approve", id.as_uuid());
+        let (status, answer) = call(&app, &uri, SECRET, Some(json!({ "action": &action }))).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["state"], json!("redeemed"), "{answer}");
+
+        let sent = email_port.sent_emails();
+        assert_eq!(sent.len(), 1, "one approval, one letter");
+        assert_eq!(sent[0].to, vec![to.to_owned()]);
+        assert_eq!(sent[0].subject, subject);
+        assert_eq!(
+            sent[0].body_text, body,
+            "the letter that left is not the letter that was approved"
+        );
+
+        // 3. And one with no draft is refused rather than sent empty.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let mute = agentos_store::approvals::create(
+            &mut tx,
+            &agentos_store::approvals::NewApproval {
+                employee_id: Some(employee),
+                action: &action,
+                requested_by: "seat",
+                required_role: "approver",
+                reason: Some("email"),
+                expires_at: now + chrono::Duration::hours(24),
+            },
+            now,
+        )
+        .await
+        .expect("file");
+        tx.commit().await.expect("commit");
+
+        let uri = format!("/v1/approvals/{}/approve", mute.id().as_uuid());
+        let (status, answer) = call(&app, &uri, SECRET, Some(json!({ "action": &action }))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+        assert_eq!(answer["code"], json!("approval_has_no_draft"), "{answer}");
+        assert_eq!(
+            state_of(&db, tenant, mute.id()).await,
+            "pending",
+            "a row nobody could read was burned instead of being left alone"
+        );
+        assert_eq!(
+            email_port.sent_count(),
+            1,
+            "a draftless approval sent something"
+        );
     }
 
     // -- deny --------------------------------------------------------------

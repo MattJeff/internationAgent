@@ -2018,7 +2018,9 @@ fn performed<T>(
 macro_rules! gated {
     // The ordinary spelling: a refusal becomes the string the model reads.
     ($self:ident, $trust:expr, $origin:expr, $subject:expr, |$ok:ident| $effect:expr) => {
-        gated!($self, $trust, $origin, $subject, |$ok| $effect, |denied| refusal(denied))
+        gated!($self, $trust, $origin, $subject, |$ok| $effect, |denied| {
+            refusal(denied)
+        })
     };
     // …and the same gate, with something to do on the way out. One arm has it
     // — the email, which has to leave its draft on the approval row the gate

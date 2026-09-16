@@ -1775,9 +1775,7 @@ fn evaluate_rules(policy: &EffectivePolicy, action: &Action, ctx: &ActionCtx) ->
                         // stranger's text, and an unquoted one would let it
                         // dress itself up as the rest of the sentence in the
                         // founder's queue.
-                        summary: format!(
-                            "email {to:?} — drafted in a turn that read outside text"
-                        ),
+                        summary: format!("email {to:?} — drafted in a turn that read outside text"),
                     }
                 }
                 None => Decision::Allow,
