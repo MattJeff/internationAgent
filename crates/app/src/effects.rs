@@ -56,6 +56,7 @@ use agentos_providers::email::{
     EmailProvider, OutboundAttachment, OutboundEmail, ProviderMessageId,
 };
 use agentos_providers::leads::{self as leads, LeadSink};
+use agentos_providers::mail_domain::MailDomains;
 use agentos_providers::telephony::{
     OpenWindow, OutboundCall, OutboundSms, OutboundWhatsapp, TelephonyProvider,
 };
@@ -1351,6 +1352,15 @@ pub struct Ports {
     pub browser: Arc<dyn BrowserProvider>,
     /// MCP tool calls.
     pub mcp: Arc<dyn McpCaller>,
+    /// Le DNS, pour une seule question : ce domaine accepte-t-il du courrier ?
+    ///
+    /// Un port et pas un client construit sur place, pour la raison qui vaut
+    /// pour tous les autres — un test ne touche pas le réseau — et pour une de
+    /// plus : le cache est **dans** l'instance, au TTL de chaque
+    /// enregistrement, donc une liste de mille adresses sur trois cents
+    /// domaines ne pose trois cents questions que si tout le processus partage
+    /// le même résolveur. Voir [`agentos_providers::mail_domain`].
+    pub mail_domains: Arc<dyn MailDomains>,
     /// Payments.
     pub payments: Arc<dyn PaymentProvider>,
 }
@@ -2526,9 +2536,16 @@ impl Effects {
             // euro plutôt que « une découverte ».
             source: Some(url.as_str()),
         };
-        let report = crate::prospects::discover(&mut tx, &list, &page, Utc::now(), budget)
-            .await
-            .map_err(discovery_error)?;
+        let report = crate::prospects::discover(
+            &mut tx,
+            &list,
+            self.ports.mail_domains.as_ref(),
+            &page,
+            Utc::now(),
+            budget,
+        )
+        .await
+        .map_err(discovery_error)?;
         tx.commit().await.map_err(EffectError::Unavailable)?;
         Ok(report)
     }
@@ -4355,6 +4372,7 @@ mod tests {
 
     use super::*;
     use crate::gate::{Denied, PolicyGate};
+    use agentos_providers::mail_domain::MockMailDomains;
 
     // -- test doubles for the two ports that have no adapter ---------------
 
@@ -4715,6 +4733,7 @@ mod tests {
             mcp: Arc::new(StubMcp),
             payments,
             leads,
+            mail_domains: Arc::new(MockMailDomains::silent()),
         })
     }
 
@@ -4733,6 +4752,7 @@ mod tests {
             mcp: Arc::new(StubMcp),
             payments: MockPayments::healthy(),
             leads: Arc::new(MockLeadSink::new()),
+            mail_domains: Arc::new(MockMailDomains::silent()),
         })
     }
 
@@ -4752,6 +4772,7 @@ mod tests {
             mcp: Arc::new(StubMcp),
             payments: MockPayments::healthy(),
             leads: Arc::new(MockLeadSink::new()),
+            mail_domains: Arc::new(MockMailDomains::silent()),
         })
     }
 
@@ -6266,6 +6287,7 @@ mod tests {
                 mcp: Arc::new(StubMcp),
                 payments: MockPayments::healthy(),
                 leads: Arc::new(MockLeadSink::new()),
+                mail_domains: Arc::new(MockMailDomains::silent()),
             }),
             principal.clone(),
         );
@@ -8041,6 +8063,7 @@ mod tests {
                 mcp: Arc::new(StubMcp),
                 payments: MockPayments::healthy(),
                 leads: Arc::new(MockLeadSink::new()),
+                mail_domains: Arc::new(MockMailDomains::silent()),
             }),
             principal.clone(),
         );
@@ -8110,6 +8133,7 @@ mod tests {
                 mcp: Arc::new(StubMcp),
                 payments: MockPayments::healthy(),
                 leads: Arc::new(MockLeadSink::new()),
+                mail_domains: Arc::new(MockMailDomains::silent()),
             }),
             principal.clone(),
         );
@@ -8173,6 +8197,7 @@ mod tests {
                 mcp: Arc::new(StubMcp),
                 payments: MockPayments::healthy(),
                 leads: Arc::new(MockLeadSink::new()),
+                mail_domains: Arc::new(MockMailDomains::silent()),
             }),
             principal.clone(),
         );
@@ -8246,6 +8271,7 @@ mod tests {
                 mcp: Arc::new(StubMcp),
                 payments: MockPayments::healthy(),
                 leads: Arc::new(MockLeadSink::new()),
+                mail_domains: Arc::new(MockMailDomains::silent()),
             }),
             principal.clone(),
         );

@@ -33,6 +33,22 @@ chrono = { version = "0.4", features = ["serde"] }
 # two copies of rand_core for one 32-byte fill.
 ed25519-dalek = "2"
 hmac = "0.12"
+# `mail_domain` : demander au DNS si un domaine publie un serveur de courrier.
+# La seule résolution du dépôt jusqu'ici est `tokio::net::lookup_host` dans
+# `mcp::resolve_and_vet`, et elle ne peut pas servir : `getaddrinfo` n'a pas de
+# type d'enregistrement, il rend des adresses, jamais un MX. Ce qu'il faudrait
+# écrire à la main pour s'en passer : lire `/etc/resolv.conf`, sérialiser une
+# requête, marcher les pointeurs de compression d'une réponse **hostile**,
+# retomber en TCP sur un TC=1, et un cache qui honore le TTL de chaque
+# enregistrement. C'est un résolveur, pas quelques lignes, et le parseur est du
+# code qui lit des octets venus du réseau. hickory est le résolveur Rust de
+# référence (ex-trust-dns), pur Rust, sans dépendance C — et **sans ses
+# features par défaut** : ni DNSSEC ni DoH/DoT/DoQ, donc aucun rustls, aucun
+# quinn, aucun h3 de plus dans l'arbre. Il ne reste que `system-config`
+# (resolv.conf) et `tokio`.
+hickory-resolver = { version = "0.26", default-features = false, features = [
+  "system-config", "tokio",
+] }
 rand = "0.9"
 # PBKDF2 pour les mots de passe des comptes de console. Déjà dans le graphe de
 # compilation — rustls le tire par `sqlx/tls-rustls-ring` — donc cette ligne

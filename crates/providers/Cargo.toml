@@ -17,6 +17,7 @@ axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
 ed25519-dalek.workspace = true
+hickory-resolver.workspace = true
 hmac.workspace = true
 rand.workspace = true
 reqwest.workspace = true

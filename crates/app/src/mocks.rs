@@ -59,6 +59,7 @@ use agentos_providers::embedder::Embedder;
 use agentos_providers::embedder_openai::OpenAiEmbedder;
 use agentos_providers::llm_anthropic::AnthropicLlm;
 use agentos_providers::llm_cli::CliLlm;
+use agentos_providers::mail_domain::HickoryMailDomains;
 use agentos_providers::secrets::LocalEnvelopeSecretStore;
 use agentos_providers::telephony::{MockTelephony, TelephonyProvider};
 use agentos_providers::telephony_twilio::TwilioTelephony;
@@ -131,6 +132,10 @@ pub use agentos_providers::browser_observer::{BrowserObserver, NoopObserver};
 // send-path tests could construct the `Ports` but never read what reached the
 // platform — which is the only thing those tests are about.
 pub use agentos_providers::leads::MockLeadSink;
+/// Le port DNS, pour les appelants hors de ce crate : `apps/server` n'a pas
+/// `agentos-providers` dans son manifeste, et la sous-commande `import` a
+/// besoin d'un résolveur.
+pub use agentos_providers::mail_domain::{MailDomains, MockMailDomains};
 
 // And a receipt, for the fourth time and the same reason: `routes::approvals`
 // is the only caller of `Effects::pay`, and the test that has to prove a
@@ -520,6 +525,30 @@ impl UrlVet for PublicWeb {
     }
 }
 
+/// Le résolveur de domaines de courrier : celui du système, ou aucun.
+///
+/// Pas de credential à sélectionner — le DNS ne se paie pas, c'est tout
+/// l'argument du chantier. Ce qui se sélectionne, c'est l'existence d'une
+/// configuration DNS lisible : une machine qui n'en a pas obtient un résolveur
+/// **muet**, donc « je ne sais pas » à chaque question, donc aucune adresse
+/// écartée et un `prospects::Report::mx_unknown` qui le dit. Refuser de
+/// démarrer là-dessus échangerait un import non vérifié contre pas d'import.
+///
+/// **Une instance par processus**, parce que le cache vit dedans : voir
+/// [`agentos_providers::mail_domain`].
+pub fn mail_domains() -> Arc<dyn MailDomains> {
+    match HickoryMailDomains::from_system() {
+        Ok(resolver) => Arc::new(resolver),
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                "no system DNS configuration: prospect addresses are imported unchecked"
+            );
+            Arc::new(MockMailDomains::silent())
+        }
+    }
+}
+
 /// The embedder: the real client when there is a key, the SHA-256 hash when
 /// there is not.
 ///
@@ -668,6 +697,12 @@ pub fn ports() -> Ports {
         &Credentials::default(),
         "http://localhost",
         BrowserPorts::default(),
+        // Un résolveur muet, et c'est le bon défaut pour une fixture : chaque
+        // question rend « je ne sais pas », donc `prospects` écrit toutes les
+        // adresses et le dit dans `Report::mx_unknown`. Un test qui veut juger
+        // la vérification monte sa propre table
+        // (`MockMailDomains::accepting`) ; aucun ne parle au vrai DNS.
+        Arc::new(MockMailDomains::silent()),
     )
 }
 
@@ -697,8 +732,20 @@ pub fn ports() -> Ports {
 /// `crate::browser_profile::SpecBrowserProfiles` in a deployment and
 /// `DefaultProfiles` in a test — both of them database-shaped, and neither of
 /// them this module's to build.
-pub fn ports_for(credentials: &Credentials, public_host: &str, browser: BrowserPorts) -> Ports {
+///
+/// `mail_domains` est passé plutôt que choisi ici, pour la raison de `jar` :
+/// c'est une instance **partagée par tout le processus** — le cache DNS vit
+/// dedans — et ce module ne construit rien qui ait une durée de vie. Le
+/// déploiement passe [`agentos_providers::mail_domain::HickoryMailDomains`],
+/// un test passe une table.
+pub fn ports_for(
+    credentials: &Credentials,
+    public_host: &str,
+    browser: BrowserPorts,
+    mail_domains: Arc<dyn MailDomains>,
+) -> Ports {
     Ports {
+        mail_domains,
         email: email_provider(credentials, Some(public_host)),
         telephony: telephony_provider(credentials, Some(public_host)),
         browser: browser_provider(credentials, browser),
@@ -1254,12 +1301,17 @@ mod tests {
             "browser",
         );
         let provider_of = async |credentials: &Credentials| {
-            ports_for(credentials, "https://agents.test", BrowserPorts::default())
-                .browser
-                .ensure_context(&ctx)
-                .await
-                .expect("ensure")
-                .provider
+            ports_for(
+                credentials,
+                "https://agents.test",
+                BrowserPorts::default(),
+                Arc::new(MockMailDomains::silent()),
+            )
+            .browser
+            .ensure_context(&ctx)
+            .await
+            .expect("ensure")
+            .provider
         };
 
         assert_eq!(provider_of(&Credentials::default()).await, MOCK_PROVIDER);
@@ -1274,7 +1326,12 @@ mod tests {
             browser_fetch_http: true,
             ..Credentials::default()
         };
-        let ports = ports_for(&both, "https://agents.test", BrowserPorts::default());
+        let ports = ports_for(
+            &both,
+            "https://agents.test",
+            BrowserPorts::default(),
+            Arc::new(MockMailDomains::silent()),
+        );
         let existing = ProviderBinding {
             provider: agentos_providers::browser_browserbase::PROVIDER.to_owned(),
             external_id: "ctx_bb".to_owned(),
@@ -1322,12 +1379,17 @@ mod tests {
             })
         };
         let provider_of = async |credentials: &Credentials| {
-            ports_for(credentials, "https://agents.test", BrowserPorts::default())
-                .browser
-                .ensure_context(&ctx)
-                .await
-                .expect("ensure")
-                .provider
+            ports_for(
+                credentials,
+                "https://agents.test",
+                BrowserPorts::default(),
+                Arc::new(MockMailDomains::silent()),
+            )
+            .browser
+            .ensure_context(&ctx)
+            .await
+            .expect("ensure")
+            .provider
         };
 
         assert_eq!(
@@ -1360,12 +1422,17 @@ mod tests {
             external_id: "ctx_bb".to_owned(),
         };
         assert_eq!(
-            ports_for(&both, "https://agents.test", BrowserPorts::default())
-                .browser
-                .ensure_context(&ctx.clone().with_existing(existing))
-                .await
-                .expect("a persisted binding needs no round trip")
-                .provider,
+            ports_for(
+                &both,
+                "https://agents.test",
+                BrowserPorts::default(),
+                Arc::new(MockMailDomains::silent()),
+            )
+            .browser
+            .ensure_context(&ctx.clone().with_existing(existing))
+            .await
+            .expect("a persisted binding needs no round trip")
+            .provider,
             agentos_providers::browser_browserbase::PROVIDER
         );
     }
@@ -1388,7 +1455,12 @@ mod tests {
         };
         use agentos_providers::{EnsureCtx, ProviderBinding};
 
-        let real = ports_for(&live(), "https://agents.test", BrowserPorts::default());
+        let real = ports_for(
+            &live(),
+            "https://agents.test",
+            BrowserPorts::default(),
+            Arc::new(MockMailDomains::silent()),
+        );
         let mock = ports();
 
         // -- email: signed with a secret only Resend was handed -------------
@@ -1473,6 +1545,7 @@ mod tests {
             },
             "https://agents.test",
             BrowserPorts::default(),
+            Arc::new(MockMailDomains::silent()),
         );
         let ctx = EnsureCtx::new(
             agentos_domain::ids::TenantId::new_v7(Utc::now()),
@@ -1557,6 +1630,7 @@ mod tests {
             },
             "https://agents.test",
             BrowserPorts::default(),
+            Arc::new(MockMailDomains::silent()),
         );
         let body = br#"{"type":"email.received"}"#;
         let timestamp = Utc::now().timestamp().to_string();

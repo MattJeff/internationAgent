@@ -177,6 +177,7 @@ const SEALED_COLUMNS: &[(&str, &str)] = &[
     ("mcp_servers", "sealed_refresh_token"),
     ("mcp_oauth_flows", "sealed_verifier"),
     ("tenant_model_access", "sealed_key"),
+    ("tenant_stripe_access", "sealed_key"),
     ("webhook_endpoints", "sealed_secret"),
 ];
 

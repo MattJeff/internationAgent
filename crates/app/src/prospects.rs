@@ -63,7 +63,62 @@
 //! BEFORE trigger on `contacts` is still underneath refusing an active
 //! suppressed row whatever the statement thinks. The report counts them.
 //!
+//! # An address whose domain takes no mail does not become a row
+//!
+//! The check is [`agentos_providers::mail_domain`]: does this address's domain
+//! publish a mail exchanger? Three refusals in the founder's own lists are the
+//! reason — an agency that folded, a domain that lapsed, a `.at` that now
+//! redirects to a parking page — and the cost of keeping them is not a lost
+//! contact. **A list that bounces burns the sending domain.** `0094` runs
+//! Orizn's prospecting across two verified Resend domains under daily caps
+//! precisely so that no single one's reputation collapses, and a hard bounce
+//! is counted against the domain that sent it, by every filter, for weeks.
+//! `GET /v1/outreach/health` sees that only afterwards — both of its rates are
+//! `null` until a provider trace comes back.
+//!
+//! **Why here and not at the send.** [`crate::deliverability::check`] is at
+//! the wire, in [`crate::effects::Effects::send_email`], and its module header
+//! says why it can be: it is pure, and the body it judges *does not exist*
+//! before the send. An address exists at the import — this is the earliest
+//! moment the thing being judged is in our hands, and the rule is to judge at
+//! the earliest one. Two consequences follow and both are deliberate:
+//!
+//! * The send path acquires no new failure mode. A DNS lookup per outbound
+//!   mail would put a network dependency on the one path whose refusals must
+//!   be explicable, and a resolver outage would stop all prospecting while
+//!   looking like a policy refusal.
+//! * The verdict ages. A domain can lose its MX between the import and the
+//!   send, and this will not notice. That is a real gap, it is named in
+//!   `docs/CE_QUI_MANQUE.md`, and the thing that would tell us whether it
+//!   matters is a real bounce rate — which only a week of sending gives. The
+//!   upgrade is one call to the same port next to `deliverability::check`.
+//!
+//! The half-measure that costs nothing today: the check is **before** the
+//! upsert, so re-running the same file re-asks about every address, and the
+//! report of a second run names the domains that have died since the first.
+//! What it will not do is retire the row it already wrote — there is no column
+//! for "this address stopped resolving", and adding one is a migration that
+//! wants a real bounce rate behind it too.
+//!
+//! **Not knowing is not a refusal.** `mail_domain` returns `Err` for a
+//! resolver that did not answer, and this module writes the row anyway and
+//! counts it in [`Report::mx_unknown`]. A broken resolver that silently
+//! dropped 1,552 valid addresses would do more damage in one command than
+//! every bounce it prevents.
+//!
+//! ponytail: no per-run memo. The distinct domains of a thousand-row list
+//! repeat, and the deduplication is the resolver's own cache at each record's
+//! own TTL (`mail_domain::CACHE_ENTRIES`) — a hand-written map here would be a
+//! second cache with an invented lifetime. Share one
+//! [`agentos_providers::mail_domain::HickoryMailDomains`] per process and it
+//! is already done.
+//!
 //! # What it will not do
+//!
+//! **It will not talk to a mail server.** Whether the *mailbox* exists is one
+//! `RCPT TO` away and this will never make it: see
+//! [`agentos_providers::mail_domain`] for the three reasons, of which the
+//! first is that it is a solicitation and we refuse other people's.
 //!
 //! **It will not invent a first name.** 3,012 of 3,048 rows across every list
 //! have neither a first nor a last name, because they are `info@` and
@@ -168,6 +223,7 @@
 use agentos_domain::action::{Domain, EmailAddress};
 use agentos_domain::ids::EmployeeId;
 use agentos_domain::untrusted::Untrusted;
+use agentos_providers::mail_domain::MailDomains;
 use agentos_store::db::TenantTx;
 use agentos_store::revenue::{
     self as revenue_store, NewAccount, NewContact, RevenueError, Upserted,
@@ -296,6 +352,14 @@ pub struct Report {
     pub phones_dropped: usize,
     /// Rows carrying a `linkedin_profile`, which has no column anywhere.
     pub linkedin_dropped: usize,
+    /// Addresses whose domain takes no mail: no such domain, or no mail
+    /// exchanger. No row was written for any of them and each one is named in
+    /// [`Report::refused`] with which of the two it was.
+    pub no_mail_domain: usize,
+    /// Addresses the resolver would not answer for. **Written anyway**, and
+    /// counted so that an operator can tell "this list is clean" from "the
+    /// resolver was down and nothing was checked".
+    pub mx_unknown: usize,
     /// Contacts with no name at all — the September problem, counted.
     pub nameless: usize,
     /// Accounts created with [`UNKNOWN_COUNTRY`], their location kept verbatim.
@@ -320,6 +384,21 @@ impl Report {
             out.push_str(&format!(
                 "\n{} addresses are on the suppression list and were skipped",
                 self.suppressed
+            ));
+        }
+        if self.no_mail_domain > 0 {
+            out.push_str(&format!(
+                "\n{} addresses are on a domain that takes no mail and were \
+                 NOT imported; they are still in the CSV, and each one is \
+                 named below",
+                self.no_mail_domain
+            ));
+        }
+        if self.mx_unknown > 0 {
+            out.push_str(&format!(
+                "\n{} addresses were imported WITHOUT being checked: the \
+                 resolver did not answer for their domain",
+                self.mx_unknown
             ));
         }
         if self.nameless > 0 {
@@ -381,6 +460,7 @@ impl Report {
 pub async fn import(
     tx: &mut TenantTx<'_>,
     list: &List<'_>,
+    mx: &dyn MailDomains,
     text: &str,
     now: DateTime<Utc>,
 ) -> Result<Report, ImportError> {
@@ -446,6 +526,13 @@ pub async fn import(
                 continue;
             }
         };
+
+        if let Some(why) = no_mail_here(mx, &address, &mut report).await {
+            report
+                .refused
+                .push(format!("line {line}: {address}: {why}"));
+            continue;
+        }
 
         let account = revenue_store::upsert_account(
             tx,
@@ -554,6 +641,7 @@ pub async fn import(
 pub async fn discover(
     tx: &mut TenantTx<'_>,
     list: &List<'_>,
+    mx: &dyn MailDomains,
     page: &Untrusted<String>,
     now: DateTime<Utc>,
     budget: u32,
@@ -589,6 +677,15 @@ pub async fn discover(
                 found.len() - n
             ));
             break;
+        }
+
+        // Une page d'annuaire vit plus longtemps que ses membres : l'adresse
+        // est imprimée, l'association a fermé. Même refus qu'à l'import, même
+        // compteur, et la ligne du rapport ne nomme que l'adresse — un numéro
+        // de ligne n'existe pas ici.
+        if let Some(why) = no_mail_here(mx, address, &mut report).await {
+            report.refused.push(format!("{address}: {why}"));
+            continue;
         }
 
         let domain = address.domain();
@@ -658,6 +755,36 @@ pub async fn discover(
     }
 
     Ok(report)
+}
+
+/// Ask the DNS whether this address's domain takes mail, and say what the
+/// caller must do about it.
+///
+/// `Some(reason)` — do not write this address, and put the reason in the
+/// report. `None` — write it, which includes the case where the resolver said
+/// nothing at all: that bumps [`Report::mx_unknown`] and the row lands. See
+/// the module header for why a silent resolver must not refuse anybody.
+///
+/// Called after the cheap refusals of each loop, so a row that is going to be
+/// refused for having no company costs no DNS question.
+async fn no_mail_here(
+    mx: &dyn MailDomains,
+    address: &EmailAddress,
+    report: &mut Report,
+) -> Option<&'static str> {
+    match mx.lookup(address.domain().as_str()).await {
+        Ok(verdict) if verdict.accepts() => None,
+        Ok(verdict) => {
+            report.no_mail_domain += 1;
+            // Our sentence, from a closed set — see [`MailDomain::reason`].
+            // Nothing a nameserver wrote goes into a report a model may read.
+            Some(verdict.reason())
+        }
+        Err(_) => {
+            report.mx_unknown += 1;
+            None
+        }
+    }
 }
 
 /// The two things a [`List`] says that the source cannot, checked before any
@@ -836,6 +963,7 @@ fn push(record: &mut [String], c: char) {
 #[cfg(test)]
 mod tests {
     use agentos_domain::ids::TenantId;
+    use agentos_providers::mail_domain::{MailDomain, MockMailDomains};
     use agentos_store::db::Db;
 
     use super::*;
@@ -847,6 +975,14 @@ mod tests {
     /// bytes `crate::queue`'s tests assert the export against, so the import and
     /// the export are proved against one file rather than two copies of one.
     const REAL: &str = include_str!("../tests/fixtures/smartlead_getorizn_prospection.csv");
+
+    /// A resolver for the tests whose subject is not the resolver: every domain
+    /// takes mail, so each of them reads exactly as it did before the check
+    /// existed. The ones that *are* about it build their own table, and no test
+    /// in this module asks the real DNS anything.
+    fn anywhere() -> MockMailDomains {
+        MockMailDomains::everywhere()
+    }
 
     // -- the parser --------------------------------------------------------
 
@@ -1056,7 +1192,7 @@ mod tests {
         let now = Utc::now().trunc_subsecs(6);
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
 
-        let report = import(&mut tx, &insurers(), REAL, now)
+        let report = import(&mut tx, &insurers(), &anywhere(), REAL, now)
             .await
             .expect("import");
         assert_eq!(report.rows, 3);
@@ -1168,12 +1304,15 @@ mod tests {
         let now = Utc::now();
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
 
-        let first = import(&mut tx, &insurers(), REAL, now).await.expect("one");
+        let first = import(&mut tx, &insurers(), &anywhere(), REAL, now)
+            .await
+            .expect("one");
         let before = (accounts(&mut tx).await, contacts(&mut tx).await);
 
         let second = import(
             &mut tx,
             &insurers(),
+            &anywhere(),
             REAL,
             now + chrono::TimeDelta::hours(1),
         )
@@ -1225,7 +1364,7 @@ mod tests {
         .await
         .expect("suppress");
 
-        let report = import(&mut tx, &insurers(), REAL, now)
+        let report = import(&mut tx, &insurers(), &anywhere(), REAL, now)
             .await
             .expect("import");
         assert_eq!(report.suppressed, 1);
@@ -1255,7 +1394,7 @@ mod tests {
         .await
         .expect("suppress");
 
-        let again = import(&mut tx, &insurers(), REAL, now)
+        let again = import(&mut tx, &insurers(), &anywhere(), REAL, now)
             .await
             .expect("again");
         assert_eq!(again.suppressed, 2, "both of them, now");
@@ -1287,6 +1426,134 @@ mod tests {
         drop_tenant(&db, tenant).await;
     }
 
+    /// La marche du chantier : un import dont le rapport **nomme** les adresses
+    /// écartées et dit pourquoi, sur les quatre réponses que le DNS sait
+    /// donner.
+    #[tokio::test]
+    async fn the_report_names_every_address_whose_domain_takes_no_mail() {
+        let Some(db) = db().await else { return };
+        let tenant = seed_tenant(&db).await;
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+
+        // Quatre lignes, quatre réponses. Les deux dernières sont la forme que
+        // prennent les vraies : une agence qui a fermé et dont le nom est
+        // retombé, et un domaine garé qui répond en A sans jamais avoir eu de
+        // MX.
+        let list = format!(
+            "{}\r\n\
+             office@oesterreichreisen.at,,,Oesterreich Reisen,,https://oesterreichreisen.at,,Austria\r\n\
+             info@reisehaus.at,,,Reisehaus,,https://reisehaus.at,,Austria\r\n\
+             bd@ferme-en-2019.example,,,Ferme En 2019,,https://ferme-en-2019.example,,France\r\n\
+             contact@domaine-gare.example,,,Domaine Gare,,https://domaine-gare.example,,France\r\n",
+            COLUMNS[..8].join(",")
+        );
+        // `reisehaus.at` ne répond pas — un SERVFAIL, une panne de résolveur —
+        // et c'est la ligne qui doit quand même être écrite.
+        let mx = MockMailDomains::accepting(&["oesterreichreisen.at"])
+            .unreachable("reisehaus.at")
+            .with("ferme-en-2019.example", MailDomain::NoSuchDomain)
+            .with("domaine-gare.example", MailDomain::NoMailExchanger);
+
+        let list_of = List {
+            segment: "other",
+            country: "AT",
+            employee_id: None,
+            source: Some(LISTE),
+        };
+        let report = import(&mut tx, &list_of, &mx, &list, now)
+            .await
+            .expect("import");
+
+        assert_eq!(report.rows, 4);
+        assert_eq!(
+            report.contacts_created, 2,
+            "celle qui accepte, et celle dont on ne sait rien"
+        );
+        assert_eq!(report.no_mail_domain, 2);
+        assert_eq!(report.mx_unknown, 1, "un résolveur muet n'écarte personne");
+        assert_eq!(
+            report.refused,
+            vec![
+                "line 4: bd@ferme-en-2019.example: the domain does not exist (NXDOMAIN)".to_owned(),
+                "line 5: contact@domaine-gare.example: the domain publishes no mail exchanger"
+                    .to_owned(),
+            ],
+            "chaque adresse écartée est nommée avec sa raison"
+        );
+
+        // Et le rapport que l'opérateur lit, en toutes lettres.
+        let summary = report.summary();
+        assert!(
+            summary.contains("2 addresses are on a domain that takes no mail"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("1 addresses were imported WITHOUT being checked"),
+            "un import non vérifié ne se tait pas : {summary}"
+        );
+        assert!(
+            summary.contains("ferme-en-2019") && summary.contains("domaine-gare"),
+            "{summary}"
+        );
+
+        // Et rien n'a été écrit pour elles : ni le contact, ni l'entreprise.
+        assert_eq!(contacts(&mut tx).await.len(), 2);
+        assert_eq!(
+            accounts(&mut tx)
+                .await
+                .into_iter()
+                .map(|account| account.1)
+                .collect::<Vec<_>>(),
+            vec!["oesterreichreisen.at", "reisehaus.at"],
+            "une entreprise dont personne ne peut recevoir de courrier n'est pas \
+             une ligne de pipeline"
+        );
+
+        tx.rollback().await.expect("rollback");
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// La même règle à l'autre porte : une page d'annuaire vit plus longtemps
+    /// que ses membres.
+    #[tokio::test]
+    async fn a_directory_address_on_a_dead_domain_is_not_discovered() {
+        let Some(db) = db().await else { return };
+        let tenant = seed_tenant(&db).await;
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+
+        // La page en porte trois : une vivante, une dont le domaine n'a plus de
+        // serveur de courrier, une dont le résolveur ne dit rien.
+        let mx = MockMailDomains::accepting(&["oesterreichreisen.at"])
+            .with("reisehaus.at", MailDomain::NoMailExchanger)
+            .unreachable("qilutravel.com");
+        let report = discover(&mut tx, &associations(), &mx, &directory(), now, 50)
+            .await
+            .expect("discover");
+
+        assert_eq!(report.rows, 3, "les trois adresses de la page");
+        assert_eq!(report.contacts_created, 2);
+        assert_eq!(report.no_mail_domain, 1);
+        assert_eq!(report.mx_unknown, 1);
+        assert_eq!(
+            report.refused,
+            vec!["info@reisehaus.at: the domain publishes no mail exchanger".to_owned()],
+            "notre phrase, nos mots — pas un octet de ce que la page a écrit"
+        );
+        assert_eq!(
+            contacts(&mut tx)
+                .await
+                .into_iter()
+                .filter_map(|contact| contact.1)
+                .collect::<Vec<_>>(),
+            vec!["bd@qilutravel.com", "office@oesterreichreisen.at"]
+        );
+
+        tx.rollback().await.expect("rollback");
+        drop_tenant(&db, tenant).await;
+    }
+
     /// 0 of the 150 rows in the DMW list have a first name — they are `info@`
     /// inboxes. That is a fact to record, not a hole to fill.
     #[tokio::test]
@@ -1312,7 +1579,9 @@ mod tests {
             employee_id: None,
             source: None,
         };
-        let report = import(&mut tx, &list_of, &list, now).await.expect("import");
+        let report = import(&mut tx, &list_of, &anywhere(), &list, now)
+            .await
+            .expect("import");
         assert_eq!(report.contacts_created, 3);
         assert_eq!(report.nameless, 2);
         assert!(report.refused.is_empty(), "{:?}", report.refused);
@@ -1371,7 +1640,7 @@ mod tests {
             COLUMNS[..8].join(",")
         );
 
-        let report = import(&mut tx, &insurers(), &list, now)
+        let report = import(&mut tx, &insurers(), &anywhere(), &list, now)
             .await
             .expect("import");
         assert_eq!(report.rows, 6);
@@ -1431,7 +1700,7 @@ mod tests {
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
 
         let contexte = "email,segment,angle_email,score_global\r\na@b.com,ota,hi,9\r\n";
-        let err = import(&mut tx, &insurers(), contexte, now)
+        let err = import(&mut tx, &insurers(), &anywhere(), contexte, now)
             .await
             .expect_err("not a list");
         assert!(matches!(err, ImportError::Header(_)), "{err}");
@@ -1443,7 +1712,7 @@ mod tests {
             employee_id: None,
             source: None,
         };
-        let err = import(&mut tx, &wrong_segment, REAL, now)
+        let err = import(&mut tx, &wrong_segment, &anywhere(), REAL, now)
             .await
             .expect_err("bad segment");
         assert!(matches!(err, ImportError::Segment(_)), "{err}");
@@ -1454,7 +1723,7 @@ mod tests {
             employee_id: None,
             source: None,
         };
-        let err = import(&mut tx, &wrong_country, REAL, now)
+        let err = import(&mut tx, &wrong_country, &anywhere(), REAL, now)
             .await
             .expect_err("bad country");
         assert!(matches!(err, ImportError::Country(_)), "{err}");
@@ -1485,7 +1754,7 @@ mod tests {
                 employee_id: None,
                 source: None,
             };
-            let report = import(&mut tx, &list_of, &list, now)
+            let report = import(&mut tx, &list_of, &anywhere(), &list, now)
                 .await
                 .unwrap_or_else(|err| {
                     panic!("{segment} is not a segment this schema takes: {err}")
@@ -1575,7 +1844,7 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
         let now = Utc::now().trunc_subsecs(6);
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
 
-        let report = discover(&mut tx, &associations(), &directory(), now, 50)
+        let report = discover(&mut tx, &associations(), &anywhere(), &directory(), now, 50)
             .await
             .expect("discover");
         assert_eq!(report.rows, 3);
@@ -1670,6 +1939,7 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
         let second = discover(
             &mut tx,
             &associations(),
+            &anywhere(),
             &directory(),
             now + chrono::TimeDelta::hours(1),
             50,
@@ -1704,13 +1974,13 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
         let now = Utc::now();
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
 
-        import(&mut tx, &insurers(), REAL, now)
+        import(&mut tx, &insurers(), &anywhere(), REAL, now)
             .await
             .expect("import");
         let named: Vec<String> = accounts(&mut tx).await.into_iter().map(|a| a.0).collect();
         assert!(named.contains(&"漫游网 Qilu".to_owned()), "{named:?}");
 
-        let report = discover(&mut tx, &associations(), &directory(), now, 50)
+        let report = discover(&mut tx, &associations(), &anywhere(), &directory(), now, 50)
             .await
             .expect("discover");
         assert_eq!(
@@ -1817,7 +2087,7 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
         // Before: on the list already, and a page that names them changes
         // nothing.
         stop(&mut tx, "office@oesterreichreisen.at").await;
-        let report = discover(&mut tx, &associations(), &directory(), now, 50)
+        let report = discover(&mut tx, &associations(), &anywhere(), &directory(), now, 50)
             .await
             .expect("discover");
         assert_eq!(report.suppressed, 1);
@@ -1831,7 +2101,7 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
 
         // After: someone who opts out between two reads of the same directory.
         stop(&mut tx, "info@reisehaus.at").await;
-        let again = discover(&mut tx, &associations(), &directory(), now, 50)
+        let again = discover(&mut tx, &associations(), &anywhere(), &directory(), now, 50)
             .await
             .expect("again");
         assert_eq!(again.suppressed, 2);
@@ -1876,7 +2146,7 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
                 .to_owned(),
         );
 
-        let report = discover(&mut tx, &associations(), &hostile, now, 50)
+        let report = discover(&mut tx, &associations(), &anywhere(), &hostile, now, 50)
             .await
             .expect("discover");
         assert_eq!(report.contacts_created, 2);
@@ -1947,7 +2217,7 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
         // Zero: the shipped default. Nothing is written and the reason is said
         // out loud rather than the page coming back empty.
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let refused = discover(&mut tx, &associations(), &directory(), now, 0)
+        let refused = discover(&mut tx, &associations(), &anywhere(), &directory(), now, 0)
             .await
             .expect("discover");
         assert_eq!(refused.rows, 3, "the page was still read");
@@ -1965,7 +2235,7 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
 
         // Two, over a page of three: two land, the third is named as not landed.
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        let partial = discover(&mut tx, &associations(), &directory(), now, 2)
+        let partial = discover(&mut tx, &associations(), &anywhere(), &directory(), now, 2)
             .await
             .expect("discover");
         assert_eq!(partial.contacts_created, 2);
@@ -1987,7 +2257,7 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
         // budget twice by reading two pages. It stops at the first address
         // rather than at the first *new* one, which is the conservative
         // direction and what the refusal sentence says.
-        let spent = discover(&mut tx, &associations(), &directory(), now, 2)
+        let spent = discover(&mut tx, &associations(), &anywhere(), &directory(), now, 2)
             .await
             .expect("discover");
         assert!(!spent.wrote_anything(), "{spent:?}");
@@ -2002,9 +2272,16 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
 
         // Tomorrow is a new day, on the same rows.
         let tomorrow = now + chrono::TimeDelta::days(1);
-        let fresh = discover(&mut tx, &associations(), &directory(), tomorrow, 2)
-            .await
-            .expect("discover");
+        let fresh = discover(
+            &mut tx,
+            &associations(),
+            &anywhere(),
+            &directory(),
+            tomorrow,
+            2,
+        )
+        .await
+        .expect("discover");
         assert_eq!(fresh.contacts_created, 1, "the third one, at last");
         assert!(fresh.refused.is_empty(), "{:?}", fresh.refused);
 
@@ -2028,7 +2305,7 @@ Head office: not-an-address, telephone +43 1 5871581, ask for @reception\n";
             employee_id: None,
             source: None,
         };
-        let err = discover(&mut tx, &wrong, &directory(), now, 50)
+        let err = discover(&mut tx, &wrong, &anywhere(), &directory(), now, 50)
             .await
             .expect_err("bad segment");
         assert!(matches!(err, ImportError::Segment(_)), "{err}");

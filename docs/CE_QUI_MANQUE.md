@@ -123,6 +123,17 @@ La livraison sortante laisse aussi ses traces depuis `0091` : `delivered`,
 `opened`, `clicked` lus de Resend, en plus de `bounced` et `complained` qui
 finissent dans `suppressions`.
 
+Et depuis le 2026-09-13, **le fondateur peut lire ce qui est arrivé**. Ça
+paraît acquis et ça ne l'était pas : tout ce qui précède marchait, et aucune
+route ne rendait un `messages.body` — le seul `SELECT` d'un corps dans l'arbre
+était celui du bureau interne. Une campagne partie était donc une campagne
+aveugle : des ouvertures, des clics, un compteur de fils qui ont répondu, et
+pas une phrase. `GET /v1/conversations` (`conversations_list`) rend les fils où
+quelqu'un du dehors a écrit, avec un extrait ; `GET /v1/conversations/{id}`
+(`conversations_get`) rend le fil dans les deux sens. Lecture seule des deux
+côtés : répondre reste un acte d'employé, derrière la Gate, pour la raison que
+`routes::quotes` écrit sur son propre refus d'une route d'opérateur.
+
 ### 2.3 Les statistiques de tout
 
 C'est, à ma lecture, la partie la mieux faite du produit, et celle qu'un
@@ -258,13 +269,46 @@ Et c'est le seul des trois qui vise le vrai coût : une liste qui rebondit ne
 coûte pas des contacts perdus, elle brûle **le domaine d'envoi**, et
 `outreach_health_get` ne le voit qu'après.
 
-**Recommandé — et pas maintenant.** La raison est celle que § 7 oppose déjà à
-la recherche elle-même : *ouvrir le robinet avant d'avoir mesuré, c'est ajouter
-avant de mesurer*. On n'a **aucun taux de rebond d'une semaine réelle** — les
-deux taux de `GET /v1/outreach/health` valent `null` tant que rien n'est
-revenu. Construire un vérificateur avant de connaître le nombre qu'il doit
-faire baisser, c'est construire contre une intuition. La semaine de prospection
-réelle est la même que celle de la cinquième place ; ce chantier la suit.
+**Recommandé — et pas maintenant**, disait ce paragraphe le 2026-09-12, parce
+qu'on n'avait aucun taux de rebond d'une semaine réelle. Ce qui a changé le
+2026-09-13 : le fondateur commence à prospecter sur sa propre entreprise avec
+**deux domaines vérifiés chez Resend** qu'il ne peut pas se permettre de
+brûler. Attendre le nombre aurait voulu dire l'obtenir en brûlant ce qu'il
+mesure.
+
+**Bâti**, et voici ce que ça fait et ne fait pas.
+
+`crates/providers/src/mail_domain.rs` pose **une** question au résolveur du
+système : ce domaine publie-t-il une destination de courrier ? Trois verdicts —
+le domaine n'existe pas (NXDOMAIN), il existe et ne veut pas de courrier (aucun
+MX, aucune adresse à la place, ou le MX nul de la RFC 7505), il en accepte — et
+une quatrième réponse qui n'est pas un verdict : *le résolveur n'a pas
+répondu*, qui n'écarte jamais personne. La dépendance est `hickory-resolver`
+sans ses features par défaut ; `tokio::net::lookup_host` ne pouvait pas servir,
+`getaddrinfo` n'a pas de type d'enregistrement.
+
+**Pas de SMTP.** Savoir si la *boîte* existe demande un `RCPT TO` chez
+l'hébergeur du destinataire : une sollicitation, à laquelle Google et Microsoft
+répondent « oui » de toute façon, et qui fait lister l'IP qui la pose. Le
+module en porte l'argument entier.
+
+**À l'import et à la découverte, pas à l'envoi.** `deliverability::check` est
+au fil parce que le corps qu'il juge *n'existe pas* avant l'envoi ; une adresse
+existe à l'import, et la règle est de juger au plus tôt. Conséquence assumée :
+le verdict vieillit — un domaine peut perdre son MX entre l'import et l'envoi,
+et rien ne le verra. La suite est un appel au même port à côté de
+`deliverability::check`, et **ce qui dira s'il faut la faire est le taux de
+rebond réel**, celui que ce paragraphe attendait : si les rebonds tombent sur
+des domaines qui ont bien un MX, ce n'est pas là qu'il faut regarder.
+
+**Le refus est nommé, pas silencieux.** L'adresse n'est pas écrite et le
+rapport la cite avec sa raison (`Report::no_mail_domain`), sur le modèle des
+compteurs que `prospects_import` avait déjà ; un résolveur muet écrit la ligne
+et le dit (`Report::mx_unknown`), pour qu'« cette liste est propre » ne se
+confonde pas avec « rien n'a été vérifié ».
+
+**Pas de cache écrit à la main.** Celui de hickory, au TTL que chaque autorité
+publie, dans une instance partagée par tout le processus.
 
 #### Chemin C — acheter
 
@@ -489,6 +533,17 @@ Côté encaissement, Stripe est **entrant seulement** : `on_stripe_webhook` lit
 une session Checkout payée et règle la facture qu'elle nomme. Rien dans ce
 dépôt ne *crée* une session Checkout ni un lien de paiement. Le client est donc
 facturé par PDF et paie par un lien fabriqué ailleurs.
+
+**Et depuis le 2026-09-13, une deuxième porte vers Stripe, qui ne fait que
+lire.** `agentos_app::stripe_subscriptions` interroge `GET /v1/subscriptions` et
+`GET /v1/events` avec une clé restreinte rangée par locataire (`0108`), et
+`GET /v1/growth` rend le résultat sous `subscriptions`, **à côté** du registre
+de factures et jamais dedans. C'est la moitié du revenu qu'aucune table d'ici ne
+pouvait porter : `invoices.opportunity_id` est `NOT NULL` et une affaire
+`closed_won` exige une approbation humaine, donc un abonnement pris en
+libre-service à 3 h du matin n'entrait nulle part. Ce module n'écrit rien chez
+Stripe et ne le peut pas — une seule fonction y touche le réseau, elle fait un
+`GET`, et un test lit le fichier pour refuser les verbes d'écriture.
 
 ### 3.9 Signer — joint le 2026-09-12, sans qu'aucun appel réel ait été fait
 

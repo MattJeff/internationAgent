@@ -105,6 +105,57 @@
 //! La somme des seaux d'une monnaie est exactement son `collected_minor` : la
 //! fenêtre est la même, la table est la même, et un test l'affirme.
 //!
+//! # Le revenu d'abonnement, et pourquoi il est **à côté** et jamais dedans
+//!
+//! Les cinq montants ci-dessus sortent tous d'`invoices`, et `invoices` a une
+//! porte d'entrée unique : `opportunity_id` est `NOT NULL` (0066) et
+//! `opportunities_won_needs_approval` (0011) refuse un `closed_won` sans
+//! `approval_id`. **Aucun euro n'entre dans ce registre sans qu'un humain ait
+//! approuvé une affaire**, et c'est juste — une facture est un document
+//! commercial que la société a émis.
+//!
+//! Une entreprise qui vend en libre-service n'émet rien de tel. Un abonnement à
+//! 49 $ pris par carte à 3 h du matin n'a ni affaire, ni devis, ni approbation ;
+//! il n'entre nulle part, et le webhook Stripe (`agentos_app::stripe`, 0081) ne
+//! le rattrape pas : il **règle** une facture déjà écrite, il n'en crée aucune.
+//! C'est le cas d'Orizn, et [`UNMEASURED`] le disait déjà avant que cette
+//! section existe.
+//!
+//! `subscriptions` est la lecture qui manquait, et elle est **lue chez Stripe à
+//! chaque chargement**, sans rien garder. Trois questions se posaient et voici
+//! celle qui a été tranchée :
+//!
+//! * **un appel par lecture** — c'est ce qui est fait ;
+//! * un cliché rafraîchi par une boucle, dans une table de plus ;
+//! * une entrée au catalogue que l'employé interroge comme n'importe quel
+//!   connecteur MCP.
+//!
+//! L'argument est celui de l'en-tête, deux paragraphes plus haut : *chaque
+//! nombre sort de la table qui en fait foi*. La table qui fait foi du revenu
+//! d'abonnement est celle de Stripe, et ce dépôt n'a **nulle part** un miroir de
+//! l'état courant d'un tiers — il garde ce qu'un tiers lui pousse et signe
+//! (`webhook_endpoints`, 0053 ; `messages`, 0080) et ce qu'il mesure lui-même
+//! (`model_usage_daily`, 0024 ; `outreach_buckets`, 0055). Un cliché serait le
+//! premier, et surtout un **second endroit où « notre recette » peut être
+//! vraie** : `docs/ORIZN.md` a déjà publié 76 $/mois en prose pendant que le
+//! calcul en disait un autre, et cette route existe en partie pour ça. Le
+//! catalogue, lui, est la surface d'un connecteur que le **client** a branché
+//! (`mcp_servers`, 0013) ; le compte Stripe de l'entreprise n'est pas un outil
+//! qu'un employé appelle, c'est une source de la lecture de direction, et un
+//! outil de plus voudrait dire un modèle qui recompose un MRR à partir d'une
+//! liste d'abonnements — c'est-à-dire l'arithmétique de [`funnel`] refaite par
+//! quelque chose qui n'est pas testable.
+//!
+//! Ce que l'appel par lecture coûte est réel et il est nommé : un écran qui
+//! dépend d'un tiers. La réponse est `null` — jamais zéro — quand Stripe ne
+//! répond pas, quand la clé est refusée, ou quand aucune clé n'est posée, et un
+//! déploiement sans Stripe branché lit exactement ce qu'il lisait avant.
+//!
+//! **Les deux blocs ne se somment pas et ne doivent jamais être sommés.**
+//! `revenue` dit ce que la société a réclamé et ce qui est rentré dessus ;
+//! `subscriptions` dit ce qui tourne aujourd'hui. Une entreprise qui fait les
+//! deux les verrait comptés deux fois.
+//!
 //! # Le coût, et pourquoi il est souvent `null`
 //!
 //! `model_minor` est les jetons de la fenêtre multipliés par le tarif que ce
@@ -147,6 +198,8 @@
 //! il n'y a aucun `WHERE tenant_id`, et l'entonnoir d'une autre entreprise
 //! n'est pas filtré — il est invisible.
 
+use agentos_app::mcp::Credentials;
+use agentos_app::stripe_subscriptions::{self, ConnectError, StripeError};
 use agentos_domain::money::Currency;
 use agentos_store::db::{Db, StoreError};
 use axum::Router;
@@ -163,15 +216,29 @@ use uuid::Uuid;
 use crate::auth::Principal;
 use crate::error::ApiError;
 
+/// L'état de cette unité : la base, et le chiffre qui ouvre la clé Stripe.
+///
+/// `credentials` est la même poignée que `routes::model` et `routes::mcp`
+/// tiennent, pour qu'un déploiement ne finisse pas avec deux chiffres sur un
+/// `AGENTOS_MASTER_KEY`. **Ce n'est pas un magasin** : depuis 0108 la clé est
+/// une colonne de la ligne que cette route lit, donc ce qu'il faut ici est de
+/// quoi l'ouvrir, pas de quoi la ranger ailleurs.
+#[derive(Clone)]
+struct GrowthState {
+    db: Db,
+    credentials: Credentials,
+}
+
 /// Les routes de cette unité.
-pub fn router(db: Db) -> Router {
+pub fn router(db: Db, credentials: Credentials) -> Router {
     Router::new()
         .route("/v1/growth", get_route(get))
         .route(
             "/v1/growth/target",
             get_route(read_target).put(write_target),
         )
-        .with_state(db)
+        .route("/v1/growth/stripe", axum::routing::post(connect_stripe))
+        .with_state(GrowthState { db, credentials })
 }
 
 /// `?days=N`, défaut [`DEFAULT_DAYS`], au plus [`MAX_DAYS`].
@@ -273,6 +340,74 @@ struct AttributionView {
     collected_minor: i64,
 }
 
+/// Un palier de prix, tel que Stripe le nomme.
+#[derive(Debug, Serialize)]
+struct TierView {
+    price_id: String,
+    /// Le nom donné à ce prix dans le tableau de bord Stripe. `null` quand
+    /// personne ne l'a nommé — et alors c'est `price_id` qui s'affiche, plutôt
+    /// qu'un « Palier 2 » inventé ici.
+    label: Option<String>,
+    currency: String,
+    subscribers: i64,
+    /// `null` quand un prix du palier n'a pas de montant unitaire — une
+    /// tarification à l'usage. Jamais zéro.
+    mrr_minor: Option<i64>,
+}
+
+/// Ce que Stripe dit du revenu d'abonnement, à l'instant de la lecture.
+///
+/// **Ne se somme pas avec [`RevenueView`].** Voir l'en-tête : ce sont deux
+/// vérités, pas deux vues d'une même.
+#[derive(Debug, Serialize)]
+struct SubscriptionsView {
+    /// Le revenu mensuel récurrent, en unités mineures. `null` quand les
+    /// abonnements comptés n'emploient pas une seule monnaie — cette route ne
+    /// somme pas plus à travers les codes ISO ici qu'ailleurs.
+    mrr_minor: Option<i64>,
+    currency: Option<String>,
+    /// Les abonnements `active` et `past_due`. Voir `unmeasured` pour ce que ce
+    /// second état coûte et ce qu'il évite.
+    subscribers: i64,
+    /// Nés dans la fenêtre, d'après les événements de Stripe. `null` — jamais
+    /// zéro — quand la fenêtre dépasse la rétention des événements.
+    started: Option<i64>,
+    /// Résiliés dans la fenêtre, même source et même règle.
+    stopped: Option<i64>,
+    /// `true` quand un montant n'a pas pu être lu : `mrr_minor` est alors un
+    /// **plancher**. Le drapeau de `GET /v1/pnl`, pour la même raison.
+    mrr_is_floor: bool,
+    tiers: Vec<TierView>,
+    /// Quand Stripe a été interrogé. Rien n'est gardé : c'est toujours il y a
+    /// un instant, et la console peut le dire plutôt que de le laisser croire.
+    read_at: DateTime<Utc>,
+}
+
+impl From<stripe_subscriptions::Subscriptions> for SubscriptionsView {
+    fn from(read: stripe_subscriptions::Subscriptions) -> Self {
+        Self {
+            mrr_minor: read.mrr_minor,
+            currency: read.currency,
+            subscribers: read.subscribers,
+            started: read.started,
+            stopped: read.stopped,
+            mrr_is_floor: read.mrr_is_floor,
+            tiers: read
+                .tiers
+                .into_iter()
+                .map(|tier| TierView {
+                    price_id: tier.price_id,
+                    label: tier.label,
+                    currency: tier.currency,
+                    subscribers: tier.subscribers,
+                    mrr_minor: tier.mrr_minor,
+                })
+                .collect(),
+            read_at: read.read_at,
+        }
+    }
+}
+
 /// Ce que le modèle a coûté, en cents de dollar.
 #[derive(Debug, Default, Serialize)]
 struct CostView {
@@ -342,9 +477,11 @@ const UNMEASURED: &[&str] = &[
      closed_won (invoices.opportunity_id, 0066). Un abonnement pris en libre-service sur le site \
      du locataire — une carte, une clé d'API, aucun humain — n'a ni affaire ni devis, donc il \
      n'entre jamais dans invoices et il n'est pas ici. Ces euros-là ne sont pas d'origine \
-     inconnue : ils sont hors de cette lecture, et le webhook Stripe (0081) ne fait que régler \
-     une facture déjà écrite, jamais en créer une. Une entreprise qui vend en libre-service lit \
-     donc une attribution vide sans que rien ne soit cassé.",
+     inconnue : ils sont hors de l'attribution, et le webhook Stripe (0081) ne fait que régler \
+     une facture déjà écrite, jamais en créer une. Ils sont lus ailleurs dans cette réponse, \
+     sous subscriptions, et sans origine — Stripe ne sait pas par quelle porte un abonné est \
+     entré. Une entreprise qui vend en libre-service lit donc une attribution vide sans que \
+     rien ne soit cassé.",
     "Une origine est la porte par laquelle une adresse est entrée, pas ce qui l'a convaincue. \
      Un contact importé en mars et converti après un article de septembre porte import, et rien \
      ici ne dit lequel des deux a emporté l'affaire. C'est une attribution au premier contact, \
@@ -361,6 +498,34 @@ const UNMEASURED: &[&str] = &[
     "model_minor est un plancher quand une partie des appels n'a pas été mesurée par le \
      fournisseur ou quand le tarif déclaré est incomplet. GET /v1/pnl porte les deux drapeaux \
      (complete, cost_is_floor) qui le disent appel par appel.",
+    "subscriptions et revenue ne se somment jamais. Le second est le registre de factures — ce \
+     que la société a réclamé à quelqu'un et ce qui est rentré dessus ; le premier est ce qui \
+     tourne aujourd'hui chez Stripe. Une entreprise qui facture ET qui vend par abonnement se \
+     compterait deux fois en les additionnant, et rien ici ne fait la soustraction : une facture \
+     émise pour un abonnement déjà compté chez Stripe apparaît dans les deux.",
+    "subscriptions null a deux causes que la réponse ne distingue pas : aucune clé Stripe posée \
+     (POST /v1/growth/stripe), ou une lecture qui a échoué — clé refusée, Stripe muet, plus \
+     d'abonnements qu'un écran n'en lit. Ce n'est jamais un zéro : une recette d'abonnement \
+     nulle serait une faillite affichée. La cause précise est dans le journal du serveur, par \
+     son code.",
+    "Le MRR de Stripe est un montant par mois calculé à partir des prix, pas de l'argent \
+     encaissé : un annuel de 1 200 $ y compte pour 100 $ par mois, une semaine passe par 52/12 \
+     et un jour par 365/12, avec un arrondi à l'unité mineure. Les réductions, les coupons, les \
+     avoirs, les taxes et les échecs de paiement n'y sont pas — c'est ce qui est facturable, pas \
+     ce qui arrivera.",
+    "subscribers compte les abonnements active ET past_due. Inclure past_due surestime la \
+     recette de ceux qui finiront par partir ; l'exclure ferait chuter le MRR le jour d'un refus \
+     de carte et remonter trois jours plus tard, ce qui se lit comme une résiliation qui n'a pas \
+     eu lieu. Les essais (trialing) ne comptent pas : ils ne paient pas encore, donc le MRR est \
+     un plancher pour une entreprise qui vend par essai.",
+    "started et stopped viennent des événements de Stripe, qui ne remontent pas au-delà de \
+     trente jours : au-delà d'une fenêtre de trente jours ils sont null et aucune requête n'est \
+     faite pour eux. Ils comptent des abonnements et non des livraisons, et une résiliation \
+     programmée pour la fin du mois n'est pas un départ tant qu'elle n'a pas pris effet.",
+    "mrr_is_floor dit qu'un montant n'a pas pu être lu — tarification par paliers ou à l'usage, \
+     ou un abonnement de plus de dix lignes. Le MRR rendu est alors ce qu'on sait lire et pas \
+     plus. La somme des abonnés des paliers peut dépasser subscribers : un abonnement à deux \
+     lignes est un abonné dans deux paliers.",
     "Le point mort n'est pas ici : GET /v1/forecast le divise, avec ses opérandes nommés un \
      par un. Cette route dit ce qui est arrivé, celle-là ce qui arriverait.",
 ];
@@ -372,6 +537,10 @@ struct GrowthView {
     window: WindowView,
     funnel: Vec<StageView>,
     revenue: RevenueView,
+    /// Le revenu d'abonnement lu chez Stripe, **à côté** de `revenue` et jamais
+    /// dedans. `null` sans clé posée, et `null` quand la lecture a échoué —
+    /// voir l'en-tête, et `unmeasured` pour les deux façons de lire ce `null`.
+    subscriptions: Option<SubscriptionsView>,
     /// D'où viennent les factures réglées de la fenêtre. Voir l'en-tête : la
     /// somme des seaux d'une monnaie est son `collected_minor`.
     attribution: Vec<AttributionView>,
@@ -664,12 +833,24 @@ const ACTIVE_SEATS_SQL: &str = "SELECT count(*)::bigint FROM employees WHERE lif
 
 const TARGET_SQL: &str = "SELECT mrr_minor, currency, at, set_at FROM growth_targets LIMIT 1";
 
+/// La clé Stripe de ce locataire, scellée. Zéro ou une ligne : la clé primaire
+/// de `tenant_stripe_access` est le locataire (0108), et RLS fait le reste.
+const STRIPE_KEY_SQL: &str = "SELECT sealed_key FROM tenant_stripe_access LIMIT 1";
+
+/// La pose d'une clé, qui est un upsert : reposer une clé est une **rotation**,
+/// pas une seconde porte. Voir 0108 pour pourquoi il n'y a pas de `DELETE`.
+const STRIPE_CONNECT_SQL: &str = "\
+INSERT INTO tenant_stripe_access (tenant_id, sealed_key, connected_at) \
+     VALUES ($1, $2, now()) \
+ON CONFLICT (tenant_id) DO UPDATE \
+   SET sealed_key = excluded.sealed_key, connected_at = excluded.connected_at";
+
 // ---------------------------------------------------------------------------
 // GET /v1/growth
 // ---------------------------------------------------------------------------
 
 async fn get(
-    State(db): State<Db>,
+    State(state): State<GrowthState>,
     principal: Principal,
     query: Result<Query<GrowthQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
@@ -689,7 +870,7 @@ async fn get(
     let month_ago = now - Duration::days(MONTH_DAYS);
     let two_months_ago = now - Duration::days(2 * MONTH_DAYS);
 
-    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
 
     // Les sept comptes. Les cinq datés d'abord, puis les deux d'`outreach`,
     // remis dans l'ordre de `STAGES` juste après.
@@ -760,7 +941,25 @@ async fn get(
         .map_err(StoreError::from)?;
 
     let target = read_target_row(&mut tx).await?;
+    // La clé Stripe est lue **dans** la transaction et employée **dehors** : un
+    // aller-retour vers un tiers ne tient pas une transaction Postgres ouverte,
+    // et dix secondes de connexion retenue sont dix secondes que le pool n'a
+    // pas. C'est la discipline de la boucle d'initiative, qui referme sa
+    // transaction de lecture avant de faire tourner un tour.
+    let sealed_stripe_key: Option<Vec<u8>> = sqlx::query_scalar(STRIPE_KEY_SQL)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(StoreError::from)?;
     tx.commit().await?;
+
+    let subscriptions = read_subscriptions(
+        &state.credentials,
+        principal.tenant_id,
+        sealed_stripe_key.as_deref(),
+        from,
+        now,
+    )
+    .await;
 
     // Une seule monnaie, ou rien. Voir l'en-tête : cette route ne somme pas à
     // travers les codes ISO et ne rend pas un zéro sans monnaie.
@@ -802,11 +1001,188 @@ async fn get(
             per_seat_minor: cost_minor.filter(|_| seats > 0).map(|cost| cost / seats),
         },
         revenue,
+        subscriptions,
         attribution: attribute(attribution),
         target,
         unmeasured: UNMEASURED,
     })
     .into_response())
+}
+
+/// Stripe, ou `null` — et jamais autre chose.
+///
+/// Séparée du gestionnaire parce que c'est la seule partie de cette route qui
+/// dépend d'un tiers, et que les quatre façons de n'avoir pas de réponse
+/// doivent se lire d'un bloc :
+///
+/// * **aucune clé posée** — le cas de tout déploiement qui n'a pas branché
+///   Stripe, et celui de tous les locataires avant 0108 ;
+/// * **la clé ne s'ouvre pas** — clé maîtresse tournée, ou ligne restaurée
+///   d'ailleurs ;
+/// * **Stripe refuse ou se tait** ;
+/// * **plus d'abonnements qu'un écran n'en lit**.
+///
+/// Les quatre rendent `None`. Aucune ne rend une erreur : l'entonnoir, la
+/// recette et le verdict sont tous lisibles sans Stripe, et rendre 502 à cause
+/// d'un tiers ferait disparaître neuf lectures qui ont réussi. Aucune ne rend
+/// zéro non plus — un `subscriptions: { mrr: 0 }` sur une panne de Stripe est
+/// une faillite affichée.
+///
+/// Le code du refus part au journal, avec le locataire, parce que c'est un
+/// opérateur qui a une décision à prendre : recoller la clé, ou attendre.
+async fn read_subscriptions(
+    credentials: &Credentials,
+    tenant_id: agentos_domain::ids::TenantId,
+    sealed: Option<&[u8]>,
+    from: NaiveDate,
+    now: DateTime<Utc>,
+) -> Option<SubscriptionsView> {
+    let sealed = sealed?;
+    let Some(client) = stripe_subscriptions::client_for(
+        credentials,
+        tenant_id,
+        sealed,
+        // `None` est le vrai Stripe. Voir `model_access::ApiBase` : ce n'est
+        // pas une surface de configuration, et le jour où un déploiement sort
+        // par un mandataire il voudra une variable nommée dans `config.rs`.
+        None,
+    ) else {
+        tracing::warn!(
+            %tenant_id,
+            "the sealed Stripe key does not open: growth reads no subscription revenue for this tenant"
+        );
+        return None;
+    };
+    // Le début de la fenêtre de la route, à minuit UTC : la même borne que
+    // `window.from` rend, pour que « nouveaux ce mois-ci » et « facturés ce
+    // mois-ci » parlent du même mois.
+    let window_start = from.and_hms_opt(0, 0, 0).map_or(now, |at| at.and_utc());
+    match tokio::time::timeout(STRIPE_DEADLINE, client.read(window_start, now)).await {
+        Ok(Ok(read)) => Some(read.into()),
+        Ok(Err(err)) => {
+            tracing::warn!(
+                %tenant_id,
+                code = err.code(),
+                "stripe did not answer: growth reads no subscription revenue this time"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                %tenant_id,
+                seconds = STRIPE_DEADLINE.as_secs(),
+                "stripe took longer than this screen may wait: growth reads no subscription revenue this time"
+            );
+            None
+        }
+    }
+}
+
+/// Ce que tout l'aller-retour Stripe a le droit de coûter à un écran.
+///
+/// Le délai de `agentos_app::stripe_subscriptions` borne **une** requête ; une
+/// lecture en fait jusqu'à vingt et une (dix pages par état compté, plus les
+/// événements), donc sans cette borne-ci le pire cas d'un Stripe qui traîne est
+/// plusieurs minutes d'écran blanc. Vingt secondes : trois requêtes lentes
+/// tiennent, une pagination pathologique non — et une pagination pathologique
+/// rendait déjà `null` par [`agentos_app::stripe_subscriptions::MAX_PAGES`].
+const STRIPE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+// ---------------------------------------------------------------------------
+// POST /v1/growth/stripe
+// ---------------------------------------------------------------------------
+
+/// Ce qu'un `POST` accepte : une clé, et rien d'autre.
+///
+/// **Délibérément sans `Serialize`.** C'est la règle de `routes::model` sur son
+/// propre corps de connexion : un type qui se sérialise est un type qu'une
+/// réponse ou une ligne de journal peut rendre par distraction, et celui-ci
+/// porte une clé de paiement.
+#[derive(Deserialize)]
+struct StripeBody {
+    api_key: String,
+}
+
+// Écrit à la main, et pour la même raison que le `Serialize` est absent.
+impl std::fmt::Debug for StripeBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StripeBody")
+    }
+}
+
+/// `POST /v1/growth/stripe` — coller la clé restreinte avec laquelle on lira.
+///
+/// La clé est **prouvée avant d'être rangée** : une lecture d'une ligne part
+/// chez Stripe, et un refus n'écrit rien. C'est la discipline de
+/// `POST /v1/model`, et elle vaut ici le même prix pour la même raison — une
+/// clé rangée sans preuve est un écran qui dit « connecté » et un `null` le
+/// lendemain, sans que personne sache si c'est la clé, le réseau ou le code.
+///
+/// **Reposer une clé est une rotation**, pas une seconde porte : la table a une
+/// ligne par locataire et l'écriture est un upsert. Il n'y a pas de
+/// `DELETE` — `migrations/0108` dit pourquoi, et le vrai débranchement est la
+/// révocation de la clé dans le tableau de bord Stripe.
+///
+/// **Ce que cette route ne promet pas : que la clé soit restreinte.** Rien dans
+/// l'API de Stripe ne dit à un porteur ce que sa clé n'a pas le droit de faire,
+/// donc une clé secrète complète collée ici passerait la preuve. La lecture
+/// seule est une propriété de notre code (`agentos_app::stripe_subscriptions`,
+/// et le test qui refuse un verbe d'écriture dans ce module), pas une confiance
+/// dans ce qui a été collé.
+async fn connect_stripe(
+    State(state): State<GrowthState>,
+    principal: Principal,
+    body: Result<axum::Json<StripeBody>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let axum::Json(body) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
+    let sealed = stripe_subscriptions::prove_and_seal(
+        &state.credentials,
+        principal.tenant_id,
+        body.api_key,
+        None,
+    )
+    .await
+    .map_err(stripe_connect_error)?;
+
+    let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
+    sqlx::query(STRIPE_CONNECT_SQL)
+        .bind(principal.tenant_id.as_uuid())
+        .bind(&sealed)
+        .execute(&mut **tx)
+        .await
+        .map_err(StoreError::from)?;
+    tx.commit().await?;
+
+    // Rien de ce qui a été collé ne revient, pas même une empreinte : 0040 et
+    // 0053 en donnent l'argument, et la seule question de l'appelant — « y
+    // en a-t-il une » — est répondue par le 200.
+    Ok(axum::Json(json!({ "connected": true })).into_response())
+}
+
+/// Le refus, en une phrase que la personne qui vient de coller peut agir.
+fn stripe_connect_error(err: ConnectError) -> ApiError {
+    match err {
+        ConnectError::Blank => ApiError::bad_request(
+            "api_key: la clé restreinte Stripe, non vide. Une chaîne vide n'est pas une clé",
+        ),
+        ConnectError::Stripe(StripeError::Refused) => ApiError::bad_request(
+            "Stripe a refusé cette clé. Elle est révoquée, ou restreinte au point de ne pas lire \
+             les abonnements — il lui faut la lecture de `subscriptions`, et celle d'`events` \
+             pour savoir qui est arrivé et qui est parti",
+        ),
+        ConnectError::Stripe(StripeError::Unreadable) => ApiError::bad_request(
+            "Stripe a répondu quelque chose que ce serveur ne sait pas lire. Rien n'a été rangé",
+        ),
+        // Stripe muet, ou trop d'abonnements pour la sonde : ce n'est pas la
+        // faute de l'appelant, et rien n'a été écrit. Il recollera.
+        ConnectError::Stripe(_) => ApiError::new(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "stripe_unavailable",
+            "Stripe n'a pas répondu",
+        )
+        .with_detail("la clé n'a pas été rangée ; réessayer"),
+        ConnectError::Cipher => ApiError::internal(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -816,8 +1192,11 @@ async fn get(
 /// La lecture seule de la cible, pour l'écran qui la pose et rien d'autre.
 /// `GET /v1/growth` la porte déjà — celle-ci existe pour que le formulaire
 /// n'ait pas à lire tout l'entonnoir pour préremplir deux champs.
-async fn read_target(State(db): State<Db>, principal: Principal) -> Result<Response, ApiError> {
-    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+async fn read_target(
+    State(state): State<GrowthState>,
+    principal: Principal,
+) -> Result<Response, ApiError> {
+    let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
     let target = read_target_row(&mut tx).await?;
     tx.rollback().await?;
     Ok(axum::Json(json!({ "target": target })).into_response())
@@ -863,7 +1242,7 @@ struct TargetBody {
 /// qu'on avait visé, et refuser de la relire le lendemain de la date serait
 /// refuser l'écran exactement le jour où on l'ouvre. `verdict` rend `behind`.
 async fn write_target(
-    State(db): State<Db>,
+    State(state): State<GrowthState>,
     principal: Principal,
     body: Result<axum::Json<TargetBody>, JsonRejection>,
 ) -> Result<Response, ApiError> {
@@ -881,7 +1260,7 @@ async fn write_target(
         .parse()
         .map_err(|_| ApiError::bad_request("currency: an ISO 4217 code this ledger knows"))?;
 
-    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
     sqlx::query(
         "INSERT INTO growth_targets (tenant_id, currency, mrr_minor, at, set_at) \
               VALUES ($1, $2, $3, $4, now()) \
@@ -1143,7 +1522,10 @@ mod tests {
 
             Some(Self {
                 app: crate::with_api_stack(
-                    router(db.clone()),
+                    router(
+                        db.clone(),
+                        Credentials::from_master_key(crate::auth::TEST_MASTER_KEY),
+                    ),
                     db.clone(),
                     crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
                 ),
@@ -1893,6 +2275,110 @@ mod tests {
         let (status, body) = h.get("/v1/growth?days=7", SECRET_A).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["days"], 7);
+        h.teardown().await;
+    }
+
+    /// **Un déploiement sans Stripe branché lit exactement ce qu'il lisait
+    /// avant.**
+    ///
+    /// C'est la contrainte la plus facile à casser de ce chantier : une lecture
+    /// d'un tiers ajoutée au milieu d'un écran, et l'écran tombe le jour où le
+    /// tiers n'est pas là. Ici il n'y a aucune clé, donc aucun appel ne part, et
+    /// `subscriptions` est `null` — **pas un zéro**, qui se lirait comme une
+    /// entreprise sans un seul abonné.
+    #[tokio::test]
+    async fn sans_cle_stripe_subscriptions_est_null_et_le_reste_de_lecran_tient() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        une_entreprise(&h.db, h.a).await;
+
+        let (status, body) = h.get("/v1/growth", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["subscriptions"].is_null(),
+            "sans clé, la lecture est absente et non nulle : {}",
+            body["subscriptions"]
+        );
+        // Et les neuf lectures qui ne dépendent de personne sont là.
+        assert_eq!(body["funnel"].as_array().map(Vec::len), Some(7));
+        assert!(body["revenue"]["collected_minor"].is_number());
+        assert!(body["attribution"].is_array());
+        h.teardown().await;
+    }
+
+    /// **Une clé vide n'est pas une clé, et rien n'est rangé.**
+    ///
+    /// Le refus est prononcé avant qu'aucun octet ne parte vers Stripe — c'est
+    /// ce qui rend ce test hermétique, et c'est aussi la bonne façon de traiter
+    /// un formulaire qui poste `""` pour un champ qu'on n'a pas touché.
+    #[tokio::test]
+    async fn une_cle_vide_est_refusee_et_naucune_ligne_nest_ecrite() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        for corps in [json!({ "api_key": "" }), json!({ "api_key": "   " })] {
+            let (status, _) = h
+                .call("POST", "/v1/growth/stripe", SECRET_A, Some(corps))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        // Un corps sans le champ du tout : la même porte, par le rejet de JSON.
+        let (status, _) = h
+            .call("POST", "/v1/growth/stripe", SECRET_A, Some(json!({})))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM tenant_stripe_access")
+            .fetch_one(&mut **tx)
+            .await
+            .expect("compter");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(rows, 0, "un refus n'écrit pas de ligne");
+        h.teardown().await;
+    }
+
+    /// **La clé d'un locataire n'est pas lisible par un autre**, et ce n'est pas
+    /// un filtre : RLS `force` sur `tenant_stripe_access` (0108) rend la ligne
+    /// de A invisible sous B, donc l'écran de B lit `null` là où A lirait sa
+    /// propre recette.
+    #[tokio::test]
+    async fn la_cle_dun_locataire_nest_pas_celle_dun_autre() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        // Écrite directement : la poser par la route ferait partir une sonde
+        // vers le vrai Stripe, et aucun test de ce dépôt ne tient une clé.
+        let mut tx = h.db.tenant_tx(h.a).await.expect("tenant tx");
+        sqlx::query(STRIPE_CONNECT_SQL)
+            .bind(h.a.as_uuid())
+            .bind(vec![1_u8, 2, 3])
+            .execute(&mut **tx)
+            .await
+            .expect("poser une clé");
+        tx.commit().await.expect("commit");
+
+        for (tenant, attendu) in [(h.a, 1_i64), (h.b, 0)] {
+            let mut tx = h.db.tenant_tx(tenant).await.expect("tenant tx");
+            let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM tenant_stripe_access")
+                .fetch_one(&mut **tx)
+                .await
+                .expect("compter");
+            tx.rollback().await.expect("rollback");
+            assert_eq!(rows, attendu, "la clé de A n'est pas celle de B");
+        }
+
+        // Et l'écran de B ne part pas en erreur pour autant.
+        let (status, body) = h.get("/v1/growth", SECRET_B).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["subscriptions"].is_null());
+
+        // Celui de A non plus : l'enveloppe de trois octets ne s'ouvre pas, et
+        // une clé illisible est une absence de lecture, pas une panne d'écran.
+        let (status, body) = h.get("/v1/growth", SECRET_A).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["subscriptions"].is_null());
         h.teardown().await;
     }
 }

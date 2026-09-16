@@ -57,6 +57,9 @@ noise = {"dry_run", "user_config", "last_failure_detail", "outstanding_minor", "
          # nom, parce qu'un geste qui dit « lis le verdict » sans dire lequel ne
          # se relit pas. Ils ont la meme forme qu'un nom d'outil et n'en sont pas.
          "last_success_at", "last_failure_employee_slug", "expires_at",
+         # Le champ que `work_items_list` rend et que `point-du-jour` doit
+         # pouvoir nommer : c'est lui qui mene du tableau au texte recu.
+         "conversation_id",
          "to_next_rate", "no_target", "on_track", "raised_after_denials"}
 missing = sorted(t for t in cited - noise if t not in registry)
 if missing:

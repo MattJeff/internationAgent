@@ -141,6 +141,12 @@ async fn run(args: &[String]) -> Result<String, String> {
         .await
         .map_err(|err| store_error("could not open a transaction", &err))?;
 
+    // Le résolveur, une fois pour toute la commande : c'est lui qui porte le
+    // cache, et cinq fichiers qui partagent des domaines ne posent la question
+    // qu'une fois par domaine. Voir `agentos_app::mocks::mail_domains` pour ce
+    // qu'une machine sans DNS obtient.
+    let mx = agentos_app::mocks::mail_domains();
+
     let now = Utc::now();
     let mut out = String::new();
     let mut total = Report::default();
@@ -156,7 +162,7 @@ async fn run(args: &[String]) -> Result<String, String> {
             employee_id: None,
             source: Some(path),
         };
-        let report = prospects::import(&mut tx, &list, text, now)
+        let report = prospects::import(&mut tx, &list, mx.as_ref(), text, now)
             .await
             .map_err(|err| import_error(path, &err))?;
         out.push_str(&format!("{path}\n{}\n\n", indent(&report.summary())));
