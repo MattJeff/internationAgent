@@ -4,9 +4,11 @@
 #
 # Ce que ce script fait, et où il s'arrête : il pose l'INFRASTRUCTURE — la base,
 # les migrations (par le serveur, à son démarrage), le locataire, le plafond de
-# politique, le serveur, la clé. Il ne crée NI la société NI le premier siège :
-# c'est le geste que le fondateur veut faire depuis son terminal, et le lui
-# voler lui retire la démonstration.
+# politique, le serveur, la clé, et les deux choses qui ne sont pas du produit
+# mais de la machine : le Chrome qui lit les pages et le tunnel par lequel on
+# reçoit. Il ne crée NI la société NI le premier siège : c'est le geste que le
+# fondateur veut faire depuis son terminal, et le lui voler lui retire la
+# démonstration.
 #
 # Le modèle est le `claude` de cette machine (AGENTOS_LLM=cli). Rien n'est
 # intermédié : pas de jeton collecté, pas de session stockée, pas de binaire
@@ -15,16 +17,37 @@
 # Relancer ce script ne casse rien : la base, le locataire, le plafond et les
 # clés sont retrouvés plutôt que recréés.
 #
-#   scripts/ce-soir.sh            faux adaptateurs — rien ne part vraiment
-#   scripts/ce-soir.sh --reel     e-mail réel via Resend (demande confirmation)
-#   scripts/ce-soir.sh --arreter  arrête le serveur lancé par ce script
-#   scripts/ce-soir.sh --effacer  arrête, puis supprime la base et l'état
+#   scripts/ce-soir.sh             faux adaptateurs — rien ne part vraiment
+#   scripts/ce-soir.sh --reel      e-mail réel via Resend (demande confirmation)
+#   scripts/ce-soir.sh --recevoir  ouvre un tunnel public et enregistre la porte
+#                                  d'entrée du courrier (webhook_endpoints)
+#   scripts/ce-soir.sh --arreter   arrête le serveur, le Chrome et le tunnel
+#   scripts/ce-soir.sh --effacer   arrête, puis supprime la base et l'état
+#
+# Le navigateur : si Google Chrome est installé, il est lancé en `--headless=new`
+# et `BROWSER_CDP_URL` le nomme, donc un siège qui veut lire le site d'un
+# prospect avant d'écrire le lit vraiment. Sans lui, `MockBrowser` répond
+# `no_such_element` à toute lecture et le siège renonce — le script le dit.
+#
+# La répétition générale de `--reel`, sans clé Resend et sans destinataire :
+#
+#   python3 scripts/faux-resend.py --port 8081 --journal /tmp/envois.jsonl &
+#   EMAIL_API_KEY=re_faux AGENT_EMAIL_DOMAIN=… EMAIL_API_BASE=http://127.0.0.1:8081 \
+#     scripts/ce-soir.sh --reel
+#
+# `EMAIL_API_BASE` est refusée par le serveur sans `AGENTOS_ALLOW_MOCKS` ; ici
+# elle est posée, et le script ne demande pas de `OUI` parce qu'il n'y a rien à
+# confirmer : rien ne sort de la machine.
 
 set -euo pipefail
 
 RACINE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ETAT="${AGENTOS_CE_SOIR_ETAT:-$HOME/.agentos-ce-soir}"
 PORT="${PORT:-8787}"
+# Le port du protocole de débogage de Chrome. Un autre port que celui du serveur
+# et réglable pour la même raison : deux instances sur la même machine ne
+# partagent pas un navigateur, chacune veut le sien.
+CDP_PORT="${CDP_PORT:-9222}"
 PGPORT="${PGPORT:-5432}"
 PGHOST="${PGHOST:-localhost}"
 BASE_NOM="${DB_NAME:-agentos_ce_soir}"
@@ -36,15 +59,19 @@ BASE_NOM="${DB_NAME:-agentos_ce_soir}"
 PGUSER="${PGUSER:-$(id -un)}"
 BASE_URL="postgres://${PGUSER}@${PGHOST}:${PGPORT}"
 
+CHROME_MAC="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
 REEL=0
+RECEVOIR=0
 ACTION=monter
 for arg in "$@"; do
   case "$arg" in
     --reel) REEL=1 ;;
+    --recevoir) RECEVOIR=1 ;;
     --arreter) ACTION=arreter ;;
     --effacer) ACTION=effacer ;;
-    -h|--help) sed -n '3,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "je ne connais pas « $arg ». --reel, --arreter, --effacer, --help." >&2; exit 2 ;;
+    -h|--help) sed -n '3,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "je ne connais pas « $arg ». --reel, --recevoir, --arreter, --effacer, --help." >&2; exit 2 ;;
   esac
 done
 
@@ -53,22 +80,38 @@ refuse() { printf '\033[1;31m== REFUS\033[0m %s\n' "$*" >&2; exit 1; }
 
 PIDFILE="$ETAT/serveur.pid"
 JOURNAL="$ETAT/serveur.log"
+CHROME_PIDFILE="$ETAT/chrome.pid"
+CHROME_PROFIL="$ETAT/chrome-profil"
+TUNNEL_PIDFILE="$ETAT/tunnel.pid"
+TUNNEL_JOURNAL="$ETAT/tunnel.log"
 
-arreter() {
-  [ -f "$PIDFILE" ] || { dit "aucun serveur lancé par ce script."; return 0; }
-  local pid; pid="$(cat "$PIDFILE")"
-  # Par le pid, jamais pkill : d'autres agents et d'autres serveurs tournent.
+# Tout ce que ce script a lancé s'arrête par son pid, et par rien d'autre.
+# Jamais `pkill` : d'autres agents, d'autres serveurs et le Chrome du fondateur
+# tournent sur cette machine, et un `pkill chrome` fermerait ses onglets.
+arreter_pid() { # fichier-pid, nom, secondes d'attente
+  [ -f "$1" ] || return 0
+  local pid; pid="$(cat "$1")"
   if kill -0 "$pid" 2>/dev/null; then
     kill "$pid"
+    for _ in $(seq 1 "$3"); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    dit "$2 $pid arrêté."
+  else
+    dit "le pid $pid de $2 ne tourne plus."
+  fi
+  rm -f "$1"
+}
+
+arreter() {
+  if [ -f "$PIDFILE" ]; then
     # Attendre qu'il rende ses connexions : un `dropdb` lancé pendant que le
     # serveur tient encore seize connexions échoue, et `--effacer` laisserait
     # la base derrière lui en disant le contraire.
-    for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
-    dit "serveur $pid arrêté."
+    arreter_pid "$PIDFILE" "serveur" 20
   else
-    dit "le pid $pid ne tourne plus."
+    dit "aucun serveur lancé par ce script."
   fi
-  rm -f "$PIDFILE"
+  arreter_pid "$TUNNEL_PIDFILE" "tunnel" 10
+  arreter_pid "$CHROME_PIDFILE" "Chrome" 10
 }
 
 case "$ACTION" in
@@ -97,6 +140,11 @@ psql "$BASE_URL/postgres" -Atc 'select 1' >/dev/null 2>&1 \
 command -v claude >/dev/null \
   || refuse "pas de binaire « claude » sur le PATH. C'est LUI le modèle de ce montage : sans lui il n'y a pas de tour, donc pas d'e-mail. Aucune clé Anthropic ne remplace ça ici — c'est le chemin cli, pas le chemin api_key."
 
+if [ "$RECEVOIR" = 1 ]; then
+  command -v cloudflared >/dev/null \
+    || refuse "--recevoir sans cloudflared. C'est lui qui donne une adresse publique à ce portable : « brew install cloudflared ». Un tunnel rapide ne demande ni compte ni dépense."
+fi
+
 mkdir -p "$ETAT"; chmod 700 "$ETAT"
 
 if [ "$REEL" = 1 ]; then
@@ -104,19 +152,29 @@ if [ "$REEL" = 1 ]; then
     || refuse "--reel sans EMAIL_API_KEY. Exporte la clé Resend d'abord ; sans elle l'adaptateur reste faux et --reel ne veut rien dire."
   [ -n "${AGENT_EMAIL_DOMAIN:-}" ] \
     || refuse "--reel sans AGENT_EMAIL_DOMAIN. Nomme le domaine d'envoi vérifié chez Resend ; le faux domaine par défaut ferait refuser chaque envoi par Resend."
-  cat >&2 <<'AVERT'
+  if [ -n "${EMAIL_API_BASE:-}" ]; then
+    # La répétition générale. L'adaptateur est le vrai — même code, même
+    # `Idempotency-Key`, même `provider_message_id` relu — et il parle à
+    # l'adresse nommée. Pas de `OUI` à taper : il n'y a rien à confirmer quand
+    # rien ne sort de la machine, et un avertissement qui ment la première fois
+    # n'est plus lu la seconde.
+    dit "--reel contre EMAIL_API_BASE=$EMAIL_API_BASE : l'adaptateur Resend est le vrai, son correspondant ne l'est pas. Rien ne sortira de cette machine."
+  else
+    cat >&2 <<'AVERT'
 
   ┌─ --reel : ce que tu viens de demander ───────────────────────────────────┐
   │ L'adaptateur e-mail devient Resend. Un siège qui prend un tour et décide │
   │ d'écrire ENVERRA un vrai e-mail, à une vraie adresse, depuis ton domaine │
   │ vérifié, et ça compte sur ta réputation d'envoi. Il n'y a pas de mode    │
-  │ « presque ». Le téléphone, le navigateur et l'embedder restent faux.     │
+  │ « presque ». Le téléphone et l'embedder restent faux ; le navigateur est │
+  │ un vrai Chrome s'il est installé.                                        │
   └──────────────────────────────────────────────────────────────────────────┘
 
 AVERT
-  printf '  tape OUI pour continuer : ' >&2
-  read -r reponse
-  [ "$reponse" = "OUI" ] || refuse "annulé. Relance sans --reel pour la marche à blanc."
+    printf '  tape OUI pour continuer : ' >&2
+    read -r reponse
+    [ "$reponse" = "OUI" ] || refuse "annulé. Relance sans --reel pour la marche à blanc."
+  fi
 fi
 
 # Le port : le nôtre, ou personne.
@@ -161,6 +219,99 @@ fi
 # shellcheck disable=SC1090
 . "$SECRETS"
 
+# Les deux secrets de `--recevoir`, ajoutés le jour où on en a besoin plutôt
+# qu'à la création : un état écrit avant ce mode-là n'en a pas, et le
+# régénérer à chaque lancement ferait d'un `whsec_…` recollé chez le
+# fournisseur un secret périmé au redémarrage suivant.
+if [ "$RECEVOIR" = 1 ] && [ -z "${CLE_PLATEFORME:-}" ]; then
+  {
+    echo "CLE_PLATEFORME=$(openssl rand -hex 24)"
+    # `whsec_` + du base64, la forme que Resend donne aux siens. La forme ne
+    # change rien à la vérification — c'est un HMAC sur des octets — mais un
+    # secret qui ne ressemble pas à ceux du fournisseur est un secret qu'on
+    # colle au mauvais endroit.
+    echo "SECRET_WEBHOOK=whsec_$(openssl rand -base64 24 | tr -d '\n')"
+  } >> "$SECRETS"
+  # shellcheck disable=SC1090
+  . "$SECRETS"
+fi
+
+# ---------------------------------------------------------------------------
+# Le tunnel, AVANT le serveur, parce que `PUBLIC_HOST` est lu au démarrage
+# ---------------------------------------------------------------------------
+#
+# Un tunnel rapide (`cloudflared tunnel --url`) donne une adresse
+# `https://…trycloudflare.com` sans compte et sans dépense. Elle CHANGE à chaque
+# lancement : le webhook côté fournisseur est à recoller à chaque fois, et c'est
+# le prix de ne pas demander de compte. Un tunnel NOMMÉ (`cloudflared tunnel
+# create`) garderait l'adresse — il faudrait le compte Cloudflare du fondateur
+# et un `cloudflared login` ; ce script ne le fait pas et ne le fera pas tout
+# seul.
+#
+# Il est lancé ici plutôt qu'après le serveur parce que `PUBLIC_HOST` est ce que
+# le produit croit être sa propre adresse : le lien de désabonnement, la carte
+# d'agent et l'URL que le schéma de Twilio signe en sortent. Pointé sur
+# `127.0.0.1`, le lien de désabonnement est mort chez le destinataire, et
+# Gmail le lit.
+PUBLIC="http://127.0.0.1:$PORT"
+if [ "$RECEVOIR" = 1 ]; then
+  dit "j'ouvre un tunnel rapide (sans compte, sans dépense)…"
+  : > "$TUNNEL_JOURNAL"
+  cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$PORT" \
+    >"$TUNNEL_JOURNAL" 2>&1 &
+  echo $! > "$TUNNEL_PIDFILE"
+  ADRESSE=""
+  for _ in $(seq 1 40); do
+    ADRESSE="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_JOURNAL" | head -1 || true)"
+    if [ -n "$ADRESSE" ]; then break; fi
+    kill -0 "$(cat "$TUNNEL_PIDFILE")" 2>/dev/null \
+      || { tail -20 "$TUNNEL_JOURNAL" >&2; refuse "cloudflared est mort avant d'annoncer une adresse. Journal : $TUNNEL_JOURNAL"; }
+    printf .; sleep 1
+  done; echo
+  [ -n "$ADRESSE" ] || { tail -20 "$TUNNEL_JOURNAL" >&2; refuse "cloudflared n'a annoncé aucune adresse en 40 s. Journal : $TUNNEL_JOURNAL"; }
+  PUBLIC="$ADRESSE"
+  dit "tunnel ouvert : $PUBLIC (pid $(cat "$TUNNEL_PIDFILE"))"
+fi
+
+# ---------------------------------------------------------------------------
+# Le navigateur : un vrai Chrome, ou rien, et il le dit
+# ---------------------------------------------------------------------------
+#
+# `MockBrowser` répond `no_such_element` à chaque lecture — mesuré le
+# 2026-09-10 — donc un siège commercial dont la charte exige de lire le site
+# d'un prospect avant d'écrire renonce toujours, et le journal d'audit le
+# montre. La ligne ci-dessous est celle que `browser_chrome.rs` documente pour
+# macOS et celle que la CI lance sous Linux.
+CHROME_URL=""
+if [ -x "$CHROME_MAC" ]; then
+  if curl -fsS "http://127.0.0.1:$CDP_PORT/json/version" >/dev/null 2>&1; then
+    # Quelque chose parle déjà CDP sur ce port : c'est un navigateur, pas un
+    # inconnu, et en relancer un second échouerait sur le port occupé.
+    dit "un navigateur répond déjà en CDP sur $CDP_PORT ; je le prends tel quel."
+    CHROME_URL="http://127.0.0.1:$CDP_PORT"
+  elif lsof -nP -iTCP:"$CDP_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    refuse "le port $CDP_PORT est pris par quelque chose qui ne parle pas CDP. Choisis-en un autre : CDP_PORT=9223 scripts/ce-soir.sh"
+  else
+    mkdir -p "$CHROME_PROFIL"
+    "$CHROME_MAC" --headless=new --remote-debugging-port="$CDP_PORT" \
+      --user-data-dir="$CHROME_PROFIL" about:blank \
+      >"$ETAT/chrome.log" 2>&1 &
+    echo $! > "$CHROME_PIDFILE"
+    for _ in $(seq 1 30); do
+      curl -fsS "http://127.0.0.1:$CDP_PORT/json/version" >/dev/null 2>&1 && break
+      kill -0 "$(cat "$CHROME_PIDFILE")" 2>/dev/null \
+        || { tail -20 "$ETAT/chrome.log" >&2; refuse "Chrome est mort au démarrage. Journal : $ETAT/chrome.log"; }
+      printf .; sleep 1
+    done; echo
+    curl -fsS "http://127.0.0.1:$CDP_PORT/json/version" >/dev/null 2>&1 \
+      || refuse "Chrome n'a pas ouvert son port de débogage en 30 s. Journal : $ETAT/chrome.log"
+    CHROME_URL="http://127.0.0.1:$CDP_PORT"
+    dit "Chrome lancé, pid $(cat "$CHROME_PIDFILE"), CDP sur $CDP_PORT."
+  fi
+else
+  dit "pas de « $CHROME_MAC » : le navigateur restera FAUX. Un siège qui veut lire le site d'un prospect avant d'écrire lira \`no_such_element\` et renoncera — et il le fera en silence, la charte satisfaite. Installe Google Chrome, ou accepte que la lecture de page ne marche pas ce soir."
+fi
+
 # ---------------------------------------------------------------------------
 # La base, le binaire, le serveur
 # ---------------------------------------------------------------------------
@@ -179,10 +330,10 @@ export CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0
 BIN="$RACINE/target/debug/agentos-server"
 
 # Les quatre obligatoires, puis le reste. AGENTOS_ALLOW_MOCKS=1 est là parce que
-# le téléphone, le navigateur et l'embedder n'ont pas de clé sur cette machine :
-# sans lui le serveur REFUSE de démarrer, et il a raison — un faux adaptateur en
-# production est une panne qui rend un succès.
-export PUBLIC_HOST="http://127.0.0.1:$PORT"
+# le téléphone et l'embedder n'ont pas de clé sur cette machine : sans lui le
+# serveur REFUSE de démarrer, et il a raison — un faux adaptateur en production
+# est une panne qui rend un succès.
+export PUBLIC_HOST="$PUBLIC"
 export AGENT_EMAIL_DOMAIN="${AGENT_EMAIL_DOMAIN:-agents.example.com}"
 export DATABASE_URL
 export AGENTOS_MASTER_KEY="$MASTER_KEY"
@@ -191,7 +342,13 @@ export AGENTOS_ALLOW_MOCKS=1
 export AGENTOS_LLM=cli
 export AGENTOS_API_KEYS="ops:$TENANT_ID:$CLE_OPS,approbateur:$TENANT_ID:$CLE_APPROBATEUR"
 export RUST_LOG="${RUST_LOG:-info,agentos_server=debug}"
-[ "$REEL" = 1 ] || unset EMAIL_API_KEY
+if [ -n "$CHROME_URL" ]; then export BROWSER_CDP_URL="$CHROME_URL"; fi
+[ "$REEL" = 1 ] || unset EMAIL_API_KEY EMAIL_API_BASE
+# La clé de plate-forme n'existe QUE sous `--recevoir`. C'est la seule qui peut
+# écrire `webhook_endpoints` — aucune clé de locataire ne le peut, et c'est
+# délibéré : un locataire qui écrirait sa propre ligne pourrait nommer un chemin
+# et se mettre à ramasser le courrier d'un autre.
+if [ "$RECEVOIR" = 1 ]; then export AGENTOS_PLATFORM_KEYS="ce-soir:$CLE_PLATEFORME"; fi
 
 dit "démarrage du serveur (il applique les migrations lui-même)…"
 "$BIN" >"$JOURNAL" 2>&1 &
@@ -226,7 +383,33 @@ attendre "http://127.0.0.1:$PORT/readyz" 30 "/readyz"
 dit "prêt."
 
 MOCKS="$(grep -o 'mock_adapters[^]]*]' "$JOURNAL" | tail -1 || true)"
-[ -n "$MOCKS" ] && dit "faux adaptateurs : ${MOCKS#*: }"
+if [ -n "$MOCKS" ]; then dit "faux adaptateurs : ${MOCKS#*: }"; fi
+
+# ---------------------------------------------------------------------------
+# La porte d'entrée du courrier, par la vraie route
+# ---------------------------------------------------------------------------
+#
+# `POST /v1/platform/webhooks` est le seul chemin qui écrive `webhook_endpoints`
+# (0053), et il rend un chemin OPAQUE — pas `/{locataire}/{fournisseur}` — parce
+# qu'une adresse devinable est une adresse qu'on sonde. Rejouer la même
+# inscription fait tourner le secret et GARDE le chemin, donc relancer ce script
+# ne change pas l'URL à coller ; c'est le tunnel qui la change.
+ROUTE_WEBHOOK=""
+if [ "$RECEVOIR" = 1 ]; then
+  REPONSE="$(curl -fsS -X POST "http://127.0.0.1:$PORT/v1/platform/webhooks" \
+    -H "Authorization: Bearer $CLE_PLATEFORME" \
+    -H 'Content-Type: application/json' \
+    -d "{\"tenant_id\":\"$TENANT_ID\",\"provider\":\"email\",\"secret\":\"$SECRET_WEBHOOK\"}")" \
+    || refuse "l'inscription du webhook a échoué. Journal : $JOURNAL"
+  ROUTE_WEBHOOK="$(printf '%s' "$REPONSE" | sed -n 's/.*"route":"\([^"]*\)".*/\1/p')"
+  [ -n "$ROUTE_WEBHOOK" ] || refuse "la route du webhook n'était pas dans la réponse : $REPONSE"
+  dit "porte d'entrée enregistrée : $ROUTE_WEBHOOK"
+
+  # Et on la traverse, parce qu'un tunnel qu'on n'a pas franchi est une adresse
+  # qu'on a lue dans un journal.
+  attendre "$PUBLIC/livez" 30 "le tunnel"
+  dit "le tunnel passe : $PUBLIC/livez répond."
+fi
 
 cat <<FIN_MSG
 
@@ -240,7 +423,9 @@ cat <<FIN_MSG
 
  Le premier geste est model_connect {"path":"cli"} — il prouve ton propre
  claude, ne stocke rien, et sans lui aucun siège ne prend de tour.
- Ensuite : org_apply (la société), puis le geste lancer-une-campagne.
+ Ensuite : company_create (la société, ses rôles et sa fenêtre — c'est LUI
+ qui pose la première couche de limites ; org_apply n'en pose aucune et le
+ geste suivant tomberait sur un 404). Puis le geste lancer-une-campagne.
 
  La clé qui approuve (une autre, sinon les quatre yeux refusent sur soi) :
    $CLE_APPROBATEUR
@@ -249,3 +434,24 @@ cat <<FIN_MSG
  Tout jeter : scripts/ce-soir.sh --effacer
 ────────────────────────────────────────────────────────────────────────────
 FIN_MSG
+
+if [ "$RECEVOIR" = 1 ]; then
+  cat <<FIN_RECEVOIR
+ À coller dans le tableau de bord Resend (Webhooks → Add endpoint) :
+
+   URL     $PUBLIC$ROUTE_WEBHOOK
+   Secret  $SECRET_WEBHOOK
+
+ L'adresse du tunnel CHANGE à chaque lancement de ce script : c'est ce que
+ coûte un tunnel rapide, qui ne demande ni compte ni carte. Le secret, lui,
+ ne change pas — il est dans $SECRETS — donc seule l'URL est à recoller.
+ Pour une adresse stable il faudrait un tunnel NOMMÉ, donc ton compte
+ Cloudflare et un « cloudflared login » ; ce script ne le fait pas.
+
+ La signature EST vérifiée sur ce chemin : schéma Standard Webhooks (celui
+ de Resend), HMAC sur « id.horodatage.corps », fenêtre de rejeu comprise, et
+ une livraison non signée est un 401 avant qu'une ligne soit écrite. Le
+ tunnel est public ; la porte ne l'est pas.
+────────────────────────────────────────────────────────────────────────────
+FIN_RECEVOIR
+fi
