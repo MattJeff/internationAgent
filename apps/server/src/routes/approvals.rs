@@ -814,6 +814,23 @@ const ENVELOPE_NOT_SENT: &str = "envelope_not_sent";
 /// approval, and the approval stays `pending` so that the failure is a letter
 /// that did not go.
 ///
+/// # What this does *not* take, and it is a real hole
+///
+/// The day's cold-contact slot. `PolicyGate::take_contact` runs on the `Allow`
+/// arm of a ruling, and an escalation is not that arm — so an approved first
+/// email to a stranger is sent without being counted against
+/// `max_new_contacts_per_day`, which is the number an operator answers a
+/// supervisory authority for. A payment does not have this problem because
+/// `approve` reserves the money explicitly at redemption; there is no matching
+/// call here, and adding one would need the policy back, which
+/// `redeem_approval` argues at length for *not* reloading.
+///
+/// ponytail: left uncounted, and named rather than half-fixed. It bites only
+/// on an approved approach to somebody new — a reply is `ContactStanding::Known`
+/// and spends no slot either way. Close it the day the queue is where cold mail
+/// actually goes, by giving `redeem_approval` the ledger call the payment arm
+/// already makes.
+///
 /// `in_reply_to` is deliberately absent. The thread this was a reply to is on
 /// the seat's turn and not on the row, so the letter goes out as its own
 /// message — the same thing that happens today when
@@ -837,6 +854,13 @@ async fn letter(
     /// of the document — which is the one way this route could send something
     /// nobody wrote. With it, the executor is chosen by the seat that composed
     /// the draft rather than guessed at here.
+    ///
+    /// Not covered by a test, and named: exercising the invoice arm needs a
+    /// `closed_won` opportunity and an issued invoice, which is a fixture three
+    /// tables deep for one `if let`. What it rests on instead is that `turn.rs`
+    /// is the only writer of an invoice draft and writes the key in the same
+    /// `json!` as the body — a forgotten key would send that body, and the body
+    /// says in its own words that it is not a letter.
     #[derive(serde::Deserialize)]
     struct Draft {
         subject: String,

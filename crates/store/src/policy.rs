@@ -1656,14 +1656,14 @@ pub async fn install_layer_tx(
             allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
             allowed_models, max_new_contacts_per_day, max_turns_per_day, \
             allow_file_upload, allow_credential_change, allow_data_delete, \
-            allow_lead_upload) \
+            allow_lead_upload, untrusted_email_needs_approval) \
          SELECT gen_random_uuid(), $1, tenant_id, layer, role_name, employee_id, \
                 spend_currency, max_per_transaction_minor, max_per_day_minor, \
                 approval_above_minor, allowed_channels, allowed_calling_codes, \
                 allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
                 allowed_models, max_new_contacts_per_day, max_turns_per_day, \
                 allow_file_upload, allow_credential_change, allow_data_delete, \
-                allow_lead_upload \
+                allow_lead_upload, untrusted_email_needs_approval \
            FROM policy_layers \
           WHERE version_id = $2 \
             AND NOT (layer = $3 AND role_name IS NOT DISTINCT FROM $4 \
@@ -1686,9 +1686,10 @@ pub async fn install_layer_tx(
                 allowed_domains, denied_domains, allowed_mcp_tools, allowed_a2a_peers, \
                 allowed_models, max_new_contacts_per_day, max_turns_per_day, \
                 allow_file_upload, allow_credential_change, allow_data_delete, \
-                allow_lead_upload) \
+                allow_lead_upload, untrusted_email_needs_approval) \
              VALUES ($1, $2, $3, $4, $5, $6, \
-                     $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)",
+                     $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, \
+                     $23, $24)",
         )
         .bind(Uuid::now_v7())
         .bind(next)
