@@ -233,6 +233,7 @@ Where each goes:
 | Credential | Goes into | What it does |
 |---|---|---|
 | `re_…` API key | `EMAIL_API_KEY` | **builds the adapter** — set it and mail is really sent |
+| *(no credential)* | `EMAIL_API_BASE` | where the adapter talks, `https://api.resend.com` unless set. **Refused at boot without `AGENTOS_ALLOW_MOCKS=1`**: it decides who the key above is presented to. Its one use is `scripts/faux-resend.py`, which serves the six routes this adapter calls so the `--reel` path can be walked end to end with no key and no recipient — `docs/CE_SOIR.md` §4 |
 | `whsec_…` signing secret | `AGENTOS_WEBHOOK_SECRETS` as `email:<tenant-uuid>:whsec_…`, or `POST /v1/platform/webhooks` for a second customer | verifies inbound deliveries, **and** (from the variable) is handed to the adapter as its own webhook secret — one paste, not two |
 | the sending domains | `POST /v1/domain` (one row per domain, the first is the tenant's *primary*); `AGENT_EMAIL_DOMAIN` is the default for a tenant that named none | the domains the tenant's mail leaves from — each verified at Resend before a seat sits on it, each under a daily cap (`PUT /v1/domains/{domain}/cap`) |
 
