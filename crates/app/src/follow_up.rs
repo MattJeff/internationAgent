@@ -135,6 +135,9 @@ pub fn subject(contact: &str) -> String {
 /// `from` is the sender the mail actually left with — chosen by
 /// `sending_domain::pick_from`, which reads it back from this row to keep a
 /// thread on one address. Before 0094 the column was written empty here.
+// The arguments are the columns of the row this writes; a struct for them
+// would be that row, spelled twice.
+#[allow(clippy::too_many_arguments)]
 pub async fn sent(
     tx: &mut TenantTx<'_>,
     employee: EmployeeId,
@@ -415,7 +418,7 @@ mod tests {
             "SELECT body FROM messages WHERE provider_message_id = $1 AND direction = 'outbound'",
         )
         .bind("msg_body")
-        .fetch_one(&mut ***(&mut tx))
+        .fetch_one(&mut **tx)
         .await
         .expect("the row");
         tx.rollback().await.expect("rollback");

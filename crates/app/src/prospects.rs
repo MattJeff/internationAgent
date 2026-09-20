@@ -223,12 +223,15 @@
 use agentos_domain::action::{Domain, EmailAddress};
 use agentos_domain::ids::EmployeeId;
 use agentos_domain::untrusted::Untrusted;
-use agentos_providers::mail_domain::MailDomains;
+use agentos_providers::ProviderError;
+use agentos_providers::mail_domain::{MailDomain, MailDomains};
 use agentos_store::db::TenantTx;
 use agentos_store::revenue::{
     self as revenue_store, NewAccount, NewContact, RevenueError, Upserted,
 };
 use chrono::{DateTime, Utc};
+use futures_util::{StreamExt, stream};
+use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
 
 use crate::queue::COLUMNS;
@@ -474,6 +477,17 @@ pub async fn import(
         None => return Err(ImportError::Header(String::new())),
     }
 
+    let records: Vec<(usize, Vec<String>)> = records.collect();
+    let table = warm(
+        mx,
+        records
+            .iter()
+            .filter_map(|(_, record)| record.first())
+            .filter_map(|email| EmailAddress::parse(email).ok())
+            .map(|address| address.domain().as_str().to_owned()),
+    )
+    .await;
+
     let mut report = Report::default();
     for (line, record) in records {
         report.rows += 1;
@@ -527,7 +541,7 @@ pub async fn import(
             }
         };
 
-        if let Some(why) = no_mail_here(mx, &address, &mut report).await {
+        if let Some(why) = no_mail_here(&table, mx, &address, &mut report).await {
             report
                 .refused
                 .push(format!("line {line}: {address}: {why}"));
@@ -655,6 +669,7 @@ pub async fn discover(
     let remaining = i64::from(budget).saturating_sub(spent).max(0);
 
     let found = addresses(page);
+    let table = warm(mx, found.iter().map(|a| a.domain().as_str().to_owned())).await;
     let mut report = Report {
         rows: found.len(),
         ..Report::default()
@@ -683,7 +698,7 @@ pub async fn discover(
         // est imprimée, l'association a fermé. Même refus qu'à l'import, même
         // compteur, et la ligne du rapport ne nomme que l'adresse — un numéro
         // de ligne n'existe pas ici.
-        if let Some(why) = no_mail_here(mx, address, &mut report).await {
+        if let Some(why) = no_mail_here(&table, mx, address, &mut report).await {
             report.refused.push(format!("{address}: {why}"));
             continue;
         }
@@ -761,6 +776,57 @@ pub async fn discover(
 /// caller must do about it.
 ///
 /// `Some(reason)` — do not write this address, and put the reason in the
+/// How many domains are asked about at once by [`warm`].
+///
+/// Measured on 2026-09-19: the founder's 1300 verified rows, resolved one
+/// record after the other inside the import's transaction, took longer than
+/// the server's 30-second request timeout and the whole file came back 408 —
+/// the workaround was batches of 100 from a script, which is not a thing a
+/// plugin gesture can do. Measured again on 2026-09-20 with this machine's
+/// resolver, on the same file's 1228 distinct domains: **74 ms a question one
+/// after the other, so 91 s for the list; 3.6 s with thirty-two in flight.**
+/// Thirty-two is a client's worth of questions, not a scanner's, and well
+/// under any resolver's per-client limit.
+///
+/// ponytail: a constant, not a knob. The day a tenant imports a list whose
+/// domains are all slow, this is the number to raise, and the ceiling is the
+/// resolver, not us.
+const MX_IN_FLIGHT: usize = 32;
+
+/// One verdict per distinct domain, asked once.
+///
+/// [`ProviderError`] is `Clone`, so a resolver that did not answer is
+/// remembered as exactly that and [`no_mail_here`] counts it in
+/// [`Report::mx_unknown`] the same way it did when it asked itself.
+type MxTable = HashMap<String, Result<MailDomain, ProviderError>>;
+
+/// Ask the resolver about every distinct domain of a list before its rows
+/// are walked, [`MX_IN_FLIGHT`] questions at a time.
+///
+/// The rows are walked in order and inside one transaction, and that order
+/// is what makes the report readable — `line 4`, `line 5` — so the walk
+/// itself stays sequential. What was sequential *and slow* was the DNS
+/// question in the middle of it: a list of a thousand rows is a thousand
+/// round trips of tens of milliseconds each, one after the other, while the
+/// answers do not depend on one another at all. Asking first, together, and
+/// then walking with the answers in hand is the whole change; nothing about
+/// which row is refused, or why, moves.
+///
+/// Distinct domains, because a list of 1300 rows names about 1200 domains
+/// and the same mailbox provider many times; the resolver's own cache would
+/// have deduplicated the repeats too, but only one at a time.
+async fn warm(mx: &dyn MailDomains, domains: impl IntoIterator<Item = String>) -> MxTable {
+    let distinct: BTreeSet<String> = domains.into_iter().collect();
+    stream::iter(distinct)
+        .map(|domain| async move {
+            let verdict = mx.lookup(&domain).await;
+            (domain, verdict)
+        })
+        .buffer_unordered(MX_IN_FLIGHT)
+        .collect()
+        .await
+}
+
 /// report. `None` — write it, which includes the case where the resolver said
 /// nothing at all: that bumps [`Report::mx_unknown`] and the row lands. See
 /// the module header for why a silent resolver must not refuse anybody.
@@ -768,11 +834,19 @@ pub async fn discover(
 /// Called after the cheap refusals of each loop, so a row that is going to be
 /// refused for having no company costs no DNS question.
 async fn no_mail_here(
+    table: &MxTable,
     mx: &dyn MailDomains,
     address: &EmailAddress,
     report: &mut Report,
 ) -> Option<&'static str> {
-    match mx.lookup(address.domain().as_str()).await {
+    let domain = address.domain().as_str();
+    // Every domain of a list is in the table by construction; the fallback
+    // is for a caller that warmed nothing, and costs it what it cost before.
+    let verdict = match table.get(domain) {
+        Some(verdict) => verdict.clone(),
+        None => mx.lookup(domain).await,
+    };
+    match verdict {
         Ok(verdict) if verdict.accepts() => None,
         Ok(verdict) => {
             report.no_mail_domain += 1;
@@ -982,6 +1056,69 @@ mod tests {
     /// in this module asks the real DNS anything.
     fn anywhere() -> MockMailDomains {
         MockMailDomains::everywhere()
+    }
+
+    /// A resolver that counts, and wraps the mock so it never has to know
+    /// what a verdict looks like.
+    struct Counting {
+        inner: MockMailDomains,
+        asked: std::sync::Mutex<Vec<String>>,
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl MailDomains for Counting {
+        async fn lookup(&self, domain: &str) -> Result<MailDomain, ProviderError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.asked.lock().expect("not poisoned").push(domain.to_owned());
+            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(now, SeqCst);
+            // Long enough for the questions to overlap if they are asked
+            // together, short enough not to be a wait if they are not.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            self.in_flight.fetch_sub(1, SeqCst);
+            self.inner.lookup(domain).await
+        }
+    }
+
+    /// The 408 of 2026-09-19, as a rule: a list's domains are asked about
+    /// together and each distinct one once, so a thousand rows cost a few
+    /// round trips rather than a thousand in a row.
+    #[tokio::test]
+    async fn a_lists_domains_are_asked_together_and_each_once() {
+        let mx = Counting {
+            inner: MockMailDomains::everywhere(),
+            asked: std::sync::Mutex::new(Vec::new()),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            peak: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let six = [
+            "a@one.example", "b@one.example", "c@two.example",
+            "d@two.example", "e@three.example", "f@three.example",
+        ]
+        .map(|s| EmailAddress::parse(s).expect("address"));
+
+        let table = warm(&mx, six.iter().map(|a| a.domain().as_str().to_owned())).await;
+
+        let mut asked = mx.asked.lock().expect("not poisoned").clone();
+        asked.sort();
+        assert_eq!(asked, ["one.example", "three.example", "two.example"], "each once");
+        assert_eq!(table.len(), 3);
+        assert!(table.values().all(|v| v.as_ref().is_ok_and(|d| d.accepts())));
+        assert!(
+            mx.peak.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the questions overlapped, they were not asked one after the other"
+        );
+
+        // And the walk reads the table: no question is asked again.
+        let before = mx.asked.lock().expect("not poisoned").len();
+        let mut report = Report::default();
+        for address in &six {
+            assert!(no_mail_here(&table, &mx, address, &mut report).await.is_none());
+        }
+        assert_eq!(mx.asked.lock().expect("not poisoned").len(), before);
+        assert_eq!(report.mx_unknown, 0);
     }
 
     // -- the parser --------------------------------------------------------

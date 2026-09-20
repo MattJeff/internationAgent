@@ -24,6 +24,7 @@ agentos-app = { path = "crates/app" }
 
 anyhow = "1"
 async-trait = "0.1"
+futures-util = "0.3"
 axum = { version = "0.8.9", features = ["macros"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }

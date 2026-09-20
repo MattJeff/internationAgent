@@ -12,6 +12,7 @@ agentos-store.workspace = true
 a2a-lf.workspace = true
 a2a-server-lf.workspace = true
 async-trait.workspace = true
+futures-util.workspace = true
 # RFC 9421 puts a signature on the wire as base64, and a JWK's `x` member is
 # base64url. Was a dev-dependency; `http_signature` and `peer_keys` need it in
 # the build proper.

@@ -125,6 +125,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "futures-util",
  "hmac 0.12.1",
  "pdf-extract",
  "rand 0.9.5",
