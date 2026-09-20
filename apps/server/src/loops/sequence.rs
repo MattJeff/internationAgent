@@ -166,7 +166,8 @@ mod tests {
             &[
                 Step::Wait { hours: 1 },
                 Step::Email {
-                    brief: "hello".to_owned(),
+                    brief: Some("hello".to_owned()),
+                    variants: Vec::new(),
                 },
             ],
         )

@@ -330,7 +330,36 @@ pub fn by_model(sample: Sample, calls_per_turn: f64) -> Vec<(ModelId, usize, f64
 /// invalider les figures. Un re-pin complet (`--live`, deux runs) dépenserait
 /// des tours réels pour remesurer une grandeur qu'un booléen de la Gate
 /// n'atteint pas.
-pub const DIGEST: &str = "388217afd275174c";
+/// # Déplacé le 2026-09-20, et voici pourquoi les chiffres ne le sont pas
+///
+/// L'étape Approach du plan commercial (`rolepack_sales`) nomme désormais le
+/// palier public de `visa.orizn.app` qui correspond au compte — le nom, le
+/// prix et l'URL de la page — avec la consigne de l'énoncer comme un fait sur
+/// une page publique, jamais comme une proposition : `may_propose` refuse
+/// toujours `PaymentCreate` et `ContractSign`, et le test
+/// `the_approach_step_names_the_tier_as_a_fact_and_not_as_a_proposal` le
+/// re-vérifie. C'est du **prompt** — trois phrases d'instruction sur un seul
+/// des six sièges, à une seule étape — donc du jeton, donc `digest` a bougé.
+///
+/// Mesuré avant de re-piner, sur l'arbre intégré de la même vague (corps
+/// sortant conservé, `contacts_list?email=`, MX en parallèle, variantes de
+/// séquence) : le hachage est `51aaffc2dae7a911` avec et sans ces quatre
+/// autres changements. Aucun d'eux n'est du prompt — une colonne écrite, un
+/// filtre de route, un préchargement DNS, une colonne de run — et aucune ligne
+/// de catalogue n'est entrée : `sequences_variants_measure` est une route de
+/// lecture pour l'opérateur, pas un outil du tour. Les appels par tour n'ont
+/// donc aucune raison d'avoir changé.
+///
+/// Ce qui autorise le re-pin sans re-mesure est le même précédent que les deux
+/// fois précédentes : un écart d'une phrase de plan sur un siège ne déplace
+/// pas un ordre de grandeur affiché à ±20 %.
+///
+/// Le même jour, un mot plus tard : le fondateur a tranché que la phrase nomme
+/// le palier et pointe la page **sans dire le prix** — c'est la page qui le
+/// dit. La phrase a perdu « at $49 a month » et gagné « name no price » ;
+/// `51aaffc2dae7a911` est devenu `8f24a5b61db46939` pour ça et rien d'autre
+/// (mesuré : la suite `rolepack_sales::` seule a changé, 17/17).
+pub const DIGEST: &str = "8f24a5b61db46939";
 
 // ---------------------------------------------------------------------------
 // The company, as the operator wrote it down

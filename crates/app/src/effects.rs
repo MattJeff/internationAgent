@@ -748,6 +748,12 @@ pub struct SentEmail {
     pub id: ProviderMessageId,
     /// `slug@domain`, the envelope sender as sent.
     pub from: String,
+    /// The plain-text body that left, so the row on the thread can carry it.
+    /// Before this, `messages.body` was written empty on every outbound mail
+    /// while every inbound one kept its text — so nothing could be read back
+    /// about what we had actually said, to measure it or to avoid repeating
+    /// it in a follow-up. Same class of hole as the `from` column before 0094.
+    pub body: String,
 }
 
 /// A rendered SMS, minus the recipient.
@@ -1506,6 +1512,7 @@ impl Effects {
                 }
             }
         };
+        let body_text = body.body_text.clone();
         let email = OutboundEmail {
             from: from.clone(),
             // The recipient is the one that was ruled on, not one the renderer
@@ -1524,7 +1531,11 @@ impl Effects {
         let mut extra = Map::new();
         extra.insert("from".to_owned(), json!(from));
         let id = self.dispatch_email(ok, email, extra).await?;
-        Ok(SentEmail { id, from })
+        Ok(SentEmail {
+            id,
+            from,
+            body: body_text,
+        })
     }
 
     /// Put an issued invoice in front of the customer: the document
@@ -4003,6 +4014,7 @@ impl Effects {
                 employee,
                 to,
                 Some(subject),
+                &sent.body,
                 &sent.from,
                 sent.id.as_str(),
                 now,

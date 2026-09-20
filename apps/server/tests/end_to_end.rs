@@ -457,9 +457,24 @@ impl Server {
                 seen = states;
                 idle_since = Instant::now();
             } else if idle_since.elapsed() >= CONVERGE_DEADLINE {
+                // The server writes its log to a file nobody prints, so a
+                // wedge on CI used to be unreadable: the resources table said
+                // `provisioning` and nothing said why. The loop's own last
+                // lines are the only thing that can.
+                let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+                let tail: Vec<&str> = log
+                    .lines()
+                    .rev()
+                    .take(80)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
                 panic!(
-                    "the provisioning loop moved nothing for {}s; wedged: {employee:#}",
-                    CONVERGE_DEADLINE.as_secs()
+                    "the provisioning loop moved nothing for {}s; wedged: {employee:#}\n--- server log, last {} lines ---\n{}",
+                    CONVERGE_DEADLINE.as_secs(),
+                    tail.len(),
+                    tail.join("\n")
                 );
             }
             std::thread::sleep(Duration::from_millis(100));

@@ -61,6 +61,16 @@
 //!   contacting anyone. An unreproduced finding is a false statement about
 //!   another company's product, so the briefing makes it a precondition and
 //!   the plan makes it a stage.
+//! * **It names a public tier and proposes none.** The approach step carries
+//!   the tier of `visa.orizn.app` that matches the account on what is known,
+//!   and the page it is on. That is a fact about a public page, and it stays
+//!   one because [`tier_for`] never rounds up: with no volume on record — which
+//!   is every approach, since volume is asked at `Qualify`, one stage later —
+//!   it names the lowest tier a commercial account can sit on. A seat that
+//!   said "the tier that fits you is the $199 one" on no evidence would be
+//!   proposing, in the only voice this pack has for proposing, and the line
+//!   `may_propose` draws around `PaymentCreate` and `ContractSign` would be
+//!   crossed by a sentence rather than by an action.
 //!
 //! Everything else — the briefing is a `&'static str` because the cache
 //! breakpoint sits at the end of the prefix, the plan is data recomputed each
@@ -591,7 +601,12 @@ impl RolePack {
                 format!(
                     "Approach that person over {channel} with the reproduced finding, what it \
                      costs a {segment} to get this wrong, and a plain opt-out. Say who you are \
-                     and why them. {}",
+                     and why them. {} {}",
+                    // `None`: the objective carries no volume and the plan is
+                    // computed before anyone has replied, so what is known at
+                    // this step is the segment. See [`tier_for`] for why that
+                    // yields the lowest tier and not a guess at a higher one.
+                    tier_line(tier_for(segment, None)),
                     self.outreach_budget()
                 ),
             ),
@@ -727,6 +742,149 @@ impl fmt::Display for Segment {
             Segment::CruiseLine => "cruise line",
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tier
+// ---------------------------------------------------------------------------
+
+/// The public page the four tiers are read from. Pointed to, never restated:
+/// a URL is a fact the prospect verifies in one click, a price typed by a
+/// seller is a claim the company owes.
+pub const PRICING_PAGE: &str = "https://visa.orizn.app/visa-api";
+
+/// The four public tiers of `visa.orizn.app`, as `docs/ROADMAP_CROISSANCE.md`
+/// read them on 2026-09-13 and as `stripe_subscriptions` models them.
+///
+/// Closed and ordered from cheapest up, so that "the lowest tier that fits" is
+/// a comparison and not a lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Tier {
+    /// $0, 100 requests, non-commercial. No account this pack sells to can sit
+    /// here: every [`Segment`] uses the answer commercially.
+    Free,
+    /// $49, the commercial right, 30 000 requests a month.
+    Starter,
+    /// $199, change webhook, 99.9 % SLA, a named contact, 250 000 requests.
+    Pro,
+    /// From $600, white label and redistribution.
+    Enterprise,
+}
+
+impl Tier {
+    /// The name on the page.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Tier::Free => "Free",
+            Tier::Starter => "Starter",
+            Tier::Pro => "Pro",
+            Tier::Enterprise => "Enterprise",
+        }
+    }
+
+    /// The monthly price in US dollars; `Enterprise` is the floor of "from".
+    pub const fn price_usd(self) -> u32 {
+        match self {
+            Tier::Free => 0,
+            Tier::Starter => 49,
+            Tier::Pro => 199,
+            Tier::Enterprise => 600,
+        }
+    }
+
+    /// The requests a month the tier includes, where the page states one.
+    const fn monthly_requests(self) -> Option<u64> {
+        match self {
+            Tier::Free => Some(100),
+            Tier::Starter => Some(30_000),
+            Tier::Pro => Some(250_000),
+            Tier::Enterprise => None,
+        }
+    }
+}
+
+/// A tier and the one sentence that justifies it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierFit {
+    pub tier: Tier,
+    pub reason: String,
+}
+
+/// The public tier that matches an account on what is known — and only that.
+///
+/// # The boundary this function keeps
+///
+/// "The tier that matches your volume is Starter, here is the page" is a
+/// fact about a public page. "I can do the $199 one" is a commercial term, and
+/// this pack's job ends before commercial terms exist —
+/// [`RolePack::may_propose`] refuses `PaymentCreate` and `ContractSign` for
+/// that reason. A sentence can cross the same line an action cannot, and the
+/// way it crosses is by *rounding up*: a tier named above what the facts
+/// support is a price put on the table, dressed as a reading.
+///
+/// So the rule is asymmetric on purpose. `Free` is never returned — every
+/// segment sold to uses the data commercially, and the free tier's licence
+/// excludes that, which is a fact and not a judgement. Above it, the tier is
+/// the lowest whose request allowance covers the stated volume, and with no
+/// volume stated it is `Starter`. Missing evidence lowers the answer; it never
+/// raises it. A seat that wants to name `Pro` needs the prospect's own number
+/// for it, and that number is asked at [`Stage::Qualify`] — after the
+/// approach, which is why the plan calls this with `None`.
+///
+/// The `segment` is what establishes commercial use and what the reason
+/// sentence names; it does not move the tier. Pure, so the plan stays pure.
+pub fn tier_for(segment: Segment, monthly_requests: Option<u64>) -> TierFit {
+    let Some(volume) = monthly_requests else {
+        return TierFit {
+            tier: Tier::Starter,
+            reason: format!(
+                "a {segment} uses the answer commercially, which the free tier's licence \
+                 excludes, and no volume is on record yet, so the lowest tier that fits is \
+                 Starter"
+            ),
+        };
+    };
+    // Cheapest first, `Free` skipped: commercial use is settled by the segment.
+    let tier = [Tier::Starter, Tier::Pro]
+        .into_iter()
+        .find(|tier| {
+            tier.monthly_requests()
+                .is_some_and(|allowance| volume <= allowance)
+        })
+        .unwrap_or(Tier::Enterprise);
+    let reason = match tier.monthly_requests() {
+        Some(allowance) => format!(
+            "a {segment} uses the answer commercially and stated {volume} requests a month, \
+             within the {allowance} that {} includes",
+            tier.name()
+        ),
+        None => format!(
+            "a {segment} uses the answer commercially and stated {volume} requests a month, \
+             above the 250000 that Pro includes, which only the Enterprise tier covers"
+        ),
+    };
+    TierFit { tier, reason }
+}
+
+/// The sentence the approach step carries about the tier.
+///
+/// Written in the voice of the plan: a fact to state, and the words that would
+/// turn it into a proposal named so they are not used. The words themselves are
+/// what the test forbids, so this sentence avoids them even in the negative.
+///
+/// **No price in the sentence** — the founder's decision of 2026-09-20. The
+/// tier is named and the page is pointed to; what the tier costs is the
+/// page's to say. A number in a seat's mail is the thing a reader quotes
+/// back, and the day the page changes it the mail is wrong about it.
+fn tier_line(fit: TierFit) -> String {
+    format!(
+        "If Orizn's cost comes up, the public tier that matches this account on what is known \
+         is {} — {}. Point them to {PRICING_PAGE} and state it as a fact about a public page, \
+         never as a proposal: name no price, no term, no start date, and no tier above the one \
+         the facts support — the page says what it costs, not you.",
+        fit.tier.name(),
+        fit.reason
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1420,6 +1578,77 @@ mod tests {
         };
         let plan = sales().with_limits(opted_in).plan(&objective());
         assert!(plan[3].instruction.contains("at most 12 new contacts"));
+    }
+
+    // -- the tier ----------------------------------------------------------
+
+    /// No signal lowers the answer and never raises it: every segment lands on
+    /// the cheapest commercial tier, and none on the free one.
+    #[test]
+    fn without_a_volume_every_segment_sits_on_the_lowest_commercial_tier() {
+        for segment in Segment::ALL {
+            let fit = tier_for(segment, None);
+            assert_eq!(fit.tier, Tier::Starter, "{segment} was rounded up");
+            assert!(
+                fit.reason.contains(&segment.to_string()),
+                "the reason does not name the segment: {}",
+                fit.reason
+            );
+        }
+        assert_eq!(Tier::Starter.price_usd(), 49);
+        assert!(Tier::Free < Tier::Starter && Tier::Pro < Tier::Enterprise);
+    }
+
+    /// A stated volume moves the tier to the lowest allowance that covers it.
+    #[test]
+    fn a_stated_volume_picks_the_lowest_tier_that_covers_it() {
+        let tier = |volume: u64| tier_for(Segment::Ota, Some(volume)).tier;
+        // Even a volume the free tier would hold is commercial use.
+        assert_eq!(tier(50), Tier::Starter);
+        assert_eq!(tier(30_000), Tier::Starter);
+        assert_eq!(tier(30_001), Tier::Pro);
+        assert_eq!(tier(250_000), Tier::Pro);
+        assert_eq!(tier(250_001), Tier::Enterprise);
+        assert!(
+            tier_for(Segment::Ota, Some(30_001))
+                .reason
+                .contains("30001 requests")
+        );
+    }
+
+    /// The approach step names the tier and the page, and none of the words a
+    /// proposal is made of. `may_propose` still refuses `PaymentCreate` and
+    /// `ContractSign` — see `the_sales_role_can_neither_pay_nor_sign`, which
+    /// this change does not touch: the tier is a sentence, and that test is
+    /// what keeps the sentence from ever becoming an action.
+    #[test]
+    fn the_approach_step_names_the_tier_as_a_fact_and_not_as_a_proposal() {
+        let plan = sales().plan(&objective());
+        let approach = &plan[3].instruction;
+        assert!(approach.contains("Starter"), "{approach}");
+        assert!(
+            !approach.contains('$'),
+            "no price in a seat's mail: {approach}"
+        );
+        assert!(approach.contains(PRICING_PAGE), "{approach}");
+        assert!(approach.contains("fact about a public page"), "{approach}");
+        for word in ["offer", "discount", "deal", "for you", "I can give"] {
+            assert!(
+                !approach.to_lowercase().contains(&word.to_lowercase()),
+                "the approach step proposes rather than states: {word:?} in {approach}"
+            );
+        }
+        // The line is the same fact for every segment, and never a price.
+        for segment in Segment::ALL {
+            let plan = sales().plan(&Objective {
+                segment,
+                ..objective()
+            });
+            assert!(plan[3].instruction.contains("Starter"), "{segment}");
+            assert!(!plan[3].instruction.contains('$'), "{segment}");
+        }
+        assert!(!sales().may_propose(ActionKind::PaymentCreate));
+        assert!(!sales().may_propose(ActionKind::ContractSign));
     }
 
     #[test]

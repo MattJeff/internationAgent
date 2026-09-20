@@ -64,6 +64,7 @@ CHROME_MAC="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 REEL=0
 RECEVOIR=0
+RELANCER=0
 ACTION=monter
 for arg in "$@"; do
   case "$arg" in
@@ -71,8 +72,9 @@ for arg in "$@"; do
     --recevoir) RECEVOIR=1 ;;
     --arreter) ACTION=arreter ;;
     --effacer) ACTION=effacer ;;
+    --relancer) RELANCER=1 ;;
     -h|--help) sed -n '3,41p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "je ne connais pas « $arg ». --reel, --recevoir, --arreter, --effacer, --help." >&2; exit 2 ;;
+    *) echo "je ne connais pas « $arg ». --reel, --recevoir, --relancer, --arreter, --effacer, --help." >&2; exit 2 ;;
   esac
 done
 
@@ -100,6 +102,18 @@ arreter_pid() { # fichier-pid, nom, secondes d'attente
     dit "le pid $pid de $2 ne tourne plus."
   fi
   rm -f "$1"
+}
+
+# Vrai si le serveur lancé par ce script tourne ET tournait déjà en réel : la
+# clé Resend dans son environnement, et pas de faux correspondant devant. Lu
+# sur le processus lui-même (`ps eww`), pas dans un fichier qui pourrait
+# raconter autre chose que ce qui tourne.
+deja_reel() {
+  [ -f "$PIDFILE" ] || return 1
+  local pid; pid="$(cat "$PIDFILE")"
+  kill -0 "$pid" 2>/dev/null || return 1
+  local env; env="$(ps eww -p "$pid" -o command= 2>/dev/null | tr ' ' '\n')"
+  printf '%s\n' "$env" | grep -q '^EMAIL_API_KEY=' && ! printf '%s\n' "$env" | grep -q '^EMAIL_API_BASE='
 }
 
 arreter() {
@@ -160,6 +174,12 @@ if [ "$REEL" = 1 ]; then
     # rien ne sort de la machine, et un avertissement qui ment la première fois
     # n'est plus lu la seconde.
     dit "--reel contre EMAIL_API_BASE=$EMAIL_API_BASE : l'adaptateur Resend est le vrai, son correspondant ne l'est pas. Rien ne sortira de cette machine."
+  elif [ "$RELANCER" = 1 ] && deja_reel; then
+    # Le OUI a été tapé pour passer en réel ; relancer un binaire sur une
+    # instance qui y est déjà ne change pas ce qui sort de la machine. Le
+    # redemander à chaque nouveau binaire apprendrait à ne plus le lire — et
+    # une instance qui n'était PAS en réel le demande, elle, comme avant.
+    dit "--relancer sur une instance déjà en réel : je le reste, sans redemander OUI."
   else
     cat >&2 <<'AVERT'
 
@@ -181,8 +201,13 @@ fi
 # Le port : le nôtre, ou personne.
 if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   if [ -f "$PIDFILE" ] && lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | grep -qx "$(cat "$PIDFILE")"; then
-    dit "le serveur de ce script écoute déjà sur $PORT ; je l'arrête pour repartir propre."
-    arreter; sleep 1
+    if [ "$RELANCER" = 1 ]; then
+      dit "je relance le serveur seul sur $PORT ; le tunnel et Chrome restent tels quels."
+      arreter_pid "$PIDFILE" "serveur" 20; sleep 1
+    else
+      dit "le serveur de ce script écoute déjà sur $PORT ; je l'arrête pour repartir propre."
+      arreter; sleep 1
+    fi
   else
     refuse "quelque chose écoute déjà sur le port $PORT et ce n'est pas moi. Choisis-en un autre : PORT=8788 scripts/ce-soir.sh"
   fi
@@ -259,6 +284,17 @@ if [ "$RECEVOIR" = 1 ]; then
   # Celui d'avant, s'il tourne encore : une nouvelle exécution a de toute façon
   # une nouvelle adresse, et écraser le fichier de pid laisserait l'ancien
   # tunnel ouvert sans que rien ne sache plus l'arrêter.
+  ADRESSE=""
+  if [ "$RELANCER" = 1 ] && [ -f "$TUNNEL_PIDFILE" ] && kill -0 "$(cat "$TUNNEL_PIDFILE")" 2>/dev/null; then
+    ADRESSE="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_JOURNAL" | head -1 || true)"
+  fi
+  if [ -n "$ADRESSE" ]; then
+    # Un tunnel rapide change d'adresse à chaque ouverture, et c'est cette
+    # adresse qui est collée dans Resend. Un nouveau binaire n'a aucune raison
+    # de la faire changer : le tunnel qui vit est gardé, l'URL reste bonne.
+    PUBLIC="$ADRESSE"
+    dit "tunnel conservé : $PUBLIC (pid $(cat "$TUNNEL_PIDFILE")) — l'URL collée dans Resend reste bonne."
+  else
   arreter_pid "$TUNNEL_PIDFILE" "l'ancien tunnel" 10
   dit "j'ouvre un tunnel rapide (sans compte, sans dépense)…"
   : > "$TUNNEL_JOURNAL"
@@ -276,6 +312,7 @@ if [ "$RECEVOIR" = 1 ]; then
   [ -n "$ADRESSE" ] || { tail -20 "$TUNNEL_JOURNAL" >&2; refuse "cloudflared n'a annoncé aucune adresse en 40 s. Journal : $TUNNEL_JOURNAL"; }
   PUBLIC="$ADRESSE"
   dit "tunnel ouvert : $PUBLIC (pid $(cat "$TUNNEL_PIDFILE"))"
+  fi
 fi
 
 # ---------------------------------------------------------------------------

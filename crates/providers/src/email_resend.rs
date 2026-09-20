@@ -520,8 +520,18 @@ impl EmailProvider for ResendEmailProvider {
     }
 
     async fn verify_domain(&self, provider_domain_id: &str) -> Result<DomainState, ProviderError> {
-        // The verify call answers with nothing worth reading; the object is
-        // read back for the status and the per-record statuses.
+        // Read before asking. `POST /verify` starts an *asynchronous* re-check
+        // and, while it runs, Resend reports the domain `pending` again — even
+        // one that was verified a second earlier. Reading back straight after
+        // the POST therefore races that check and writes `pending` every time,
+        // which is what made a domain whose DNS was long published look
+        // unusable. A domain Resend already calls verified needs no check.
+        let read: DomainRow = self
+            .call_json(self.get(&format!("/domains/{provider_domain_id}")))
+            .await?;
+        if read.status == "verified" {
+            return Ok(read.state());
+        }
         self.call(self.post(&format!("/domains/{provider_domain_id}/verify")))
             .await?;
         let read: DomainRow = self
@@ -1375,15 +1385,36 @@ mod tests {
             ]
         );
 
+        // A domain Resend already calls verified is read and handed back
+        // WITHOUT a check being started. `POST /verify` re-tests the DNS
+        // asynchronously and reports `pending` while it runs, so asking again
+        // on a verified domain is how a usable domain reads as unusable —
+        // measured against the real API on 2026-09-20, on a domain whose DKIM
+        // and SPF had been published for days.
+        let before = fake.seen().len();
+        assert_eq!(
+            p.verify_domain("dom_0001").await.expect("verify").status,
+            DomainStatus::Verified
+        );
+        assert_eq!(
+            fake.seen()[before..],
+            ["GET /domains/dom_0001".to_owned()],
+            "a verified domain is read, never re-checked"
+        );
+
         // Resend's failed maps to ours; temporary_failure is still a wait.
+        // Each on its own domain: `dom_0001` is verified now, and the read
+        // above would hand it back before any check could change it.
+        fake.seed_domain("dom_warm", "warm.example.com", "pending");
         fake.verify_outcome("temporary_failure");
         assert_eq!(
-            p.verify_domain("dom_0001").await.expect("verify").status,
+            p.verify_domain("dom_warm").await.expect("verify").status,
             DomainStatus::Pending
         );
+        fake.seed_domain("dom_cold", "cold.example.com", "pending");
         fake.verify_outcome("failed");
         assert_eq!(
-            p.verify_domain("dom_0001").await.expect("verify").status,
+            p.verify_domain("dom_cold").await.expect("verify").status,
             DomainStatus::Failed
         );
     }

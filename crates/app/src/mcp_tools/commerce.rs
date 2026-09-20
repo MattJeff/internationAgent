@@ -124,8 +124,10 @@ pub fn tools() -> Vec<ToolDef> {
                  sans identifiant, donc un enrôlement commence toujours ici. Pagination par clé : \
                  `limit` (50 par défaut, 200 au plus) et `after`, le dernier `id` de la page \
                  précédente ; une page pleine porte `next_after`, une page courte termine la \
-                 marche. Cette lecture ne dit pas si une adresse est sur la liste de suppression \
-                 — un enrôlement refusé en 403 `suppressed` l'apprend à ce moment-là.",
+                 marche. **Pour un contact précis, `email`** : la page ne contient que lui, sans \
+                 marcher la liste — c'est le chemin d'un enrôlement qui suit un import. Cette \
+                 lecture ne dit pas si une adresse est sur la liste de suppression — un \
+                 enrôlement refusé en 403 `suppressed` l'apprend à ce moment-là.",
             method: Method::Get,
             path: "/v1/contacts",
             schema: schema(
@@ -140,11 +142,15 @@ pub fn tools() -> Vec<ToolDef> {
                         "minimum": 1,
                         "maximum": 200,
                         "description": "Nombre de lignes. 50 par défaut, borné à 200."
+                    },
+                    "email": {
+                        "type": "string",
+                        "description": "Une adresse exacte : la page ne contient que ce contact. Casse indifférente."
                     }
                 }),
                 &[],
             ),
-            query: &["after", "limit"],
+            query: &["after", "limit", "email"],
             raw_body: None,
             risk: Risk::Read,
         },
@@ -414,11 +420,13 @@ pub fn tools() -> Vec<ToolDef> {
             name: "sequences_create",
             title: "Définir une séquence",
             description: "Crée une séquence : une liste ordonnée de pas `email` (un brief, pas un \
-                 texte de mail), `wait` (des heures) et `branch` (sauter selon une ouverture ou un \
-                 clic). Définir ne contacte personne — c'est `sequences_enroll` qui met quelqu'un \
-                 dessus ; la liste est refusée en 400 si elle est vide, dépasse 12 pas, n'a aucun \
-                 pas `email`, saute hors de la liste ou boucle sans `wait` (elle tournerait à \
-                 chaque tick), et en 409 `name_taken` si une séquence vivante porte déjà ce nom.",
+                 texte de mail — ou plusieurs briefs dans `variants` pour un A/B), `wait` (des \
+                 heures) et `branch` (sauter selon une ouverture ou un clic). Définir ne contacte \
+                 personne — c'est `sequences_enroll` qui met quelqu'un dessus et tire sa variante ; \
+                 la liste est refusée en 400 si elle est vide, dépasse 12 pas, n'a aucun pas \
+                 `email`, saute hors de la liste ou boucle sans `wait` (elle tournerait à chaque \
+                 tick), et en 409 `name_taken` si une séquence vivante porte déjà ce nom. Ce que \
+                 chaque variante a donné se lit sur `sequences_variants_measure`.",
             method: Method::Post,
             path: "/v1/sequences",
             schema: schema(
@@ -438,16 +446,26 @@ pub fn tools() -> Vec<ToolDef> {
                             "oneOf": [
                                 {
                                     "type": "object",
-                                    "description": "Réveiller le siège pour qu'il écrive. Ne poste rien lui-même.",
+                                    "description": "Réveiller le siège pour qu'il écrive. Ne poste rien lui-même. `brief` seul, ou `variants` pour un A/B.",
                                     "properties": {
                                         "kind": { "const": "email" },
                                         "brief": {
                                             "type": "string",
                                             "minLength": 1,
                                             "description": "Ce que l'employé doit écrire — l'intention, pas le texte du mail."
+                                        },
+                                        "variants": {
+                                            "type": "array",
+                                            "minItems": 1,
+                                            "items": { "type": "string", "minLength": 1 },
+                                            "description": "Plusieurs briefs : chaque run inscrit en tire un à l'inscription et le garde sur tous ses pas `email`. On compare des runs, pas des mails."
                                         }
                                     },
-                                    "required": ["kind", "brief"]
+                                    "required": ["kind"],
+                                    "oneOf": [
+                                        { "required": ["brief"] },
+                                        { "required": ["variants"] }
+                                    ]
                                 },
                                 {
                                     "type": "object",
@@ -500,8 +518,9 @@ pub fn tools() -> Vec<ToolDef> {
             name: "sequences_enroll",
             title: "Inscrire un contact dans une séquence",
             description: "Met un contact sur une séquence sous la responsabilité d'un siège : la \
-                 position est posée et le premier pas est joué au prochain tick. **Un pas `email` \
-                 ne poste rien** — il réserve une promesse au calendrier, et quand elle sonne le \
+                 position est posée, une variante est tirée pour ce run (déterministe, à partir \
+                 de son id ; il la garde sur tous ses pas `email`) et le premier pas est joué au \
+                 prochain tick. **Un pas `email` ne poste rien** — il réserve une promesse au calendrier, et quand elle sonne le \
                  siège est réveillé et écrit le mail lui-même, qui passe la Gate comme tout autre \
                  envoi (suppression, budget d'inconnus du jour, `MAX_TOUCHES`) ; refusé en 403 \
                  `suppressed` si l'adresse a demandé qu'on la laisse tranquille, en 409 si le \
@@ -549,6 +568,28 @@ pub fn tools() -> Vec<ToolDef> {
                  cause la plus fréquente.",
             method: Method::Get,
             path: "/v1/sequences/{id}/runs",
+            schema: schema(
+                json!({
+                    "id": { "type": "string", "format": "uuid", "description": "La séquence." }
+                }),
+                &["id"],
+            ),
+            query: &[],
+            raw_body: None,
+            risk: Risk::Read,
+        },
+        ToolDef {
+            name: "sequences_variants_measure",
+            title: "Ce que chaque variante d'une séquence a donné",
+            description: "Rend, par variante d'une séquence, combien de runs ont été inscrits, \
+                 ont envoyé au moins un mail, ont vu leur dernier mail ouvert, cliqué, et se sont \
+                 terminés par une réponse. Des **runs**, pas des mails : un inscrit tire sa \
+                 variante à `sequences_enroll` et la garde sur tous ses pas, donc chaque ligne \
+                 compare des parcours entiers. Une séquence sans `variants` rend une seule ligne. \
+                 Pour la position de chaque inscrit, c'est `sequences_runs_list`. L'`id` vient de \
+                 `sequences_list`.",
+            method: Method::Get,
+            path: "/v1/sequences/{id}/variants",
             schema: schema(
                 json!({
                     "id": { "type": "string", "format": "uuid", "description": "La séquence." }
@@ -1571,6 +1612,18 @@ mod tests {
             .map(|s| s["properties"]["kind"]["const"].as_str().expect("kind"))
             .collect();
         assert_eq!(kinds, ["email", "wait", "branch"]);
+        // An `email` step is `brief` or `variants`, and the route accepts both.
+        let email = &steps["items"]["oneOf"][0];
+        assert_eq!(email["required"], json!(["kind"]));
+        assert_eq!(
+            email["oneOf"],
+            json!([{ "required": ["brief"] }, { "required": ["variants"] }])
+        );
+        assert_eq!(email["properties"]["variants"]["minItems"], json!(1));
+
+        let measure = find("sequences_variants_measure");
+        assert_eq!(required(&measure), ["id"]);
+        assert!(measure.risk.read_only());
 
         let enroll = find("sequences_enroll");
         assert_eq!(required(&enroll), ["id", "contact_id", "employee_id"]);

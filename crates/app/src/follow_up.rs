@@ -135,11 +135,15 @@ pub fn subject(contact: &str) -> String {
 /// `from` is the sender the mail actually left with — chosen by
 /// `sending_domain::pick_from`, which reads it back from this row to keep a
 /// thread on one address. Before 0094 the column was written empty here.
+// The arguments are the columns of the row this writes; a struct for them
+// would be that row, spelled twice.
+#[allow(clippy::too_many_arguments)]
 pub async fn sent(
     tx: &mut TenantTx<'_>,
     employee: EmployeeId,
     to: &EmailAddress,
     subject: Option<&str>,
+    body: &str,
     from: &str,
     provider_message_id: &str,
     now: DateTime<Utc>,
@@ -155,9 +159,9 @@ pub async fn sent(
     sqlx::query(
         "INSERT INTO messages \
              (id, tenant_id, conversation_id, employee_id, channel, direction, sender, \
-              recipients, provider_message_id, subject, trust_label, idempotency_key, \
-              received_at, created_at) \
-         VALUES ($1, $2, $3, $4, $5, 'outbound', $11, $6, $7, $8, 'trusted', $9, $10, $10) \
+              recipients, provider_message_id, subject, body, trust_label, \
+              idempotency_key, received_at, created_at) \
+         VALUES ($1, $2, $3, $4, $5, 'outbound', $11, $6, $7, $8, $12, 'trusted', $9, $10, $10) \
          ON CONFLICT (tenant_id, idempotency_key) DO NOTHING",
     )
     .bind(Uuid::now_v7())
@@ -171,6 +175,7 @@ pub async fn sent(
     .bind(format!("sent:{provider_message_id}"))
     .bind(now)
     .bind(from)
+    .bind(body)
     .execute(&mut ***tx)
     .await?;
     sqlx::query("UPDATE conversations SET last_message_at = $2, updated_at = $2 WHERE id = $1")
@@ -369,6 +374,7 @@ mod tests {
             employee,
             &prospect(),
             Some("hello"),
+            "the body that left",
             "lena@ours.example",
             id,
             now,
@@ -380,6 +386,43 @@ mod tests {
             .expect("schedule");
         tx.commit().await.expect("commit");
         (conversation, promised)
+    }
+
+    /// Ce qui est parti est relisible : la ligne sortante porte son texte.
+    ///
+    /// Elle ne le portait pas. `sent` écrivait l'objet et laissait `body` au
+    /// défaut vide, donc chaque e-mail que la maison envoyait disparaissait
+    /// dès qu'il était parti, là où chaque e-mail reçu gardait le sien. Rien
+    /// ne pouvait donc être mesuré sur ce qu'on avait dit, ni relu par une
+    /// relance pour éviter de le redire.
+    #[tokio::test]
+    async fn an_outbound_row_keeps_the_text_that_left() {
+        let Some((db, tenant, employee, _)) = fixture().await else {
+            return;
+        };
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        sent(
+            &mut tx,
+            employee,
+            &prospect(),
+            Some("hello"),
+            "the body that left",
+            "lena@ours.example",
+            "msg_body",
+            now,
+        )
+        .await
+        .expect("record the send");
+        let body: String = sqlx::query_scalar(
+            "SELECT body FROM messages WHERE provider_message_id = $1 AND direction = 'outbound'",
+        )
+        .bind("msg_body")
+        .fetch_one(&mut **tx)
+        .await
+        .expect("the row");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(body, "the body that left");
     }
 
     async fn outstanding(

@@ -3312,6 +3312,7 @@ pub(crate) mod tests {
             ada,
             &gruber,
             Some("hello"),
+            "the body that left",
             "ada@ours.example",
             "msg_1",
             past,
@@ -5507,7 +5508,8 @@ pub(crate) mod tests {
             &mut tx,
             "une-marche",
             &[Step::Email {
-                brief: "dire bonjour".to_owned(),
+                brief: Some("dire bonjour".to_owned()),
+                variants: Vec::new(),
             }],
         )
         .await
