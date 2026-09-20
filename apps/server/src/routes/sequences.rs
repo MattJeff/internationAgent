@@ -10,13 +10,14 @@
 //! Même auth que [`super::outreach`] : la clé du locataire, sous
 //! `with_api_stack`, donc RLS sur tout ce que ces handlers lisent.
 
-use agentos_app::sequence::{self, DefineError, EnrollError, Step};
+use agentos_app::sequence::{self, DefineError, EnrollError, Feed, FeedError, Step};
 use agentos_domain::ids::{EmployeeId, SequenceId};
 use agentos_store::db::{Db, StoreError};
+use agentos_store::policy::PolicyLoadError;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
 use serde::Deserialize;
@@ -31,6 +32,7 @@ pub fn router(db: Db) -> Router {
         .route("/v1/sequences", get(list).post(define))
         .route("/v1/sequences/{id}", axum::routing::delete(archive))
         .route("/v1/sequences/{id}/enroll", post(enroll))
+        .route("/v1/sequences/{id}/feed", put(set_feed).delete(remove_feed))
         .route("/v1/sequences/{id}/runs", get(runs))
         .route("/v1/sequences/{id}/variants", get(variants))
         .with_state(db)
@@ -46,6 +48,16 @@ struct NewSequence {
 struct Enrollment {
     contact_id: Uuid,
     employee_id: Uuid,
+}
+
+#[derive(Deserialize)]
+struct FeedBody {
+    employee_id: Uuid,
+    per_day: u32,
+    segment: String,
+    #[serde(default)]
+    countries: Vec<String>,
+    source: Option<String>,
 }
 
 /// `POST /v1/sequences` — 201 `{id}`, ou 400 avec le motif de validation.
@@ -136,6 +148,80 @@ async fn enroll(
         Json(json!({ "run_id": run.as_uuid() })),
     )
         .into_response())
+}
+
+/// `PUT /v1/sequences/{id}/feed` — 204 ; 400 `feed_over_budget` quand
+/// `per_day` dépasse le `max_new_contacts_per_day` effectif du siège (le
+/// détail dit les deux nombres) ; 400 pour la forme ; 404 séquence ou siège
+/// inconnus ici. Pourquoi le budget est lu ici et jamais dans la boucle :
+/// `agentos_app::sequence`, « Le flux ».
+async fn set_feed(
+    State(db): State<Db>,
+    principal: Principal,
+    Path(id): Path<Uuid>,
+    crate::error::JsonBody(body): crate::error::JsonBody<FeedBody>,
+) -> Result<Response, ApiError> {
+    let feed = Feed {
+        employee_id: EmployeeId::from_uuid(body.employee_id),
+        per_day: body.per_day,
+        segment: body.segment,
+        countries: body.countries,
+        source: body.source,
+    };
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    sequence::set_feed(
+        &mut tx,
+        SequenceId::from_uuid(id),
+        &feed,
+        Utc::now().date_naive(),
+    )
+    .await
+    .map_err(|err| match err {
+        FeedError::NotFound(what) => {
+            ApiError::not_found().with_detail(format!("no such {what} in this company"))
+        }
+        FeedError::BadSegment => {
+            ApiError::new(StatusCode::BAD_REQUEST, "bad_segment", "unknown segment")
+                .with_detail(err.to_string())
+        }
+        FeedError::OverBudget { .. } => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "feed_over_budget",
+            "the feed asks for more strangers a day than the seat may write to",
+        )
+        .with_detail(err.to_string()),
+        FeedError::ZeroPerDay | FeedError::BadCountry(_) => ApiError::bad_request(err.to_string()),
+        FeedError::Policy(PolicyLoadError::NoPlatformLayer) => ApiError::new(
+            StatusCode::CONFLICT,
+            "no_platform_policy",
+            "this deployment has no platform ceiling",
+        ),
+        FeedError::Policy(err) => {
+            tracing::error!(error = %err, "a feed could not read the seat's policy");
+            ApiError::internal()
+        }
+        FeedError::Store(err) => ApiError::from(err),
+    })?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `DELETE /v1/sequences/{id}/feed` — 204 ; 404 hors du locataire ou
+/// archivée. Les runs déjà inscrits continuent.
+async fn remove_feed(
+    State(db): State<Db>,
+    principal: Principal,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    sequence::remove_feed(&mut tx, SequenceId::from_uuid(id))
+        .await
+        .map_err(|err| match err {
+            StoreError::NotFound => ApiError::not_found().with_detail("no such live sequence"),
+            other => ApiError::from(other),
+        })?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// `GET /v1/sequences/{id}/runs` — chaque contact inscrit et où il en est.
@@ -452,5 +538,90 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
         let (_, body) = h.send("GET", "/v1/sequences", SECRET_A, None).await;
         assert!(!body["sequences"][0]["archived_at"].is_null(), "{body}");
+    }
+
+    /// **`per_day` is bounded by the seat's budget, and the feed reads back.**
+    /// The 400 names both numbers, because the operator's next move is to
+    /// pick one of them.
+    #[tokio::test]
+    async fn the_feed_is_bounded_by_the_seat_s_budget_and_reads_back() {
+        use agentos_domain::policy::PolicyLimits;
+        use agentos_store::policy;
+
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        policy::install(
+            &h.db,
+            h.a,
+            policy::Scope::Tenant,
+            &PolicyLimits {
+                max_new_contacts_per_day: 5,
+                ..PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("install the policy");
+        let (status, body) = h
+            .send(
+                "POST",
+                "/v1/sequences",
+                SECRET_A,
+                Some(json!({"name": "fed", "steps": [{"kind": "email", "brief": "hello"}]})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"].as_str().expect("id").to_owned();
+        let uri = format!("/v1/sequences/{id}/feed");
+
+        let (status, body) = h
+            .send(
+                "PUT",
+                &uri,
+                SECRET_A,
+                Some(json!({"employee_id": h.lena, "per_day": 6, "segment": "airline"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "feed_over_budget", "{body}");
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains('6') && detail.contains('5'), "{body}");
+
+        let (status, body) = h
+            .send(
+                "PUT",
+                &uri,
+                SECRET_A,
+                Some(json!({"employee_id": h.lena, "per_day": 5, "segment": "airline", "countries": ["fr"]})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        let (status, _) = h
+            .send(
+                "PUT",
+                &uri,
+                SECRET_B,
+                Some(json!({"employee_id": h.lena, "per_day": 1, "segment": "airline"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "the other company's seat");
+
+        let (_, body) = h.send("GET", "/v1/sequences", SECRET_A, None).await;
+        let mine = &body["sequences"][0];
+        assert_eq!(mine["feed"]["per_day"], 5, "{body}");
+        assert_eq!(mine["feed"]["countries"], json!(["FR"]), "{body}");
+        assert_eq!(mine["feed"]["employee_id"], json!(h.lena), "{body}");
+        assert_eq!(
+            mine["fed_on"],
+            json!(Utc::now().date_naive().to_string()),
+            "the day it is set counts as fed: {body}"
+        );
+
+        let (status, _) = h.send("DELETE", &uri, SECRET_B, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = h.send("DELETE", &uri, SECRET_A, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) = h.send("GET", "/v1/sequences", SECRET_A, None).await;
+        assert!(body["sequences"][0]["feed"].is_null(), "{body}");
     }
 }

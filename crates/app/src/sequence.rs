@@ -72,6 +72,52 @@
 //! depuis n'importe quelle base sans autre état. Quand un pas a moins de
 //! variantes que le maximum de la séquence, il lit la sienne modulo son propre
 //! nombre : un run n'est jamais sans brief.
+//!
+//! # Le flux : une séquence qui se nourrit seule
+//!
+//! Un inscrit que la Gate refuse a **dépensé sa promesse pour rien** — mesuré
+//! le 2026-09-20 : le sixième du jour est refusé `contact_budget_exhausted` et
+//! son run meurt en `not_sent` [`SEND_DEADLINE`] plus tard. Tenir cinq par jour
+//! sur une liste de 1300 demandait que quelqu'un inscrive exactement cinq
+//! contacts chaque matin. Un [`Feed`] sur la séquence (`sequences.feed`,
+//! `0111`) le fait à sa place : un siège, `per_day` contacts, un segment,
+//! l'ordre des pays, une liste d'origine ; [`feed`] les choisit et les inscrit
+//! par [`enroll`], le même verbe que la route, donc les mêmes refus.
+//!
+//! **Nourrir à 00:00 UTC plutôt que lire le budget.** `per_day` est validé une
+//! fois, à la pose ([`set_feed`]), contre le `max_new_contacts_per_day`
+//! effectif du siège (`policy::load`, les quatre couches intersectées). Ensuite
+//! la boucle ne lit jamais le budget : elle nourrit **une fois par jour UTC, au
+//! premier tick après minuit**, quand le compteur d'inconnus est neuf, et
+//! `per_day ≤ budget` suffit alors à ce qu'aucune promesse ne soit gaspillée.
+//! Lire le budget dans la boucle serait le lire au mauvais moment : il compte
+//! les envois du jour, pas les promesses posées, et une promesse posée à 09:00
+//! sonne quand elle veut — le budget lu à la pose ne dit rien de celui de
+//! l'envoi. La date, elle, dit tout : au premier tick du jour rien n'est parti.
+//! C'est aussi pourquoi la pose écrit `fed_on = aujourd'hui` : le jour où l'on
+//! pose, on ne sait pas ce que le siège a déjà écrit, et le premier jour sûr
+//! est demain. Ce que le fondateur inscrit à la main par-dessus est son choix
+//! et se voit dans `refusals_get`.
+//!
+//! **Un contact déjà écrit n'est pas re-démarché.** La sélection exclut tout
+//! contact vers qui une ligne `messages` sortante existe, quel que soit le
+//! siège. Pas parce qu'il coûterait un inconnu — il n'en coûte justement pas —
+//! mais parce qu'un flux est une prospection à froid et qu'une personne à qui
+//! l'on a déjà écrit a un fil, une histoire et une réponse peut-être : lui
+//! renvoyer « présentons-nous » par une machine est exactement ce que
+//! `MAX_TOUCHES` et la relance J+3 existent pour éviter. Le fondateur qui veut
+//! remettre quelqu'un sur une séquence le fait par `enroll`, en le sachant.
+//!
+//! Le reste des exclusions est celui d'`enroll`, vérifié avant plutôt qu'après
+//! pour ne pas dépenser une place du jour sur un refus : inactif, supprimé
+//! (`revenue_suppression_of`), déjà inscrit **un jour** sur cette séquence
+//! (n'importe quel état — un run fini est une séquence déjà jouée). L'ordre est
+//! celui des pays donnés (`array_position`) puis du plus ancien `created_at` :
+//! la liste se consomme comme elle a été importée, pays par pays.
+//!
+//! Zéro contact restant pose quand même `fed_on` et prévient (« feed
+//! exhausted », WARN) : le fondateur doit le voir sans deviner, et sans que la
+//! boucle recommence toutes les trente secondes.
 
 use agentos_domain::action::EmailAddress;
 use agentos_domain::ids::{
@@ -79,12 +125,14 @@ use agentos_domain::ids::{
 };
 use agentos_store::calendar;
 use agentos_store::db::{Db, StoreError, TenantTx};
-use chrono::{DateTime, TimeDelta, Utc};
+use agentos_store::policy::{self, PolicyLoadError};
+use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row as _;
 use uuid::Uuid;
 
 use crate::inbound;
+use crate::prospects::SEGMENTS;
 use crate::revenue::MAX_TOUCHES;
 
 /// Au plus tant de pas. Douze est trois emails, leurs attentes et leurs
@@ -333,12 +381,16 @@ pub struct Sequence {
     pub steps: Vec<Step>,
     pub created_at: DateTime<Utc>,
     pub archived_at: Option<DateTime<Utc>>,
+    /// Le flux qui la nourrit, s'il y en a un (voir « Le flux » en tête).
+    pub feed: Option<Feed>,
+    /// Le dernier jour UTC nourri ; posé aussi à la pose du flux.
+    pub fed_on: Option<NaiveDate>,
 }
 
 /// Les séquences du locataire, vivantes d'abord, les plus récentes en tête.
 pub async fn list(tx: &mut TenantTx<'_>) -> Result<Vec<Sequence>, StoreError> {
     let rows = sqlx::query(
-        "SELECT id, name, steps, created_at, archived_at FROM sequences \
+        "SELECT id, name, steps, created_at, archived_at, feed, fed_on FROM sequences \
          ORDER BY archived_at IS NOT NULL, created_at DESC",
     )
     .fetch_all(&mut ***tx)
@@ -351,8 +403,193 @@ pub async fn list(tx: &mut TenantTx<'_>) -> Result<Vec<Sequence>, StoreError> {
             steps: serde_json::from_value(row.get("steps")).unwrap_or_default(),
             created_at: row.get("created_at"),
             archived_at: row.get("archived_at"),
+            feed: row
+                .get::<Option<serde_json::Value>, _>("feed")
+                .and_then(|v| serde_json::from_value(v).ok()),
+            fed_on: row.get("fed_on"),
         })
         .collect())
+}
+
+/// Ce qui nourrit une séquence, tel que `sequences.feed` (`0111`) le porte.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Feed {
+    /// Le siège qui écrira : c'est son budget qui borne `per_day`.
+    pub employee_id: EmployeeId,
+    /// Combien de contacts par jour UTC, au plus le budget du siège.
+    pub per_day: u32,
+    /// `accounts.segment`, l'une des valeurs de [`SEGMENTS`].
+    pub segment: String,
+    /// Codes pays ISO-2, dans l'ordre où les servir ; vide = tous.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub countries: Vec<String>,
+    /// Le nom de liste écrit à l'import (`contacts.origin_ref`, `0107`) ;
+    /// `None` = toutes les listes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// Pourquoi un flux est refusé.
+#[derive(Debug, thiserror::Error)]
+pub enum FeedError {
+    #[error("no such {0} in this company")]
+    NotFound(&'static str),
+    #[error("`per_day` is at least 1")]
+    ZeroPerDay,
+    #[error("`segment` is one of {SEGMENTS:?}")]
+    BadSegment,
+    #[error("`countries` are ISO 3166-1 alpha-2 codes; {0:?} is not one")]
+    BadCountry(String),
+    #[error("`per_day` {per_day} is over this seat's max_new_contacts_per_day of {budget}")]
+    OverBudget { per_day: u32, budget: u32 },
+    #[error(transparent)]
+    Policy(PolicyLoadError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+impl From<sqlx::Error> for FeedError {
+    fn from(err: sqlx::Error) -> Self {
+        Self::Store(StoreError::from(err))
+    }
+}
+
+/// Poser (ou remplacer) le flux d'une séquence vivante. `per_day` est borné
+/// par le budget effectif du siège, et `fed_on` est posé à `today` : le premier
+/// jour nourri est demain, le seul dont on sait que le budget est neuf.
+pub async fn set_feed(
+    tx: &mut TenantTx<'_>,
+    sequence: SequenceId,
+    feed: &Feed,
+    today: NaiveDate,
+) -> Result<(), FeedError> {
+    if feed.per_day == 0 {
+        return Err(FeedError::ZeroPerDay);
+    }
+    if !SEGMENTS.contains(&feed.segment.as_str()) {
+        return Err(FeedError::BadSegment);
+    }
+    let countries: Vec<String> = feed
+        .countries
+        .iter()
+        .map(|c| {
+            let code = c.trim().to_ascii_uppercase();
+            (code.len() == 2 && code.bytes().all(|b| b.is_ascii_uppercase()))
+                .then_some(code)
+                .ok_or_else(|| FeedError::BadCountry(c.clone()))
+        })
+        .collect::<Result<_, _>>()?;
+    let seat: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM employees WHERE id = $1 AND lifecycle = 'active')",
+    )
+    .bind(feed.employee_id.as_uuid())
+    .fetch_one(&mut ***tx)
+    .await?;
+    if !seat {
+        return Err(FeedError::NotFound("employee"));
+    }
+    let budget = policy::load(tx, feed.employee_id)
+        .await
+        .map_err(FeedError::Policy)?
+        .limits()
+        .max_new_contacts_per_day;
+    if feed.per_day > budget {
+        return Err(FeedError::OverBudget {
+            per_day: feed.per_day,
+            budget,
+        });
+    }
+    let stored = Feed {
+        countries,
+        source: feed
+            .source
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        ..feed.clone()
+    };
+    let n = sqlx::query(
+        "UPDATE sequences SET feed = $2, fed_on = $3 WHERE id = $1 AND archived_at IS NULL",
+    )
+    .bind(sequence.as_uuid())
+    .bind(serde_json::to_value(&stored).map_err(|e| StoreError::conflict(e.to_string()))?)
+    .bind(today)
+    .execute(&mut ***tx)
+    .await?
+    .rows_affected();
+    if n == 0 {
+        return Err(FeedError::NotFound("sequence"));
+    }
+    Ok(())
+}
+
+/// Enlever le flux. [`StoreError::NotFound`] hors du locataire ou archivée ;
+/// une séquence sans flux est laissée telle quelle.
+pub async fn remove_feed(tx: &mut TenantTx<'_>, sequence: SequenceId) -> Result<(), StoreError> {
+    let n = sqlx::query("UPDATE sequences SET feed = NULL WHERE id = $1 AND archived_at IS NULL")
+        .bind(sequence.as_uuid())
+        .execute(&mut ***tx)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
+/// Nourrir une séquence pour `today`, si elle a un flux et n'a pas encore été
+/// nourrie ce jour-là. `None` sinon — y compris quand un autre tick vient de
+/// la réclamer : l'UPDATE qui pose `fed_on` est la réclamation, et le second
+/// ne touche aucune ligne. `Some(n)` : combien ont été inscrits, zéro compris.
+///
+/// Un siège du flux qui n'est plus actif rend l'erreur d'`enroll` et la
+/// transaction est à défaire : `fed_on` reste, la boucle réessaie au tick
+/// suivant et le journal le dit à chaque fois — un flux qui pointe sur un
+/// siège parti est à corriger, pas à taire.
+pub async fn feed(
+    tx: &mut TenantTx<'_>,
+    sequence: SequenceId,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+) -> Result<Option<usize>, EnrollError> {
+    let claimed: Option<serde_json::Value> = sqlx::query_scalar(
+        "UPDATE sequences SET fed_on = $2 \
+          WHERE id = $1 AND feed IS NOT NULL AND archived_at IS NULL \
+            AND (fed_on IS NULL OR fed_on < $2) \
+         RETURNING feed",
+    )
+    .bind(sequence.as_uuid())
+    .bind(today)
+    .fetch_optional(&mut ***tx)
+    .await?;
+    let Some(feed) = claimed.and_then(|v| serde_json::from_value::<Feed>(v).ok()) else {
+        return Ok(None);
+    };
+    let picked: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT c.id FROM contacts c JOIN accounts a ON a.id = c.account_id \
+          WHERE c.active AND c.email IS NOT NULL AND a.segment = $1 \
+            AND (cardinality($2::text[]) = 0 OR a.country = ANY($2)) \
+            AND ($3::text IS NULL OR c.origin_ref = $3) \
+            AND revenue_suppression_of(c.email, null::text) IS NULL \
+            AND NOT EXISTS (SELECT 1 FROM sequence_runs r \
+                             WHERE r.sequence_id = $4 AND r.contact_id = c.id) \
+            AND NOT EXISTS (SELECT 1 FROM messages m \
+                             WHERE m.direction = 'outbound' AND m.recipients ? c.email) \
+          ORDER BY array_position($2::text[], a.country) NULLS LAST, c.created_at, c.id \
+          LIMIT $5",
+    )
+    .bind(&feed.segment)
+    .bind(&feed.countries)
+    .bind(&feed.source)
+    .bind(sequence.as_uuid())
+    .bind(i64::from(feed.per_day))
+    .fetch_all(&mut ***tx)
+    .await?;
+    for contact in &picked {
+        enroll(tx, sequence, *contact, feed.employee_id, now).await?;
+    }
+    Ok(Some(picked.len()))
 }
 
 /// Archiver : le nom est libéré, les runs actifs continuent jusqu'au bout.
@@ -1674,5 +1911,304 @@ mod tests {
             .expect_err("archived");
         assert!(matches!(err, EnrollError::NotFound("sequence")), "{err}");
         tx.rollback().await.expect("rollback");
+    }
+
+    /// One more account and contact under `f.tenant`, with the columns the
+    /// feed reads: segment, country, list name, and an explicit `created_at`
+    /// so the order is the test's and not the clock's.
+    async fn prospect_in(
+        f: &Fixture,
+        segment: &str,
+        country: &str,
+        source: Option<&str>,
+        created_at: DateTime<Utc>,
+    ) -> Uuid {
+        let (account, contact) = (Uuid::now_v7(), Uuid::now_v7());
+        let mut admin = f.db.admin_tx_bypassing_rls().await.expect("admin");
+        sqlx::query(
+            "INSERT INTO accounts (id, tenant_id, legal_name, domain, segment, country) \
+             VALUES ($1, $2, 'Prospect', $3, $4, $5)",
+        )
+        .bind(account)
+        .bind(f.tenant.as_uuid())
+        .bind(format!("{}.example", account.simple()))
+        .bind(segment)
+        .bind(country)
+        .execute(&mut *admin)
+        .await
+        .expect("account");
+        sqlx::query(
+            "INSERT INTO contacts (id, tenant_id, account_id, full_name, email, origin, \
+                                   origin_ref, created_at) \
+             VALUES ($1, $2, $3, 'Someone', $4, $5, $6, $7)",
+        )
+        .bind(contact)
+        .bind(f.tenant.as_uuid())
+        .bind(account)
+        .bind(format!("someone@{}.example", account.simple()))
+        .bind(source.map(|_| "import"))
+        .bind(source)
+        .bind(created_at)
+        .execute(&mut *admin)
+        .await
+        .expect("contact");
+        admin.commit().await.expect("commit");
+        contact
+    }
+
+    /// The contacts the feed enrolled on `seq` — the active runs, as a set:
+    /// the runs of one feeding share a `started_at`, so their order is not
+    /// readable back.
+    async fn fed_contacts(f: &Fixture, seq: SequenceId) -> std::collections::BTreeSet<Uuid> {
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        let all = runs(&mut tx, seq).await.expect("runs");
+        tx.rollback().await.expect("rollback");
+        all.into_iter()
+            .filter(|r| r.state == "active")
+            .map(|r| r.contact_id)
+            .collect()
+    }
+
+    async fn fed(f: &Fixture, seq: SequenceId, day: NaiveDate) -> Option<usize> {
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        let n = feed(
+            &mut tx,
+            seq,
+            day,
+            day.and_hms_opt(0, 0, 30).expect("time").and_utc(),
+        )
+        .await
+        .expect("feed");
+        tx.commit().await.expect("commit");
+        n
+    }
+
+    async fn fed_on(f: &Fixture, seq: SequenceId) -> Option<NaiveDate> {
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        let mine = list(&mut tx).await.expect("list");
+        tx.rollback().await.expect("rollback");
+        mine.into_iter().find(|s| s.id == seq).expect("mine").fed_on
+    }
+
+    /// **The feed picks who is next, once a day, and says when it is dry.**
+    /// Countries in the order given, then the oldest first; the suppressed,
+    /// the already-enrolled, the already-written and the inactive are never
+    /// offered; the day it is set counts as fed; a second call the same day
+    /// does nothing; zero left still stamps the day.
+    #[tokio::test]
+    async fn a_feed_picks_who_is_next_once_a_day_and_says_when_it_is_dry() {
+        use agentos_domain::policy::PolicyLimits;
+        use agentos_store::policy;
+
+        let Some(f) = fixture().await else {
+            return;
+        };
+        policy::install(
+            &f.db,
+            f.tenant,
+            policy::Scope::Tenant,
+            &PolicyLimits {
+                max_new_contacts_per_day: 5,
+                ..PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("install the policy");
+        let t0 = Utc::now().trunc_subsecs(6);
+        let day = |n: i64| (t0 + TimeDelta::days(n)).date_naive();
+        let seq = defined(&f, &[email("hello")]).await;
+
+        let fr_old = prospect_in(&f, "airline", "FR", None, t0 - TimeDelta::days(5)).await;
+        let fr_new = prospect_in(&f, "airline", "FR", None, t0 - TimeDelta::days(1)).await;
+        let gb = prospect_in(&f, "airline", "GB", None, t0 - TimeDelta::days(3)).await;
+        let us = prospect_in(&f, "airline", "US", None, t0 - TimeDelta::days(8)).await;
+        let de_listed = prospect_in(
+            &f,
+            "airline",
+            "DE",
+            Some("liste-b"),
+            t0 - TimeDelta::days(2),
+        )
+        .await;
+        // Never offered: another segment, suppressed, enrolled once, inactive,
+        // and paul, to whom lena has already written.
+        prospect_in(&f, "ota", "FR", None, t0 - TimeDelta::days(9)).await;
+        let opted_out = prospect_in(&f, "airline", "FR", None, t0 - TimeDelta::days(9)).await;
+        let once = prospect_in(&f, "airline", "FR", None, t0 - TimeDelta::days(9)).await;
+        let gone = prospect_in(&f, "airline", "FR", None, t0 - TimeDelta::days(9)).await;
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        sqlx::query(
+            "INSERT INTO suppressions (id, tenant_id, channel, address, reason) \
+             SELECT $1, $2, 'email', email, 'opt_out' FROM contacts WHERE id = $3",
+        )
+        .bind(Uuid::now_v7())
+        .bind(f.tenant.as_uuid())
+        .bind(opted_out)
+        .execute(&mut **tx)
+        .await
+        .expect("suppress");
+        let run = enroll(&mut tx, seq, once, f.lena, t0).await.expect("once");
+        stop(&mut tx, run, "stopped", Some("not_sent"), t0)
+            .await
+            .expect("and finished");
+        sqlx::query("UPDATE contacts SET active = false WHERE id = $1")
+            .bind(gone)
+            .execute(&mut **tx)
+            .await
+            .expect("inactive");
+        tx.commit().await.expect("commit");
+        assert!(sent_by_lena(&f, "msg-1", t0).await.is_none());
+
+        // The rules of the shape, and the one that reads the seat's budget.
+        let plan = Feed {
+            employee_id: f.lena,
+            per_day: 2,
+            segment: "airline".to_owned(),
+            countries: vec!["gb".to_owned(), " fr ".to_owned()],
+            source: None,
+        };
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        for (bad, why) in [
+            (
+                Feed {
+                    per_day: 0,
+                    ..plan.clone()
+                },
+                "ZeroPerDay",
+            ),
+            (
+                Feed {
+                    segment: "cruise_line".to_owned(),
+                    ..plan.clone()
+                },
+                "BadSegment",
+            ),
+            (
+                Feed {
+                    countries: vec!["FRA".to_owned()],
+                    ..plan.clone()
+                },
+                "BadCountry",
+            ),
+            (
+                Feed {
+                    employee_id: EmployeeId::new_v7(t0),
+                    ..plan.clone()
+                },
+                "NotFound",
+            ),
+        ] {
+            let err = set_feed(&mut tx, seq, &bad, day(0)).await.expect_err(why);
+            assert!(format!("{err:?}").starts_with(why), "{why}: {err:?}");
+        }
+        let err = set_feed(
+            &mut tx,
+            seq,
+            &Feed {
+                per_day: 6,
+                ..plan.clone()
+            },
+            day(0),
+        )
+        .await
+        .expect_err("over the seat's budget");
+        assert!(
+            matches!(
+                err,
+                FeedError::OverBudget {
+                    per_day: 6,
+                    budget: 5
+                }
+            ),
+            "{err:?}"
+        );
+        set_feed(&mut tx, seq, &plan, day(0)).await.expect("set");
+        let mine = list(&mut tx).await.expect("list");
+        let stored = mine[0].feed.as_ref().expect("a feed");
+        assert_eq!(stored.countries, ["GB", "FR"], "normalised on the way in");
+        assert_eq!(
+            mine[0].fed_on,
+            Some(day(0)),
+            "the day it is set counts as fed"
+        );
+        tx.commit().await.expect("commit");
+        // The other company cannot set, remove, or see it.
+        let mut tx = f.db.tenant_tx(f.other).await.expect("tx");
+        let err = set_feed(
+            &mut tx,
+            seq,
+            &Feed {
+                employee_id: f.lena,
+                ..plan.clone()
+            },
+            day(0),
+        )
+        .await
+        .expect_err("not theirs");
+        assert!(matches!(err, FeedError::NotFound("employee")), "{err:?}");
+        assert!(matches!(
+            remove_feed(&mut tx, seq).await,
+            Err(StoreError::NotFound)
+        ));
+        tx.rollback().await.expect("rollback");
+
+        // Today is already fed; tomorrow: GB first, then the oldest FR.
+        assert_eq!(fed(&f, seq, day(0)).await, None);
+        assert_eq!(fed(&f, seq, day(1)).await, Some(2));
+        assert_eq!(fed_contacts(&f, seq).await, [gb, fr_old].into());
+        assert_eq!(fed(&f, seq, day(1)).await, None, "once a day");
+        assert_eq!(fed_contacts(&f, seq).await.len(), 2);
+        // The next day: the newer FR, and nobody else of GB or FR is left.
+        assert_eq!(fed(&f, seq, day(2)).await, Some(1));
+        assert_eq!(fed_contacts(&f, seq).await, [gb, fr_old, fr_new].into());
+        // Dry: the day is stamped all the same, so the loop does not retry.
+        assert_eq!(fed(&f, seq, day(3)).await, Some(0));
+        assert_eq!(fed_on(&f, seq).await, Some(day(3)));
+
+        // No countries: everyone of the segment, oldest first — US before DE.
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        set_feed(
+            &mut tx,
+            seq,
+            &Feed {
+                per_day: 1,
+                countries: Vec::new(),
+                ..plan.clone()
+            },
+            day(3),
+        )
+        .await
+        .expect("set");
+        tx.commit().await.expect("commit");
+        assert_eq!(fed(&f, seq, day(4)).await, Some(1));
+        assert!(fed_contacts(&f, seq).await.contains(&us));
+        // One list only: the DE contact, and only it.
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        set_feed(
+            &mut tx,
+            seq,
+            &Feed {
+                per_day: 5,
+                countries: Vec::new(),
+                source: Some("liste-b".to_owned()),
+                ..plan.clone()
+            },
+            day(4),
+        )
+        .await
+        .expect("set");
+        tx.commit().await.expect("commit");
+        assert_eq!(fed(&f, seq, day(5)).await, Some(1));
+        assert_eq!(
+            fed_contacts(&f, seq).await,
+            [gb, fr_old, fr_new, us, de_listed].into()
+        );
+
+        // Removed: nothing is fed, and the day is not stamped.
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        remove_feed(&mut tx, seq).await.expect("remove");
+        tx.commit().await.expect("commit");
+        assert_eq!(fed(&f, seq, day(6)).await, None);
+        assert_eq!(fed_on(&f, seq).await, Some(day(5)));
     }
 }

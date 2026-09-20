@@ -22,10 +22,20 @@
 //!
 //! [`not_stopped!`](agentos_store::not_stopped) borne la lecture comme les
 //! autres claims : une entreprise arrêtée n'avance pas ses séquences.
+//!
+//! # Le flux, une fois par jour
+//!
+//! La même passe nourrit chaque séquence vivante qui a un flux et dont
+//! `fed_on` est avant aujourd'hui UTC (`agentos_app::sequence::feed`) : au
+//! premier tick après minuit, quand le budget d'inconnus du siège est neuf —
+//! c'est ce qui dispense de lire le budget ici, et l'argument est en tête de
+//! `agentos_app::sequence`. Une ligne INFO « sequence fed » dit combien ; zéro
+//! est une ligne WARN « feed exhausted », parce qu'un flux à sec est une liste
+//! à réimporter, et le fondateur ne doit pas le deviner.
 
 use std::time::Duration;
 
-use agentos_domain::ids::{SequenceRunId, TenantId};
+use agentos_domain::ids::{SequenceId, SequenceRunId, TenantId};
 use agentos_store::db::{Db, StoreError};
 use chrono::{DateTime, Utc};
 use sqlx::Row as _;
@@ -94,7 +104,52 @@ pub async fn tick(db: &Db, now: DateTime<Utc>) -> Result<usize, StoreError> {
             }
         }
     }
+    feed(db, now).await?;
     Ok(due.len())
+}
+
+/// Les séquences à nourrir aujourd'hui, chacune dans sa transaction de
+/// locataire. `feed` réclame la ligne en posant `fed_on` : deux réplicas qui
+/// lisent la même séquence n'en nourrissent qu'une.
+async fn feed(db: &Db, now: DateTime<Utc>) -> Result<(), StoreError> {
+    let today = now.date_naive();
+    let mut admin = db.admin_tx_bypassing_rls().await?;
+    let hungry = sqlx::query(concat!(
+        "SELECT s.id, s.tenant_id FROM sequences s \
+          WHERE s.feed IS NOT NULL AND s.archived_at IS NULL \
+            AND (s.fed_on IS NULL OR s.fed_on < $1::date) AND ",
+        agentos_store::not_stopped!("s.tenant_id"),
+        " ORDER BY s.created_at, s.id",
+    ))
+    .bind(today)
+    .fetch_all(&mut *admin)
+    .await?;
+    admin.commit().await?;
+
+    for row in &hungry {
+        let sequence = SequenceId::from_uuid(row.get("id"));
+        let tenant = TenantId::from_uuid(row.get("tenant_id"));
+        let mut tx = db.tenant_tx(tenant).await?;
+        match agentos_app::sequence::feed(&mut tx, sequence, today, now).await {
+            Ok(fed) => {
+                tx.commit().await?;
+                match fed {
+                    Some(0) => {
+                        tracing::warn!(sequence = %sequence, tenant = %tenant, "feed exhausted")
+                    }
+                    Some(n) => {
+                        tracing::info!(sequence = %sequence, tenant = %tenant, contacts = n, "sequence fed")
+                    }
+                    None => {}
+                }
+            }
+            Err(err) => {
+                tracing::error!(error = %err, sequence = %sequence, tenant = %tenant, "sequence was not fed");
+                let _ = tx.rollback().await;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -208,6 +263,120 @@ mod tests {
             tick(&db, now).await.expect("tick"),
             0,
             "nothing else is due yet"
+        );
+    }
+
+    /// **A fed sequence enrols on the first tick of a new day, and not
+    /// again that day.** The selection itself is proved in
+    /// `agentos_app::sequence`; what the loop owns is *when*.
+    #[tokio::test]
+    async fn the_loop_feeds_a_sequence_once_a_day() {
+        use agentos_domain::policy::PolicyLimits;
+        use agentos_store::policy;
+
+        let Some(db) = crate::loops::private_db("sequence_feed").await else {
+            return;
+        };
+        let now = Utc::now().trunc_subsecs(6);
+        let tenant = TenantId::new_v7(now);
+        let employee = EmployeeId::new_v7(now);
+        let account = Uuid::now_v7();
+        let mut admin = db.admin_tx_bypassing_rls().await.expect("admin");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, 'fed loop')")
+            .bind(tenant.as_uuid())
+            .bind(format!("fed-loop-{}", tenant.as_uuid().simple()))
+            .execute(&mut *admin)
+            .await
+            .expect("tenant");
+        sqlx::query(
+            "INSERT INTO employees (id, tenant_id, slug, display_name, lifecycle) \
+             VALUES ($1, $2, 'lena', 'lena', 'active')",
+        )
+        .bind(employee.as_uuid())
+        .bind(tenant.as_uuid())
+        .execute(&mut *admin)
+        .await
+        .expect("employee");
+        sqlx::query(
+            "INSERT INTO accounts (id, tenant_id, legal_name, domain, segment, country) \
+             VALUES ($1, $2, 'Prospect', $3, 'airline', 'FR')",
+        )
+        .bind(account)
+        .bind(tenant.as_uuid())
+        .bind(format!("{}.example", account.simple()))
+        .execute(&mut *admin)
+        .await
+        .expect("account");
+        for name in ["paul", "marie"] {
+            sqlx::query(
+                "INSERT INTO contacts (id, tenant_id, account_id, full_name, email) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(tenant.as_uuid())
+            .bind(account)
+            .bind(name)
+            .bind(format!("{name}@{}.example", account.simple()))
+            .execute(&mut *admin)
+            .await
+            .expect("contact");
+        }
+        admin.commit().await.expect("commit");
+        policy::install(
+            &db,
+            tenant,
+            policy::Scope::Tenant,
+            &PolicyLimits {
+                max_new_contacts_per_day: 5,
+                ..PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("install the policy");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let seq = sequence::define(
+            &mut tx,
+            "fed",
+            &[Step::Email {
+                brief: Some("hello".to_owned()),
+                variants: Vec::new(),
+            }],
+        )
+        .await
+        .expect("define");
+        // Set yesterday, so that today is a new day for it.
+        sequence::set_feed(
+            &mut tx,
+            seq,
+            &sequence::Feed {
+                employee_id: employee,
+                per_day: 1,
+                segment: "airline".to_owned(),
+                countries: Vec::new(),
+                source: None,
+            },
+            (now - TimeDelta::days(1)).date_naive(),
+        )
+        .await
+        .expect("set");
+        tx.commit().await.expect("commit");
+
+        let enrolled = |db: Db| async move {
+            let mut tx = db.tenant_tx(tenant).await.expect("tx");
+            let n = sequence::runs(&mut tx, seq).await.expect("runs").len();
+            let fed_on = sequence::list(&mut tx).await.expect("list")[0].fed_on;
+            tx.rollback().await.expect("rollback");
+            (n, fed_on)
+        };
+        tick(&db, now).await.expect("tick");
+        assert_eq!(enrolled(db.clone()).await, (1, Some(now.date_naive())));
+        tick(&db, now + TimeDelta::minutes(1)).await.expect("tick");
+        assert_eq!(enrolled(db.clone()).await.0, 1, "once a day");
+        tick(&db, now + TimeDelta::days(1)).await.expect("tick");
+        assert_eq!(
+            enrolled(db).await,
+            (2, Some((now + TimeDelta::days(1)).date_naive()))
         );
     }
 }
