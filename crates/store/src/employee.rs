@@ -146,6 +146,27 @@ fn spec_of(employee: &Employee) -> serde_json::Value {
 /// `lease_owner`, `lease_until`, `attempt_count` and `last_error` belong to the
 /// provisioning worker and must survive an aggregate save.
 ///
+/// **And it never moves a row backwards.** An aggregate is loaded, changed
+/// in memory, and saved; between the load and the save the provisioning
+/// worker may have finished a step in its own transaction. Saving the copy
+/// then wrote the copy's `state` — `provisioning`, as loaded mid-step — over
+/// the worker's `ready`, while the lease columns, left alone by design, kept
+/// the `NULL` the worker had just written. A `provisioning` row with no
+/// lease is one `CLAIM_SQL` can never take back (it reclaims on
+/// `lease_until < now`), so the seat sat there for good and the end-to-end
+/// suite called it "the provisioning loop moved nothing for 600s". Measured
+/// on 2026-09-20: every resource row and the `employees` row of the wedged
+/// seat shared one `xmin` — the `on_step_ready` activation's transaction —
+/// while each step's outbox event had its own. The `version` check below
+/// guards `employees`; nothing guarded the rows.
+///
+/// The guard is the row's own clock: a save only lands on a row that is not
+/// newer than the copy it was loaded from. The worker stamps `updated_at =
+/// now` when it finishes a step, so a stale copy loses exactly the rows the
+/// worker moved and keeps every other write it meant to make. A caller that
+/// changed a resource itself stamps its own `now`, which is never older than
+/// what it loaded.
+///
 /// ponytail: eleven round-trips per save. A single `unnest(...)` statement is
 /// the upgrade if employee writes ever show up in a profile; they are a
 /// once-per-provisioning-step operation today.
@@ -177,7 +198,8 @@ async fn save_resources(tx: &mut TenantTx<'_>, employee: &Employee) -> Result<()
                external_id = excluded.external_id, \
                poll_ref = excluded.poll_ref, \
                expected_by = excluded.expected_by, \
-               updated_at = excluded.updated_at",
+               updated_at = excluded.updated_at \
+             WHERE employee_resources.updated_at <= excluded.updated_at",
         )
         .bind(employee_id)
         .bind(step.as_str())
@@ -516,6 +538,77 @@ mod tests {
             Some("PN-raj")
         );
 
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// The race of 2026-09-20, replayed by hand: a copy loaded while the worker
+    /// held `browser`, saved after the worker finished it. The save must lose
+    /// that one row — the worker's `ready` and its cleared lease stay — and
+    /// keep every row the caller actually moved.
+    #[tokio::test]
+    async fn a_stale_aggregate_save_never_moves_a_row_the_worker_already_moved() {
+        let Some(db) = db().await else { return };
+        let tenant = new_tenant(&db).await;
+        let mut copy = draft(tenant, "lena");
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let version = insert(&mut tx, &copy).await.expect("insert");
+        tx.commit().await.expect("commit");
+
+        // What the copy saw: the worker had claimed `browser`.
+        copy.set_resource(Step::Browser, ResourceState::Provisioning, at(T0 + 5))
+            .unwrap();
+        // What the worker did after that, in its own transaction.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        sqlx::query(
+            "UPDATE employee_resources SET state = 'ready', provider = 'agentos', \
+                    external_id = 'ctx-1', lease_owner = NULL, lease_until = NULL, \
+                    updated_at = $2 \
+              WHERE employee_id = $1 AND step = 'browser'",
+        )
+        .bind(copy.id().as_uuid())
+        .bind(at(T0 + 10))
+        .execute(&mut **tx)
+        .await
+        .expect("the worker finishes the step");
+        tx.commit().await.expect("commit");
+
+        // And what the caller itself changed, newer than anything stored —
+        // through the states the domain admits, `pending` never being `ready`
+        // in one move.
+        copy.set_resource(Step::Identity, ResourceState::Provisioning, at(T0 + 29))
+            .unwrap();
+        copy.set_resource(Step::Identity, ResourceState::Ready, at(T0 + 30))
+            .unwrap();
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        update(&mut tx, &copy, version)
+            .await
+            .expect("the save itself is fine");
+        tx.commit().await.expect("commit");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let stored = load(&mut tx, copy.id()).await.expect("load");
+        tx.rollback().await.expect("rollback");
+        let browser = stored.employee.resource(Step::Browser);
+        assert_eq!(
+            browser.state(),
+            &ResourceState::Ready,
+            "the worker's newer row survives a stale save"
+        );
+        assert_eq!(browser.updated_at(), at(T0 + 10));
+        assert_eq!(
+            stored.employee.resource(Step::Identity).state(),
+            &ResourceState::Ready,
+            "the caller's own, newer change lands"
+        );
+        let (owner, until): (Option<uuid::Uuid>, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT lease_owner, lease_until FROM employee_resources \
+              WHERE employee_id = $1 AND step = 'browser'",
+        )
+        .bind(copy.id().as_uuid())
+        .fetch_one(&mut **db.tenant_tx(tenant).await.expect("tx"))
+        .await
+        .expect("row");
+        assert_eq!((owner, until), (None, None), "the lease stays the worker's");
         drop_tenant(&db, tenant).await;
     }
 
