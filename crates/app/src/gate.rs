@@ -1188,11 +1188,26 @@ impl PolicyGate {
         .await
         .map_err(|e| Denied::Unavailable(e.into()))?;
 
-        let standing = if known.unwrap_or(false) {
+        let mut standing = if known.unwrap_or(false) {
             ContactStanding::Known
         } else {
             ContactStanding::New
         };
+        // The company's own people are not strangers. On 2026-09-20 the
+        // founder's test mail to his own mailbox spent one of the seat's five
+        // new contacts of the day, and the fifth prospect was refused for it.
+        // The list of what is "our own" already exists: the sending domains
+        // the tenant verified, and the domains they hang under —
+        // `agents.getorizn.com` is the seat's address, `getorizn.com` is the
+        // founder's. No table, no policy field, nothing a model can widen:
+        // a stranger's domain is never one we send from.
+        if standing == ContactStanding::New
+            && let Some(address) = counterparty(action)
+            && let Some((_, domain)) = address.rsplit_once('@')
+            && is_own_domain(tx, domain).await?
+        {
+            standing = ContactStanding::Known;
+        }
         Ok((u32::try_from(new_today).unwrap_or(u32::MAX), standing))
     }
 
@@ -1559,6 +1574,26 @@ impl PolicyGate {
 /// [`spends_contact_budget`](agentos_domain::policy::spends_contact_budget)'s
 /// narrower set and not this one. Widening either direction is a policy change:
 /// dropping a peer from this key would hand the email budget a slot back.
+/// Whether `domain` is one of the tenant's sending domains or the domain one
+/// of them hangs under: `agents.getorizn.com` answers for `getorizn.com` too.
+/// Only one level up — `a.b.example.com` sends for `b.example.com`, not for
+/// `example.com` — so a seat on a subdomain of a mailbox provider does not
+/// turn every customer of that provider into a colleague.
+async fn is_own_domain(tx: &mut TenantTx<'_>, domain: &str) -> Result<bool, Denied> {
+    let domain = domain.trim().to_ascii_lowercase();
+    let own = crate::sending_domain::all(tx)
+        .await
+        .map_err(Denied::Unavailable)?;
+    Ok(own.iter().any(|row| {
+        let sends_from = row.domain.as_str();
+        let parent = sends_from
+            .split_once('.')
+            .map(|(_, rest)| rest)
+            .filter(|rest| rest.matches('.').count() >= 1);
+        sends_from == domain || parent == Some(domain.as_str())
+    }))
+}
+
 fn counterparty(action: &Action) -> Option<String> {
     match action {
         Action::EmailSend { to } => Some(to.to_string()),
@@ -3333,6 +3368,59 @@ mod tests {
     /// `warmup_allowance` returns the `min` of the two — so sharing a code would
     /// put "shall we mail more strangers" in front of the founder as the fix for
     /// a domain nobody can vouch for.
+    /// The founder's own mailbox is not a stranger: an address on a sending
+    /// domain of the company, or on the domain it hangs under, spends none of
+    /// the day's new contacts. A neighbour one level further up still does.
+    #[tokio::test]
+    async fn an_address_on_the_companys_own_domain_is_no_stranger() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+        let gate = with_policy(
+            &db,
+            &principal,
+            Scope::Tenant,
+            &PolicyLimits {
+                allowed_channels: BTreeSet::from([Channel::Email]),
+                max_new_contacts_per_day: 1,
+                ..PolicyLimits::default()
+            },
+        )
+        .await;
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        sqlx::query(
+            "INSERT INTO tenant_domains (tenant_id, domain, provider, status, is_primary) \
+             VALUES ($1, 'agents.getorizn.test', 'mock-email', 'verified', true)",
+        )
+        .bind(principal.tenant_id.as_uuid())
+        .execute(&mut **tx)
+        .await
+        .expect("a sending domain");
+        tx.commit().await.expect("commit");
+
+        // One stranger uses the whole budget of the day.
+        gate.authorize(&principal, email("someone@elsewhere.test"))
+            .await
+            .expect("the first stranger is within the budget");
+        let err = gate
+            .authorize(&principal, email("another@elsewhere.test"))
+            .await
+            .expect_err("the budget is spent");
+        assert_eq!(err.code(), DenyReason::ContactBudgetExhausted.code());
+
+        // Our own people still get through: the seat's domain and its parent.
+        for ours in ["sdr@agents.getorizn.test", "Mathis@GetOrizn.test"] {
+            gate.authorize(&principal, email(ours))
+                .await
+                .unwrap_or_else(|e| panic!("{ours} is one of us, not a stranger: {e}"));
+        }
+        // But not a neighbour two levels up.
+        let err = gate
+            .authorize(&principal, email("x@orizn.test"))
+            .await
+            .expect_err("a sibling domain is still a stranger");
+        assert_eq!(err.code(), DenyReason::ContactBudgetExhausted.code());
+    }
+
     #[tokio::test]
     async fn a_warming_domain_refuses_with_its_own_code_and_not_the_operators() {
         let Some(db) = db().await else { return };
