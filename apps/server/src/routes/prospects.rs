@@ -507,6 +507,14 @@ struct Page {
     after: Option<uuid::Uuid>,
     #[serde(default)]
     limit: Option<i64>,
+    /// Une adresse exacte, et la page ne contient qu'elle.
+    ///
+    /// Marché le 2026-09-20 : sur une liste de 1300, retrouver le contact
+    /// qu'on vient d'importer pour l'inscrire coûtait sept pages — alors que
+    /// cette route est la seule source du `contact_id`. Comparée en
+    /// minuscules, comme `prospects` écrit la colonne.
+    #[serde(default)]
+    email: Option<String>,
 }
 
 /// Une ligne de la liste.
@@ -564,11 +572,13 @@ async fn contacts(
                 next_follow_up_at, created_at \
            FROM contacts \
           WHERE ($1::uuid IS NULL OR id > $1) \
+            AND ($3::text IS NULL OR email = $3) \
           ORDER BY id \
           LIMIT $2",
     )
     .bind(page.after)
     .bind(limit)
+    .bind(page.email.as_deref().map(str::trim).map(str::to_lowercase))
     .fetch_all(&mut **tx)
     .await
     .map_err(agentos_store::db::StoreError::from)?;
@@ -1024,6 +1034,27 @@ mod tests {
             .await;
         assert_eq!(suite["contacts"].as_array().expect("liste").len(), 1);
         assert!(suite["next_after"].is_null(), "{suite}");
+
+        // Par adresse : une page d'une ligne, quelle que soit la casse tapée.
+        let wanted = rows[1]["email"].as_str().expect("adresse").to_owned();
+        let (status, one) = h
+            .send(
+                "GET",
+                &format!("/v1/contacts?email={}", wanted.to_uppercase()),
+                SECRET_A,
+                "text/plain",
+                "",
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{one}");
+        let found = one["contacts"].as_array().expect("liste");
+        assert_eq!(found.len(), 1, "{one}");
+        assert_eq!(found[0]["email"], wanted);
+        assert_eq!(found[0]["id"], rows[1]["id"]);
+        let (_, none) = h
+            .send("GET", "/v1/contacts?email=personne@nulle.part", SECRET_A, "text/plain", "")
+            .await;
+        assert!(none["contacts"].as_array().expect("liste").is_empty(), "{none}");
 
         // Et les contacts d'une autre société ne sont pas filtrés, ils sont
         // invisibles.

@@ -124,8 +124,10 @@ pub fn tools() -> Vec<ToolDef> {
                  sans identifiant, donc un enrôlement commence toujours ici. Pagination par clé : \
                  `limit` (50 par défaut, 200 au plus) et `after`, le dernier `id` de la page \
                  précédente ; une page pleine porte `next_after`, une page courte termine la \
-                 marche. Cette lecture ne dit pas si une adresse est sur la liste de suppression \
-                 — un enrôlement refusé en 403 `suppressed` l'apprend à ce moment-là.",
+                 marche. **Pour un contact précis, `email`** : la page ne contient que lui, sans \
+                 marcher la liste — c'est le chemin d'un enrôlement qui suit un import. Cette \
+                 lecture ne dit pas si une adresse est sur la liste de suppression — un \
+                 enrôlement refusé en 403 `suppressed` l'apprend à ce moment-là.",
             method: Method::Get,
             path: "/v1/contacts",
             schema: schema(
@@ -140,11 +142,15 @@ pub fn tools() -> Vec<ToolDef> {
                         "minimum": 1,
                         "maximum": 200,
                         "description": "Nombre de lignes. 50 par défaut, borné à 200."
+                    },
+                    "email": {
+                        "type": "string",
+                        "description": "Une adresse exacte : la page ne contient que ce contact. Casse indifférente."
                     }
                 }),
                 &[],
             ),
-            query: &["after", "limit"],
+            query: &["after", "limit", "email"],
             raw_body: None,
             risk: Risk::Read,
         },
