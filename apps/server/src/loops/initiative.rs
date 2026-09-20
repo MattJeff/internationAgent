@@ -3312,6 +3312,7 @@ pub(crate) mod tests {
             ada,
             &gruber,
             Some("hello"),
+            "the body that left",
             "ada@ours.example",
             "msg_1",
             past,
