@@ -814,7 +814,7 @@ pub struct TierFit {
 ///
 /// # The boundary this function keeps
 ///
-/// "The tier that matches your volume is the $49 one, here is the page" is a
+/// "The tier that matches your volume is Starter, here is the page" is a
 /// fact about a public page. "I can do the $199 one" is a commercial term, and
 /// this pack's job ends before commercial terms exist —
 /// [`RolePack::may_propose`] refuses `PaymentCreate` and `ContractSign` for
@@ -871,14 +871,18 @@ pub fn tier_for(segment: Segment, monthly_requests: Option<u64>) -> TierFit {
 /// Written in the voice of the plan: a fact to state, and the words that would
 /// turn it into a proposal named so they are not used. The words themselves are
 /// what the test forbids, so this sentence avoids them even in the negative.
+///
+/// **No price in the sentence** — the founder's decision of 2026-09-20. The
+/// tier is named and the page is pointed to; what the tier costs is the
+/// page's to say. A number in a seat's mail is the thing a reader quotes
+/// back, and the day the page changes it the mail is wrong about it.
 fn tier_line(fit: TierFit) -> String {
     format!(
         "If Orizn's cost comes up, the public tier that matches this account on what is known \
-         is {} at ${} a month — {}. Point them to {PRICING_PAGE} and state it as a fact about a \
-         public page, never as a proposal: the price is the page's and not yours to set or to \
-         lower, name no term, no start date, and no tier above the one the facts support.",
+         is {} — {}. Point them to {PRICING_PAGE} and state it as a fact about a public page, \
+         never as a proposal: name no price, no term, no start date, and no tier above the one \
+         the facts support — the page says what it costs, not you.",
         fit.tier.name(),
-        fit.tier.price_usd(),
         fit.reason
     )
 }
@@ -1622,7 +1626,7 @@ mod tests {
         let plan = sales().plan(&objective());
         let approach = &plan[3].instruction;
         assert!(approach.contains("Starter"), "{approach}");
-        assert!(approach.contains("$49"), "{approach}");
+        assert!(!approach.contains('$'), "no price in a seat's mail: {approach}");
         assert!(approach.contains(PRICING_PAGE), "{approach}");
         assert!(approach.contains("fact about a public page"), "{approach}");
         for word in ["offer", "discount", "deal", "for you", "I can give"] {
@@ -1631,13 +1635,14 @@ mod tests {
                 "the approach step proposes rather than states: {word:?} in {approach}"
             );
         }
-        // The line is the same fact for every segment, priced from the page.
+        // The line is the same fact for every segment, and never a price.
         for segment in Segment::ALL {
             let plan = sales().plan(&Objective {
                 segment,
                 ..objective()
             });
-            assert!(plan[3].instruction.contains("$49"), "{segment}");
+            assert!(plan[3].instruction.contains("Starter"), "{segment}");
+            assert!(!plan[3].instruction.contains('$'), "{segment}");
         }
         assert!(!sales().may_propose(ActionKind::PaymentCreate));
         assert!(!sales().may_propose(ActionKind::ContractSign));

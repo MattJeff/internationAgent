@@ -353,7 +353,13 @@ pub fn by_model(sample: Sample, calls_per_turn: f64) -> Vec<(ModelId, usize, f64
 /// Ce qui autorise le re-pin sans re-mesure est le même précédent que les deux
 /// fois précédentes : un écart d'une phrase de plan sur un siège ne déplace
 /// pas un ordre de grandeur affiché à ±20 %.
-pub const DIGEST: &str = "51aaffc2dae7a911";
+///
+/// Le même jour, un mot plus tard : le fondateur a tranché que la phrase nomme
+/// le palier et pointe la page **sans dire le prix** — c'est la page qui le
+/// dit. La phrase a perdu « at $49 a month » et gagné « name no price » ;
+/// `51aaffc2dae7a911` est devenu `8f24a5b61db46939` pour ça et rien d'autre
+/// (mesuré : la suite `rolepack_sales::` seule a changé, 17/17).
+pub const DIGEST: &str = "8f24a5b61db46939";
 
 // ---------------------------------------------------------------------------
 // The company, as the operator wrote it down
