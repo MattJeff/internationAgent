@@ -25,10 +25,11 @@
 //!
 //! # Le flux, une fois par jour
 //!
-//! La même passe nourrit chaque séquence vivante qui a un flux et dont
-//! `fed_on` est avant aujourd'hui UTC (`agentos_app::sequence::feed`) : au
-//! premier tick après minuit, quand le budget d'inconnus du siège est neuf —
-//! c'est ce qui dispense de lire le budget ici, et l'argument est en tête de
+//! La même passe nourrit chaque séquence vivante qui a un flux, dont `fed_on`
+//! est avant aujourd'hui UTC et dont l'heure est passée
+//! (`agentos_app::sequence::feed`) : le premier tick à partir de `hour`, trente
+//! secondes de latence au plus, sans planification. Le budget n'est pas lu ici,
+//! et l'argument — avec le compromis que l'heure porte — est en tête de
 //! `agentos_app::sequence`. Une ligne INFO « sequence fed » dit combien ; zéro
 //! est une ligne WARN « feed exhausted », parce qu'un flux à sec est une liste
 //! à réimporter, et le fondateur ne doit pas le deviner.
@@ -37,7 +38,7 @@ use std::time::Duration;
 
 use agentos_domain::ids::{SequenceId, SequenceRunId, TenantId};
 use agentos_store::db::{Db, StoreError};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike as _, Utc};
 use sqlx::Row as _;
 use tokio_util::sync::CancellationToken;
 
@@ -112,16 +113,20 @@ pub async fn tick(db: &Db, now: DateTime<Utc>) -> Result<usize, StoreError> {
 /// locataire. `feed` réclame la ligne en posant `fed_on` : deux réplicas qui
 /// lisent la même séquence n'en nourrissent qu'une.
 async fn feed(db: &Db, now: DateTime<Utc>) -> Result<(), StoreError> {
-    let today = now.date_naive();
+    // The same three conditions `sequence::feed` claims on, read once for
+    // every tenant so that a feed before its hour costs no tenant transaction.
     let mut admin = db.admin_tx_bypassing_rls().await?;
     let hungry = sqlx::query(concat!(
         "SELECT s.id, s.tenant_id FROM sequences s \
           WHERE s.feed IS NOT NULL AND s.archived_at IS NULL \
-            AND (s.fed_on IS NULL OR s.fed_on < $1::date) AND ",
+            AND (s.fed_on IS NULL OR s.fed_on < $1::date) \
+            AND coalesce((s.feed->>'hour')::int, $3) <= $2 AND ",
         agentos_store::not_stopped!("s.tenant_id"),
         " ORDER BY s.created_at, s.id",
     ))
-    .bind(today)
+    .bind(now.date_naive())
+    .bind(i32::from(now.hour() as u8))
+    .bind(i32::from(agentos_app::sequence::DEFAULT_HOUR))
     .fetch_all(&mut *admin)
     .await?;
     admin.commit().await?;
@@ -130,7 +135,7 @@ async fn feed(db: &Db, now: DateTime<Utc>) -> Result<(), StoreError> {
         let sequence = SequenceId::from_uuid(row.get("id"));
         let tenant = TenantId::from_uuid(row.get("tenant_id"));
         let mut tx = db.tenant_tx(tenant).await?;
-        match agentos_app::sequence::feed(&mut tx, sequence, today, now).await {
+        match agentos_app::sequence::feed(&mut tx, sequence, now).await {
             Ok(fed) => {
                 tx.commit().await?;
                 match fed {
@@ -266,8 +271,8 @@ mod tests {
         );
     }
 
-    /// **A fed sequence enrols on the first tick of a new day, and not
-    /// again that day.** The selection itself is proved in
+    /// **A fed sequence enrols on the first tick at or after its hour, and
+    /// not again that day.** The selection itself is proved in
     /// `agentos_app::sequence`; what the loop owns is *when*.
     #[tokio::test]
     async fn the_loop_feeds_a_sequence_once_a_day() {
@@ -352,6 +357,7 @@ mod tests {
             &sequence::Feed {
                 employee_id: employee,
                 per_day: 1,
+                hour: 8,
                 segment: "airline".to_owned(),
                 countries: Vec::new(),
                 source: None,
@@ -369,11 +375,25 @@ mod tests {
             tx.rollback().await.expect("rollback");
             (n, fed_on)
         };
-        tick(&db, now).await.expect("tick");
+        let at = |h: u32, m: u32| {
+            now.date_naive()
+                .and_hms_opt(h, m, 0)
+                .expect("time")
+                .and_utc()
+        };
+        tick(&db, at(7, 59)).await.expect("tick");
+        assert_eq!(
+            enrolled(db.clone()).await,
+            (0, Some((now - TimeDelta::days(1)).date_naive())),
+            "before the hour"
+        );
+        tick(&db, at(8, 0)).await.expect("tick");
         assert_eq!(enrolled(db.clone()).await, (1, Some(now.date_naive())));
-        tick(&db, now + TimeDelta::minutes(1)).await.expect("tick");
+        tick(&db, at(8, 1)).await.expect("tick");
         assert_eq!(enrolled(db.clone()).await.0, 1, "once a day");
-        tick(&db, now + TimeDelta::days(1)).await.expect("tick");
+        tick(&db, at(8, 0) + TimeDelta::days(1))
+            .await
+            .expect("tick");
         assert_eq!(
             enrolled(db).await,
             (2, Some((now + TimeDelta::days(1)).date_naive()))

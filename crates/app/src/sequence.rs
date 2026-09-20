@@ -84,20 +84,25 @@
 //! l'ordre des pays, une liste d'origine ; [`feed`] les choisit et les inscrit
 //! par [`enroll`], le même verbe que la route, donc les mêmes refus.
 //!
-//! **Nourrir à 00:00 UTC plutôt que lire le budget.** `per_day` est validé une
+//! **Nourrir à une heure, sans lire le budget.** `per_day` est validé une
 //! fois, à la pose ([`set_feed`]), contre le `max_new_contacts_per_day`
 //! effectif du siège (`policy::load`, les quatre couches intersectées). Ensuite
 //! la boucle ne lit jamais le budget : elle nourrit **une fois par jour UTC, au
-//! premier tick après minuit**, quand le compteur d'inconnus est neuf, et
-//! `per_day ≤ budget` suffit alors à ce qu'aucune promesse ne soit gaspillée.
-//! Lire le budget dans la boucle serait le lire au mauvais moment : il compte
-//! les envois du jour, pas les promesses posées, et une promesse posée à 09:00
-//! sonne quand elle veut — le budget lu à la pose ne dit rien de celui de
-//! l'envoi. La date, elle, dit tout : au premier tick du jour rien n'est parti.
-//! C'est aussi pourquoi la pose écrit `fed_on = aujourd'hui` : le jour où l'on
-//! pose, on ne sait pas ce que le siège a déjà écrit, et le premier jour sûr
-//! est demain. Ce que le fondateur inscrit à la main par-dessus est son choix
-//! et se voit dans `refusals_get`.
+//! premier tick à partir de `hour`** (défaut [`DEFAULT_HOUR`], 8 h UTC). Lire
+//! le budget dans la boucle serait le lire au mauvais moment : il est dépensé
+//! à l'**envoi**, pas à l'inscription — la Gate compte les inconnus écrits du
+//! jour — et une promesse posée maintenant sonne quand `loops::initiative` la
+//! prend ; ce qu'on lirait à l'inscription ne dit rien de l'envoi. Nourrir à
+//! minuit rendrait le compteur neuf à coup sûr, et ferait partir les mails vers
+//! deux heures du matin à Paris. **Le compromis : à 8 h UTC, le seul concurrent
+//! possible dans la fenêtre est un envoi autonome du siège avant l'heure — un
+//! défaut reproduit chez une OTA, rare — et ce risque est préféré à des mails de
+//! nuit ; la ceinture est que `per_day` reste borné par le budget à la pose,
+//! donc un jour sans envoi autonome ne gaspille jamais rien.** Le jour de la
+//! pose compte comme nourri (`fed_on = aujourd'hui`) : on ne sait pas ce que le
+//! siège a déjà écrit ce jour-là, et le premier jour sûr est demain. Ce que le
+//! fondateur inscrit à la main par-dessus est son choix et se voit dans
+//! `refusals_get`.
 //!
 //! **Un contact déjà écrit n'est pas re-démarché.** La sélection exclut tout
 //! contact vers qui une ligne `messages` sortante existe, quel que soit le
@@ -126,7 +131,7 @@ use agentos_domain::ids::{
 use agentos_store::calendar;
 use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::policy::{self, PolicyLoadError};
-use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
+use chrono::{DateTime, NaiveDate, TimeDelta, Timelike as _, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row as _;
 use uuid::Uuid;
@@ -148,6 +153,15 @@ pub const MAX_WAIT_HOURS: u32 = 24 * 30;
 /// n'est parti — la Gate a refusé, ou le modèle n'a pas écrit — et le run
 /// s'arrête en `not_sent` plutôt que de réveiller encore.
 pub const SEND_DEADLINE: TimeDelta = TimeDelta::hours(24);
+
+/// L'heure UTC à partir de laquelle un flux nourrit, quand la pose n'en dit
+/// pas : 8 h, la fin de la nuit partout en Europe. L'argument est en tête de
+/// module, « Nourrir à une heure ».
+pub const DEFAULT_HOUR: u8 = 8;
+
+const fn default_hour() -> u8 {
+    DEFAULT_HOUR
+}
 
 /// Le fuseau des promesses de séquence : UTC, pour la raison de
 /// `follow_up::ZONE` — personne n'a dit « trois heures » à personne.
@@ -418,6 +432,9 @@ pub struct Feed {
     pub employee_id: EmployeeId,
     /// Combien de contacts par jour UTC, au plus le budget du siège.
     pub per_day: u32,
+    /// L'heure UTC (0–23) à partir de laquelle le jour courant est nourri.
+    #[serde(default = "default_hour")]
+    pub hour: u8,
     /// `accounts.segment`, l'une des valeurs de [`SEGMENTS`].
     pub segment: String,
     /// Codes pays ISO-2, dans l'ordre où les servir ; vide = tous.
@@ -436,6 +453,8 @@ pub enum FeedError {
     NotFound(&'static str),
     #[error("`per_day` is at least 1")]
     ZeroPerDay,
+    #[error("`hour` is 0 to 23, UTC")]
+    BadHour,
     #[error("`segment` is one of {SEGMENTS:?}")]
     BadSegment,
     #[error("`countries` are ISO 3166-1 alpha-2 codes; {0:?} is not one")]
@@ -465,6 +484,9 @@ pub async fn set_feed(
 ) -> Result<(), FeedError> {
     if feed.per_day == 0 {
         return Err(FeedError::ZeroPerDay);
+    }
+    if feed.hour > 23 {
+        return Err(FeedError::BadHour);
     }
     if !SEGMENTS.contains(&feed.segment.as_str()) {
         return Err(FeedError::BadSegment);
@@ -538,10 +560,11 @@ pub async fn remove_feed(tx: &mut TenantTx<'_>, sequence: SequenceId) -> Result<
     Ok(())
 }
 
-/// Nourrir une séquence pour `today`, si elle a un flux et n'a pas encore été
-/// nourrie ce jour-là. `None` sinon — y compris quand un autre tick vient de
-/// la réclamer : l'UPDATE qui pose `fed_on` est la réclamation, et le second
-/// ne touche aucune ligne. `Some(n)` : combien ont été inscrits, zéro compris.
+/// Nourrir une séquence pour le jour UTC de `now`, si elle a un flux, que
+/// l'heure du flux est passée et qu'elle n'a pas encore été nourrie ce jour-là.
+/// `None` sinon — y compris quand un autre tick vient de la réclamer :
+/// l'UPDATE qui pose `fed_on` est la réclamation, et le second ne touche
+/// aucune ligne. `Some(n)` : combien ont été inscrits, zéro compris.
 ///
 /// Un siège du flux qui n'est plus actif rend l'erreur d'`enroll` et la
 /// transaction est à défaire : `fed_on` reste, la boucle réessaie au tick
@@ -550,17 +573,19 @@ pub async fn remove_feed(tx: &mut TenantTx<'_>, sequence: SequenceId) -> Result<
 pub async fn feed(
     tx: &mut TenantTx<'_>,
     sequence: SequenceId,
-    today: NaiveDate,
     now: DateTime<Utc>,
 ) -> Result<Option<usize>, EnrollError> {
     let claimed: Option<serde_json::Value> = sqlx::query_scalar(
         "UPDATE sequences SET fed_on = $2 \
           WHERE id = $1 AND feed IS NOT NULL AND archived_at IS NULL \
             AND (fed_on IS NULL OR fed_on < $2) \
+            AND coalesce((feed->>'hour')::int, $4) <= $3 \
          RETURNING feed",
     )
     .bind(sequence.as_uuid())
-    .bind(today)
+    .bind(now.date_naive())
+    .bind(i32::from(now.hour() as u8))
+    .bind(i32::from(DEFAULT_HOUR))
     .fetch_optional(&mut ***tx)
     .await?;
     let Some(feed) = claimed.and_then(|v| serde_json::from_value::<Feed>(v).ok()) else {
@@ -1969,18 +1994,29 @@ mod tests {
             .collect()
     }
 
-    async fn fed(f: &Fixture, seq: SequenceId, day: NaiveDate) -> Option<usize> {
+    /// Feed at `hh:mm` UTC on `day`.
+    async fn fed_at(
+        f: &Fixture,
+        seq: SequenceId,
+        day: NaiveDate,
+        hh: u32,
+        mm: u32,
+    ) -> Option<usize> {
         let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
         let n = feed(
             &mut tx,
             seq,
-            day,
-            day.and_hms_opt(0, 0, 30).expect("time").and_utc(),
+            day.and_hms_opt(hh, mm, 0).expect("time").and_utc(),
         )
         .await
         .expect("feed");
         tx.commit().await.expect("commit");
         n
+    }
+
+    /// Feed at the default hour on `day`.
+    async fn fed(f: &Fixture, seq: SequenceId, day: NaiveDate) -> Option<usize> {
+        fed_at(f, seq, day, u32::from(DEFAULT_HOUR), 0).await
     }
 
     async fn fed_on(f: &Fixture, seq: SequenceId) -> Option<NaiveDate> {
@@ -2063,6 +2099,7 @@ mod tests {
         let plan = Feed {
             employee_id: f.lena,
             per_day: 2,
+            hour: DEFAULT_HOUR,
             segment: "airline".to_owned(),
             countries: vec!["gb".to_owned(), " fr ".to_owned()],
             source: None,
@@ -2075,6 +2112,13 @@ mod tests {
                     ..plan.clone()
                 },
                 "ZeroPerDay",
+            ),
+            (
+                Feed {
+                    hour: 24,
+                    ..plan.clone()
+                },
+                "BadHour",
             ),
             (
                 Feed {
@@ -2152,11 +2196,17 @@ mod tests {
         ));
         tx.rollback().await.expect("rollback");
 
-        // Today is already fed; tomorrow: GB first, then the oldest FR.
+        // Today is already fed; tomorrow, not before the hour — then GB
+        // first, then the oldest FR.
         assert_eq!(fed(&f, seq, day(0)).await, None);
-        assert_eq!(fed(&f, seq, day(1)).await, Some(2));
+        assert_eq!(
+            fed_at(&f, seq, day(1), 7, 59).await,
+            None,
+            "before the hour"
+        );
+        assert_eq!(fed_at(&f, seq, day(1), 8, 0).await, Some(2));
         assert_eq!(fed_contacts(&f, seq).await, [gb, fr_old].into());
-        assert_eq!(fed(&f, seq, day(1)).await, None, "once a day");
+        assert_eq!(fed_at(&f, seq, day(1), 8, 30).await, None, "once a day");
         assert_eq!(fed_contacts(&f, seq).await.len(), 2);
         // The next day: the newer FR, and nobody else of GB or FR is left.
         assert_eq!(fed(&f, seq, day(2)).await, Some(1));

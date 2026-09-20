@@ -54,6 +54,7 @@ struct Enrollment {
 struct FeedBody {
     employee_id: Uuid,
     per_day: u32,
+    hour: Option<u8>,
     segment: String,
     #[serde(default)]
     countries: Vec<String>,
@@ -152,8 +153,8 @@ async fn enroll(
 
 /// `PUT /v1/sequences/{id}/feed` — 204 ; 400 `feed_over_budget` quand
 /// `per_day` dépasse le `max_new_contacts_per_day` effectif du siège (le
-/// détail dit les deux nombres) ; 400 pour la forme ; 404 séquence ou siège
-/// inconnus ici. Pourquoi le budget est lu ici et jamais dans la boucle :
+/// détail dit les deux nombres) ; 400 pour la forme, `hour` > 23 compris ;
+/// 404 séquence ou siège inconnus ici. Pourquoi le budget est lu ici et jamais dans la boucle :
 /// `agentos_app::sequence`, « Le flux ».
 async fn set_feed(
     State(db): State<Db>,
@@ -164,6 +165,7 @@ async fn set_feed(
     let feed = Feed {
         employee_id: EmployeeId::from_uuid(body.employee_id),
         per_day: body.per_day,
+        hour: body.hour.unwrap_or(sequence::DEFAULT_HOUR),
         segment: body.segment,
         countries: body.countries,
         source: body.source,
@@ -190,7 +192,9 @@ async fn set_feed(
             "the feed asks for more strangers a day than the seat may write to",
         )
         .with_detail(err.to_string()),
-        FeedError::ZeroPerDay | FeedError::BadCountry(_) => ApiError::bad_request(err.to_string()),
+        FeedError::ZeroPerDay | FeedError::BadHour | FeedError::BadCountry(_) => {
+            ApiError::bad_request(err.to_string())
+        }
         FeedError::Policy(PolicyLoadError::NoPlatformLayer) => ApiError::new(
             StatusCode::CONFLICT,
             "no_platform_policy",
@@ -592,6 +596,17 @@ mod tests {
                 "PUT",
                 &uri,
                 SECRET_A,
+                Some(
+                    json!({"employee_id": h.lena, "per_day": 5, "segment": "airline", "hour": 24}),
+                ),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (status, body) = h
+            .send(
+                "PUT",
+                &uri,
+                SECRET_A,
                 Some(json!({"employee_id": h.lena, "per_day": 5, "segment": "airline", "countries": ["fr"]})),
             )
             .await;
@@ -609,6 +624,10 @@ mod tests {
         let (_, body) = h.send("GET", "/v1/sequences", SECRET_A, None).await;
         let mine = &body["sequences"][0];
         assert_eq!(mine["feed"]["per_day"], 5, "{body}");
+        assert_eq!(
+            mine["feed"]["hour"], 8,
+            "the default hour, read back: {body}"
+        );
         assert_eq!(mine["feed"]["countries"], json!(["FR"]), "{body}");
         assert_eq!(mine["feed"]["employee_id"], json!(h.lena), "{body}");
         assert_eq!(

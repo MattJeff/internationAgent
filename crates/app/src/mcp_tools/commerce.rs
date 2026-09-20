@@ -405,7 +405,7 @@ pub fn tools() -> Vec<ToolDef> {
             title: "Les séquences de l'entreprise",
             description: "Rend toutes les séquences définies, les vivantes d'abord puis les \
                  archivées, avec leurs pas, leur flux (`feed`, ce que `sequences_feed_set` a \
-                 posé, ou null) et `fed_on`, le dernier jour UTC où le flux a inscrit quelqu'un. \
+                 posé — siège, `per_day`, `hour`, segment, pays, liste — ou null) et `fed_on`, le dernier jour UTC où le flux a inscrit quelqu'un. \
                  À appeler avant d'enrôler quelqu'un : c'est là que se lisent l'identifiant \
                  d'une séquence et le nombre de mails qu'elle promet. C'est la source de l'`id` \
                  de `sequences_enroll`, `sequences_feed_set`, `sequences_runs_list` et \
@@ -561,16 +561,16 @@ pub fn tools() -> Vec<ToolDef> {
             name: "sequences_feed_set",
             title: "Faire qu'une séquence inscrive ses contacts elle-même, chaque jour",
             description: "Pose (ou remplace) le flux d'une séquence : chaque jour UTC, au premier \
-                 tick après minuit, le serveur y inscrit `per_day` contacts actifs du `segment` \
-                 demandé — dans l'ordre des `countries` donnés puis du plus ancien, d'une seule \
+                 tick à partir de `hour` (8 h UTC par défaut), le serveur y inscrit `per_day` \
+                 contacts actifs du `segment` demandé — dans l'ordre des `countries` donnés puis du plus ancien, d'une seule \
                  liste d'import si `source` est donné — et les met sous la responsabilité de \
                  l'`employee_id`. Jamais un contact supprimé, déjà inscrit un jour sur cette \
                  séquence, ou à qui **quelqu'un a déjà écrit** : un flux démarche à froid, il ne \
                  relance pas. `per_day` est refusé en 400 `feed_over_budget` s'il dépasse le \
                  `max_new_contacts_per_day` effectif du siège (le détail dit les deux nombres) ; \
-                 nourrir quand le budget est neuf est ce qui garantit qu'aucune promesse n'est \
-                 gaspillée sur un refus `contact_budget_exhausted`. Le jour de la pose compte \
-                 comme nourri : la première inscription est le lendemain. 400 `bad_segment` \
+                 c'est cette borne, et non une lecture du budget au moment de nourrir, qui \
+                 protège des refus `contact_budget_exhausted` — le seul risque restant est un \
+                 envoi autonome du siège avant `hour`. Le jour de la pose compte comme nourri : la première inscription est le lendemain. 400 `bad_segment` \
                  hors de `prospects_segments_list` ; 404 si la séquence ou le siège ne sont pas à \
                  cette entreprise. L'`id` vient de `sequences_list`, l'`employee_id` \
                  d'`employees_list` ; ce que le flux a fait se lit sur `sequences_runs_list`.",
@@ -592,6 +592,12 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "integer",
                         "minimum": 1,
                         "description": "Combien de contacts inscrire par jour UTC. Au plus le `max_new_contacts_per_day` du siège."
+                    },
+                    "hour": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 23,
+                        "description": "L'heure UTC à partir de laquelle le jour est nourri. Défaut 8 : les mails partent dans la journée européenne, pas la nuit."
                     },
                     "segment": {
                         "type": "string",
@@ -1714,6 +1720,7 @@ mod tests {
         let feed = find("sequences_feed_set");
         assert_eq!(required(&feed), ["id", "employee_id", "per_day", "segment"]);
         assert_eq!(feed.schema["properties"]["per_day"]["minimum"], json!(1));
+        assert_eq!(feed.schema["properties"]["hour"]["maximum"], json!(23));
         assert!(feed.properties().contains(&"countries"));
         assert!(feed.properties().contains(&"source"));
         assert!(
