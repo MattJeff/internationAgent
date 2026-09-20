@@ -217,7 +217,7 @@ python3 scripts/verifier-plugin.py
 
 Vérifié par ce script : chaque JSON parse, chaque `SKILL.md` porte un
 frontmatter délimité dont tous les champs sont documentés et dont le `name`
-correspond à son dossier, **chacun des 68 outils nommés par les cinq gestes
+correspond à son dossier, **chacun des 71 outils nommés par les cinq gestes
 existe encore dans `crates/app/src/mcp_tools/`**, aucun fichier ne contient
 `sk-`, `re_`, `whsec_` ni un `Bearer ` suivi d'un jeton, **les six gabarits de
 `monter-la-societe` sont encore les documents du fondateur à l'octet près**, et

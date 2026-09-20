@@ -1,7 +1,7 @@
 {
   "name": "siglair",
   "displayName": "Siglair",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Le serveur MCP de siglair.com, plus cinq gestes de fondateur : monter la société, le point du jour, lancer une campagne, répondre aux demandes, embaucher.",
   "homepage": "https://siglair.com",
   "keywords": ["siglair", "mcp", "employes", "prospection", "approbations"],
