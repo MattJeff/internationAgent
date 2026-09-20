@@ -1071,7 +1071,10 @@ mod tests {
     impl MailDomains for Counting {
         async fn lookup(&self, domain: &str) -> Result<MailDomain, ProviderError> {
             use std::sync::atomic::Ordering::SeqCst;
-            self.asked.lock().expect("not poisoned").push(domain.to_owned());
+            self.asked
+                .lock()
+                .expect("not poisoned")
+                .push(domain.to_owned());
             let now = self.in_flight.fetch_add(1, SeqCst) + 1;
             self.peak.fetch_max(now, SeqCst);
             // Long enough for the questions to overlap if they are asked
@@ -1094,8 +1097,12 @@ mod tests {
             peak: std::sync::atomic::AtomicUsize::new(0),
         };
         let six = [
-            "a@one.example", "b@one.example", "c@two.example",
-            "d@two.example", "e@three.example", "f@three.example",
+            "a@one.example",
+            "b@one.example",
+            "c@two.example",
+            "d@two.example",
+            "e@three.example",
+            "f@three.example",
         ]
         .map(|s| EmailAddress::parse(s).expect("address"));
 
@@ -1103,9 +1110,17 @@ mod tests {
 
         let mut asked = mx.asked.lock().expect("not poisoned").clone();
         asked.sort();
-        assert_eq!(asked, ["one.example", "three.example", "two.example"], "each once");
+        assert_eq!(
+            asked,
+            ["one.example", "three.example", "two.example"],
+            "each once"
+        );
         assert_eq!(table.len(), 3);
-        assert!(table.values().all(|v| v.as_ref().is_ok_and(|d| d.accepts())));
+        assert!(
+            table
+                .values()
+                .all(|v| v.as_ref().is_ok_and(|d| d.accepts()))
+        );
         assert!(
             mx.peak.load(std::sync::atomic::Ordering::SeqCst) >= 2,
             "the questions overlapped, they were not asked one after the other"
@@ -1115,7 +1130,11 @@ mod tests {
         let before = mx.asked.lock().expect("not poisoned").len();
         let mut report = Report::default();
         for address in &six {
-            assert!(no_mail_here(&table, &mx, address, &mut report).await.is_none());
+            assert!(
+                no_mail_here(&table, &mx, address, &mut report)
+                    .await
+                    .is_none()
+            );
         }
         assert_eq!(mx.asked.lock().expect("not poisoned").len(), before);
         assert_eq!(report.mx_unknown, 0);

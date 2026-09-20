@@ -1052,9 +1052,18 @@ mod tests {
         assert_eq!(found[0]["email"], wanted);
         assert_eq!(found[0]["id"], rows[1]["id"]);
         let (_, none) = h
-            .send("GET", "/v1/contacts?email=personne@nulle.part", SECRET_A, "text/plain", "")
+            .send(
+                "GET",
+                "/v1/contacts?email=personne@nulle.part",
+                SECRET_A,
+                "text/plain",
+                "",
+            )
             .await;
-        assert!(none["contacts"].as_array().expect("liste").is_empty(), "{none}");
+        assert!(
+            none["contacts"].as_array().expect("liste").is_empty(),
+            "{none}"
+        );
 
         // Et les contacts d'une autre société ne sont pas filtrés, ils sont
         // invisibles.

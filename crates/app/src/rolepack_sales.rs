@@ -1626,7 +1626,10 @@ mod tests {
         let plan = sales().plan(&objective());
         let approach = &plan[3].instruction;
         assert!(approach.contains("Starter"), "{approach}");
-        assert!(!approach.contains('$'), "no price in a seat's mail: {approach}");
+        assert!(
+            !approach.contains('$'),
+            "no price in a seat's mail: {approach}"
+        );
         assert!(approach.contains(PRICING_PAGE), "{approach}");
         assert!(approach.contains("fact about a public page"), "{approach}");
         for word in ["offer", "discount", "deal", "for you", "I can give"] {
