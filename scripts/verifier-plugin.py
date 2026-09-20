@@ -50,6 +50,7 @@ cited = set()
 for p in glob.glob("plugin/skills/*/SKILL.md") + glob.glob("plugin/commands/*.md") + ["docs/PLUGIN.md"]:
     cited |= set(re.findall(r"`([a-z][a-z0-9]+_[a-z0-9_]+)`", open(p, encoding="utf-8").read()))
 noise = {"dry_run", "user_config", "last_failure_detail", "outstanding_minor", "cost_source",
+         "per_day", "fed_on",
          "bad_segment", "name_taken", "approval_action_mismatch", "no_spend_policy",
          "policy_widens", "reporting_cycle", "draft_is_not_resumable", "turns_taken",
          "contacts_held_back", "acts_on_its_own", "set_by", "reports_to", "team_id",

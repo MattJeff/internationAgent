@@ -89,6 +89,22 @@ d'identifiant, et un UUID inventé est un 404 qui ressemble à une erreur de ta 
 jusqu'au bout — une page pleine porte un curseur, une page courte termine la marche — avant de
 compter les inscrits.
 
+**Pour un contact précis, `contacts_list` prend `email`** : la page ne contient que lui, sans
+marcher la liste — c'est le chemin d'une inscription qui suit un import.
+
+**Pour tenir une cadence sans y revenir chaque matin, `sequences_feed_set`** : la séquence se
+nourrit seule. Tu donnes le siège qui écrira, `per_day` (refusé à la pose s'il dépasse le
+`max_new_contacts_per_day` du siège — la réponse dit les deux nombres), le `segment`, une liste
+**ordonnée** de pays (`["FR","GB","US"]` : la France d'abord, puis le Royaume-Uni…), et `hour`
+(UTC, 8 par défaut : l'heure à partir de laquelle le jour est nourri — un mail de nuit n'est lu
+par personne). Chaque jour UTC, une fois, elle inscrit `per_day` contacts du segment qui ne sont
+ni supprimés, ni déjà inscrits, ni déjà écrits par quelqu'un de la société ; la première
+inscription est le lendemain de la pose. Quand il ne reste personne, `sequences_list` le montre
+(`fed_on` avance, rien n'est inscrit) et le journal dit « feed exhausted ». `sequences_feed_remove`
+arrête le flux ; les inscrits déjà posés continuent. Un flux ne dispense pas de la relecture du
+fondateur : c'est lui qui a dit combien par jour, et c'est `sequences_variants_measure` qui lui
+dira ce que ça donne.
+
 **`sequences_enroll`**, un appel par contact : la séquence, le contact, et **le siège qui
 écrira**. C'est le budget et la Gate de ce siège qui s'appliqueront, pas les tiens — choisis-le
 en connaissance de cause, et relis `controls_get` si tu ne sais pas ce qui le borne.
