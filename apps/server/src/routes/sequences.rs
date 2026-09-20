@@ -1,5 +1,5 @@
 //! `/v1/sequences` : le fondateur définit une séquence, y inscrit un contact,
-//! et relit où chacun en est.
+//! relit où chacun en est, et ce que chaque variante a donné.
 //!
 //! La moitié employé est `agentos_app::sequence` et `loops::sequence` ; le
 //! réveil est celui de `loops::initiative`. Il n'y a **pas** de route d'envoi
@@ -32,6 +32,7 @@ pub fn router(db: Db) -> Router {
         .route("/v1/sequences/{id}", axum::routing::delete(archive))
         .route("/v1/sequences/{id}/enroll", post(enroll))
         .route("/v1/sequences/{id}/runs", get(runs))
+        .route("/v1/sequences/{id}/variants", get(variants))
         .with_state(db)
 }
 
@@ -147,6 +148,20 @@ async fn runs(
     let all = sequence::runs(&mut tx, SequenceId::from_uuid(id)).await?;
     tx.rollback().await?;
     Ok(Json(json!({ "runs": all })).into_response())
+}
+
+/// `GET /v1/sequences/{id}/variants` — par variante, combien de runs, envoyés,
+/// ouverts, cliqués, répondus. Des runs, pas des mails : voir
+/// `agentos_app::sequence`.
+async fn variants(
+    State(db): State<Db>,
+    principal: Principal,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let all = sequence::variants(&mut tx, SequenceId::from_uuid(id)).await?;
+    tx.rollback().await?;
+    Ok(Json(json!({ "variants": all })).into_response())
 }
 
 #[cfg(test)]
@@ -280,8 +295,9 @@ mod tests {
         let Some(h) = Harness::new().await else {
             return;
         };
+        // The first step is an A/B; the others carry `brief` alone, as before.
         let steps = json!([
-            {"kind": "email", "brief": "introduce us"},
+            {"kind": "email", "variants": ["introduce us", "introduce us, in one line"]},
             {"kind": "wait", "hours": 72},
             {"kind": "branch", "on": "opened", "then": 3, "otherwise": 4},
             {"kind": "email", "brief": "offer a call"},
@@ -368,6 +384,36 @@ mod tests {
         assert_eq!(body["runs"][0]["id"], run_id);
         assert_eq!(body["runs"][0]["state"], "active");
         assert_eq!(body["runs"][0]["step"], 0);
+        let drawn = body["runs"][0]["variant"].as_u64().expect("variant") as usize;
+        assert!(drawn < 2, "{body}");
+
+        // Two arms, one run so far, on the arm the run drew.
+        let (status, body) = h
+            .send(
+                "GET",
+                &format!("/v1/sequences/{id}/variants"),
+                SECRET_A,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let arms = body["variants"].as_array().expect("variants");
+        assert_eq!(arms.len(), 2, "{body}");
+        assert_eq!(arms[drawn]["runs"], 1, "{body}");
+        assert_eq!(arms[1 - drawn]["runs"], 0, "{body}");
+        assert_eq!(arms[drawn]["replied"], 0, "{body}");
+        let (_, theirs) = h
+            .send(
+                "GET",
+                &format!("/v1/sequences/{id}/variants"),
+                SECRET_B,
+                None,
+            )
+            .await;
+        assert!(
+            theirs["variants"].as_array().expect("list").is_empty(),
+            "RLS"
+        );
 
         // Suppressed: 403, once the slot is free.
         let mut tx = h.db.tenant_tx(h.a).await.expect("tx");

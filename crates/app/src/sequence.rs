@@ -53,6 +53,25 @@
 //! (`stopped`, `max_touches`) plutôt que de la contourner. Personne qui a
 //! ignoré trois mails n'attend le quatrième, et une séquence qui en promettrait
 //! cinq est une séquence dont les deux derniers pas ne s'exécutent pas.
+//!
+//! # A/B : on compare des runs, pas des mails
+//!
+//! Un pas `email` peut porter plusieurs briefs (`variants`) ; `brief` seul
+//! reste valide et vaut une variante unique, donc aucune séquence existante ne
+//! change. La variante est **tirée une fois, à l'inscription**, et écrite sur
+//! le run (`sequence_runs.variant`, `0110`) : tous les pas `email` d'un run
+//! lisent la même. C'est ce qui rend la comparaison propre — un run de la
+//! variante A est un parcours entier écrit dans l'esprit A, et [`variants`]
+//! compte des *runs* (inscrits, envoyés, ouverts, cliqués, répondus), jamais
+//! des mails isolés dont on ne saurait plus à quel parcours ils appartiennent.
+//!
+//! Le tirage est **déterministe** : l'id du run modulo le nombre de variantes
+//! ([`draw`]). Pas de RNG parce qu'un tirage qu'on ne peut pas rejouer est un
+//! tirage qu'on ne peut pas tester, et parce que l'id v7 porte déjà soixante-deux
+//! bits aléatoires — en tirer un reste est aussi équitable qu'un dé et se relit
+//! depuis n'importe quelle base sans autre état. Quand un pas a moins de
+//! variantes que le maximum de la séquence, il lit la sienne modulo son propre
+//! nombre : un run n'est jamais sans brief.
 
 use agentos_domain::action::EmailAddress;
 use agentos_domain::ids::{
@@ -110,8 +129,16 @@ impl Signal {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Step {
-    /// Ce que l'employé doit écrire — pas le texte du mail.
-    Email { brief: String },
+    /// Ce que l'employé doit écrire — pas le texte du mail. `brief` est la
+    /// forme d'origine ; `variants` en porte plusieurs et le run lit la sienne
+    /// (voir « A/B » en tête de module). Les deux ensemble se lisent `brief`
+    /// d'abord.
+    Email {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        brief: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        variants: Vec<String>,
+    },
     /// Attendre tant d'heures avant le pas suivant.
     Wait { hours: u32 },
     /// Sauter à `then` si le dernier mail a reçu le signal, à `otherwise`
@@ -123,6 +150,36 @@ pub enum Step {
     },
 }
 
+impl Step {
+    /// Les briefs d'un pas `email`, `brief` en tête puis `variants` ; vide
+    /// pour les autres pas.
+    fn briefs(&self) -> Vec<&str> {
+        match self {
+            Self::Email { brief, variants } => {
+                brief.iter().chain(variants).map(String::as_str).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Combien de variantes une séquence tire : le plus grand nombre de briefs
+/// d'un de ses pas `email`, jamais moins d'une.
+fn variant_count(steps: &[Step]) -> usize {
+    steps
+        .iter()
+        .map(|s| s.briefs().len())
+        .max()
+        .unwrap_or(0)
+        .max(1)
+}
+
+/// Le tirage : l'id du run modulo `n`. Déterministe, rejouable, sans RNG —
+/// l'argument est en tête de module.
+pub fn draw(run: SequenceRunId, n: usize) -> i32 {
+    (run.as_uuid().as_u128() % n.max(1) as u128) as i32
+}
+
 /// Pourquoi une liste de pas est refusée. Chaque variante nomme le pas.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Invalid {
@@ -132,7 +189,7 @@ pub enum Invalid {
     TooMany(usize),
     #[error("a sequence needs at least one `email` step")]
     NoEmail,
-    #[error("step {0}: an `email` step needs a brief")]
+    #[error("step {0}: an `email` step needs a `brief` or non-empty `variants`")]
     EmptyBrief(usize),
     #[error("step {0}: `hours` is 1 to {MAX_WAIT_HOURS}")]
     WaitOutOfRange(usize),
@@ -162,7 +219,12 @@ pub fn validate(steps: &[Step]) -> Result<(), Invalid> {
     }
     for (i, step) in steps.iter().enumerate() {
         match step {
-            Step::Email { brief } if brief.trim().is_empty() => return Err(Invalid::EmptyBrief(i)),
+            Step::Email { .. } => {
+                let briefs = step.briefs();
+                if briefs.is_empty() || briefs.iter().any(|b| b.trim().is_empty()) {
+                    return Err(Invalid::EmptyBrief(i));
+                }
+            }
             Step::Wait { hours } if !(1..=MAX_WAIT_HOURS).contains(hours) => {
                 return Err(Invalid::WaitOutOfRange(i));
             }
@@ -331,7 +393,8 @@ impl From<sqlx::Error> for EnrollError {
     }
 }
 
-/// Inscrire un contact : un run à la position 0, dû maintenant.
+/// Inscrire un contact : un run à la position 0, dû maintenant, et sa
+/// variante tirée ([`draw`]).
 pub async fn enroll(
     tx: &mut TenantTx<'_>,
     sequence: SequenceId,
@@ -339,15 +402,15 @@ pub async fn enroll(
     employee: EmployeeId,
     now: DateTime<Utc>,
 ) -> Result<SequenceRunId, EnrollError> {
-    let live: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM sequences WHERE id = $1 AND archived_at IS NULL)",
-    )
-    .bind(sequence.as_uuid())
-    .fetch_one(&mut ***tx)
-    .await?;
-    if !live {
+    let steps: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT steps FROM sequences WHERE id = $1 AND archived_at IS NULL")
+            .bind(sequence.as_uuid())
+            .fetch_optional(&mut ***tx)
+            .await?;
+    let Some(steps) = steps else {
         return Err(EnrollError::NotFound("sequence"));
-    }
+    };
+    let steps: Vec<Step> = serde_json::from_value(steps).unwrap_or_default();
     let seat: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM employees WHERE id = $1 AND lifecycle = 'active')",
     )
@@ -375,8 +438,8 @@ pub async fn enroll(
     let id = SequenceRunId::new_v7(now);
     let inserted = sqlx::query(
         "INSERT INTO sequence_runs (id, tenant_id, sequence_id, contact_id, employee_id, \
-                                    next_at, started_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $6) \
+                                    next_at, started_at, variant) \
+         VALUES ($1, $2, $3, $4, $5, $6, $6, $7) \
          ON CONFLICT DO NOTHING",
     )
     .bind(id.as_uuid())
@@ -385,6 +448,7 @@ pub async fn enroll(
     .bind(contact)
     .bind(employee.as_uuid())
     .bind(now)
+    .bind(draw(id, variant_count(&steps)))
     .execute(&mut ***tx)
     .await?
     .rows_affected();
@@ -403,6 +467,8 @@ pub struct Run {
     pub employee_id: EmployeeId,
     pub conversation_id: Option<ConversationId>,
     pub step: i32,
+    /// La variante tirée à l'inscription ; `0` pour une séquence sans A/B.
+    pub variant: i32,
     pub state: String,
     pub stop_reason: Option<String>,
     pub next_at: Option<DateTime<Utc>>,
@@ -411,8 +477,8 @@ pub struct Run {
     pub ended_at: Option<DateTime<Utc>>,
 }
 
-const RUN_COLUMNS: &str = "id, sequence_id, contact_id, employee_id, conversation_id, step, state, \
-                           stop_reason, next_at, last_message_id, started_at, ended_at";
+const RUN_COLUMNS: &str = "id, sequence_id, contact_id, employee_id, conversation_id, step, variant, \
+                           state, stop_reason, next_at, last_message_id, started_at, ended_at";
 
 fn run_of(row: &sqlx::postgres::PgRow) -> Run {
     Run {
@@ -424,6 +490,7 @@ fn run_of(row: &sqlx::postgres::PgRow) -> Run {
             .get::<Option<Uuid>, _>("conversation_id")
             .map(ConversationId::from_uuid),
         step: row.get("step"),
+        variant: row.get("variant"),
         state: row.get("state"),
         stop_reason: row.get("stop_reason"),
         next_at: row.get("next_at"),
@@ -454,6 +521,68 @@ pub async fn find(tx: &mut TenantTx<'_>, run: SequenceRunId) -> Result<Option<Ru
     .fetch_optional(&mut ***tx)
     .await?;
     Ok(row.as_ref().map(run_of))
+}
+
+/// Ce qu'une variante a donné, en runs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct VariantStats {
+    pub variant: i32,
+    /// Inscrits, quel que soit l'état.
+    pub runs: i64,
+    /// Runs dont au moins un mail est parti.
+    pub sent: i64,
+    /// Runs dont le dernier mail a été ouvert / cliqué — la même trace que
+    /// celle qu'une branche lit.
+    pub opened: i64,
+    pub clicked: i64,
+    /// Runs terminés par une réponse — l'état que [`replied`] pose.
+    pub replied: i64,
+}
+
+/// Par variante, ce que la séquence a donné : une ligne par variante tirable,
+/// zéros compris. Vide hors du locataire.
+pub async fn variants(
+    tx: &mut TenantTx<'_>,
+    sequence: SequenceId,
+) -> Result<Vec<VariantStats>, StoreError> {
+    let steps: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT steps FROM sequences WHERE id = $1")
+            .bind(sequence.as_uuid())
+            .fetch_optional(&mut ***tx)
+            .await?;
+    let Some(steps) = steps else {
+        return Ok(Vec::new());
+    };
+    let steps: Vec<Step> = serde_json::from_value(steps).unwrap_or_default();
+    let mut out: Vec<VariantStats> = (0..variant_count(&steps))
+        .map(|v| VariantStats {
+            variant: v as i32,
+            ..VariantStats::default()
+        })
+        .collect();
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT r.variant, count(*) AS runs, count(r.last_message_id) AS sent, \
+                count(*) FILTER (WHERE {opened}) AS opened, \
+                count(*) FILTER (WHERE {clicked}) AS clicked, \
+                count(*) FILTER (WHERE r.state = 'replied') AS replied \
+           FROM sequence_runs r WHERE r.sequence_id = $1 GROUP BY r.variant",
+        opened = seen_sql("r.last_message_id", Signal::Opened),
+        clicked = seen_sql("r.last_message_id", Signal::Clicked),
+    )))
+    .bind(sequence.as_uuid())
+    .fetch_all(&mut ***tx)
+    .await?;
+    for row in &rows {
+        let variant: i32 = row.get("variant");
+        if let Some(slot) = out.get_mut(variant as usize) {
+            slot.runs = row.get("runs");
+            slot.sent = row.get("sent");
+            slot.opened = row.get("opened");
+            slot.clicked = row.get("clicked");
+            slot.replied = row.get("replied");
+        }
+    }
+    Ok(out)
 }
 
 /// La promesse réservée pour le pas courant, s'il y en a une : posée après le
@@ -618,22 +747,33 @@ pub async fn advance(
     }
 }
 
-/// Une trace `0091` sur ce message : par son id, ou par l'id fournisseur quand
-/// la trace est arrivée avant que l'outbox ait posé la ligne.
+/// Une trace `0091` sur `message` : par son id, ou par l'id fournisseur quand
+/// la trace est arrivée avant que l'outbox ait posé la ligne. `message` est une
+/// expression SQL de ce module — un paramètre ou une colonne — jamais une
+/// valeur d'appelant : c'est l'audit que `AssertSqlSafe` demande. Une seule
+/// définition, lue par la branche et par [`variants`], pour que « ouvert »
+/// veuille dire la même chose des deux côtés.
+fn seen_sql(message: &str, signal: Signal) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM message_events e \
+                  WHERE e.kind = '{}' \
+                    AND (e.message_id = {message} \
+                         OR e.provider_message_id = \
+                            (SELECT provider_message_id FROM messages WHERE id = {message})))",
+        signal.kind()
+    )
+}
+
 async fn signal_seen(
     tx: &mut TenantTx<'_>,
     message: Uuid,
     signal: Signal,
 ) -> Result<bool, StoreError> {
-    let seen: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM message_events e \
-                         WHERE e.kind = $2 \
-                           AND (e.message_id = $1 \
-                                OR e.provider_message_id = \
-                                   (SELECT provider_message_id FROM messages WHERE id = $1)))",
-    )
+    let seen: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT {}",
+        seen_sql("$1", signal)
+    )))
     .bind(message)
-    .bind(signal.kind())
     .fetch_one(&mut ***tx)
     .await?;
     Ok(seen)
@@ -721,7 +861,7 @@ pub async fn replied(
 pub async fn brief(db: &Db, tenant: TenantId, run: SequenceRunId) -> Option<String> {
     let mut tx = db.tenant_tx(tenant).await.ok()?;
     let row = sqlx::query(
-        "SELECT s.name, s.steps, r.step, c.email, r.conversation_id, r.last_message_id \
+        "SELECT s.name, s.steps, r.step, r.variant, c.email, r.conversation_id, r.last_message_id \
            FROM sequence_runs r \
            JOIN sequences s ON s.id = r.sequence_id \
            JOIN contacts c ON c.id = r.contact_id \
@@ -733,7 +873,11 @@ pub async fn brief(db: &Db, tenant: TenantId, run: SequenceRunId) -> Option<Stri
     .ok()??;
     let steps: Vec<Step> = serde_json::from_value(row.get("steps")).unwrap_or_default();
     let step = row.get::<i32, _>("step") as usize;
-    let Some(Step::Email { brief }) = steps.get(step) else {
+    let briefs = steps.get(step).map(Step::briefs).unwrap_or_default();
+    let Some(brief) = briefs
+        .get(row.get::<i32, _>("variant") as usize % briefs.len().max(1))
+        .copied()
+    else {
         let _ = tx.rollback().await;
         return None;
     };
@@ -830,7 +974,14 @@ mod tests {
 
     fn email(brief: &str) -> Step {
         Step::Email {
-            brief: brief.to_owned(),
+            brief: Some(brief.to_owned()),
+            variants: Vec::new(),
+        }
+    }
+    fn ab(variants: &[&str]) -> Step {
+        Step::Email {
+            brief: None,
+            variants: variants.iter().map(|v| (*v).to_owned()).collect(),
         }
     }
     fn wait(hours: u32) -> Step {
@@ -853,6 +1004,9 @@ mod tests {
         );
         assert_eq!(validate(&[wait(1)]), Err(Invalid::NoEmail));
         assert_eq!(validate(&[email("  ")]), Err(Invalid::EmptyBrief(0)));
+        assert_eq!(validate(&[ab(&[])]), Err(Invalid::EmptyBrief(0)));
+        assert_eq!(validate(&[ab(&["a", " "])]), Err(Invalid::EmptyBrief(0)));
+        assert_eq!(validate(&[ab(&["a", "b"])]), Ok(()));
         assert_eq!(
             validate(&[email("x"), wait(0)]),
             Err(Invalid::WaitOutOfRange(1))
@@ -903,6 +1057,42 @@ mod tests {
                 {"kind": "wait", "hours": 48},
                 {"kind": "branch", "on": "opened", "then": 3, "otherwise": 0},
             ])
+        );
+        // `brief` alone is still the wire form, and `variants` is the other.
+        let back: Vec<Step> = serde_json::from_value(serde_json::json!([
+            {"kind": "email", "brief": "x"},
+            {"kind": "email", "variants": ["a", "b"]},
+        ]))
+        .expect("both shapes");
+        assert_eq!(back, [email("x"), ab(&["a", "b"])]);
+        assert_eq!(
+            serde_json::to_value(&back).expect("json"),
+            serde_json::json!([
+                {"kind": "email", "brief": "x"},
+                {"kind": "email", "variants": ["a", "b"]},
+            ])
+        );
+    }
+
+    /// The draw is a function of the id: the same id gives the same arm, and
+    /// over a few dozen ids every arm comes up.
+    #[test]
+    fn the_draw_is_stable_and_covers_every_variant() {
+        let ids: Vec<SequenceRunId> = (0..64).map(|_| SequenceRunId::new_v7(Utc::now())).collect();
+        for n in [1usize, 2, 3] {
+            let mut seen = vec![false; n];
+            for id in &ids {
+                let v = draw(*id, n);
+                assert_eq!(v, draw(*id, n), "replayable");
+                assert!((0..n as i32).contains(&v));
+                seen[v as usize] = true;
+            }
+            assert!(seen.iter().all(|s| *s), "n={n}: an arm never came up");
+        }
+        assert_eq!(variant_count(&[email("x"), wait(1)]), 1);
+        assert_eq!(
+            variant_count(&[email("x"), ab(&["a", "b", "c"]), ab(&["d", "e"])]),
+            3
         );
     }
 
@@ -1361,6 +1551,83 @@ mod tests {
             promises(&f, run).await.is_empty(),
             "nothing was booked for it"
         );
+    }
+
+    /// **A run keeps its arm, the wake carries that arm's brief, and the
+    /// reading counts runs.** One enrolment, so the arm is whichever the id
+    /// draws; the test reads it back rather than assuming it.
+    #[tokio::test]
+    async fn a_run_keeps_its_variant_and_the_reading_counts_runs() {
+        let Some(f) = fixture().await else {
+            return;
+        };
+        let t0 = Utc::now().trunc_subsecs(6);
+        let seq = defined(
+            &f,
+            &[
+                ab(&["arm A: a question", "arm B: a number"]),
+                email("plain"),
+            ],
+        )
+        .await;
+        let run = enrolled(&f, seq, t0).await;
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        let r = find(&mut tx, run).await.expect("find").expect("mine");
+        assert_eq!(r.variant, draw(run, 2), "written at enrolment, from the id");
+        let (mine, other) = (r.variant as usize, 1 - r.variant as usize);
+        // Nothing has happened yet: one row per arm, zeros included.
+        let before = variants(&mut tx, seq).await.expect("variants");
+        assert_eq!(before.len(), 2);
+        assert_eq!(before[mine].runs, 1);
+        assert_eq!(
+            before[other],
+            VariantStats {
+                variant: other as i32,
+                ..Default::default()
+            }
+        );
+        tx.rollback().await.expect("rollback");
+
+        tick(&f, run, t0).await;
+        rung(&f, run, t0 + TimeDelta::minutes(1)).await;
+        let text = brief(&f.db, f.tenant, run).await.expect("brief");
+        let (yes, no) = if mine == 0 {
+            ("arm A", "arm B")
+        } else {
+            ("arm B", "arm A")
+        };
+        assert!(text.contains(yes), "{text}");
+        assert!(!text.contains(no), "{text}");
+
+        let t1 = t0 + TimeDelta::minutes(2);
+        assert_eq!(sent_by_lena(&f, "msg-1", t1).await, Some(run));
+        let r = tick(&f, run, t1).await; // step 1: the plain email, same run, same arm
+        assert_eq!((r.step, r.variant as usize), (1, mine));
+        opened(&f, r.last_message_id.expect("msg-1")).await;
+        reply(&f, t1 + TimeDelta::hours(1)).await;
+
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        let after = variants(&mut tx, seq).await.expect("variants");
+        assert_eq!(
+            after[mine],
+            VariantStats {
+                variant: mine as i32,
+                runs: 1,
+                sent: 1,
+                opened: 1,
+                clicked: 0,
+                replied: 1
+            }
+        );
+        assert_eq!(after[other].runs, 0);
+        tx.rollback().await.expect("rollback");
+        // The other company reads nothing.
+        let mut tx = f.db.tenant_tx(f.other).await.expect("tx");
+        assert!(
+            variants(&mut tx, seq).await.expect("variants").is_empty(),
+            "RLS"
+        );
+        tx.rollback().await.expect("rollback");
     }
 
     #[tokio::test]
