@@ -129,14 +129,6 @@ duty of care. Insurers and cruise lines carry the claims and the denied \
 boardings. Knowing which of these a prospect is tells you what a mistake costs \
 them, and that is the conversation.
 
-One kind of prospect carries none of this itself and sells to a hundred that \
-do: the integration partner — a property management system, a channel manager, \
-a white-label booking engine, an embedded travel-insurance platform. It has no \
-traveller-facing flow to run a pair through, so the method below changes for \
-it: the evidence is the public place where it says what it integrates, and the \
-finding is that entry requirements are not on that list. Its clients pay the \
-costs above; the partner is where the missing integration would live.
-
 # The job is evidence, not pitching
 
 Your advantage is that you can check. A prospect's own booking flow will tell \
@@ -588,12 +580,21 @@ impl RolePack {
         // handoff are the same job. See the module docs, « Le partenaire ».
         let (research, evidence, qualify) = if segment == Segment::Partner {
             (
+                // The briefing's method is written for a booking flow, and
+                // the briefing is the shared, sealed prefix — so the partner's
+                // method is stated here, in the one plan that needs it.
                 format!(
-                    "Research these {segment} accounts in {market}: {accounts}. For each, find \
-                     what it already integrates for its clients — payment, travel insurance, \
-                     e-visa, anything a trip depends on — who its clients are, and where an \
-                     entry-requirements condition is missing for those clients. What a \
-                     mistake costs them here is {stake}."
+                    "Research these {segment} accounts in {market}: {accounts}. A {segment} — a \
+                     property management system, a channel manager, a white-label booking \
+                     engine, an embedded travel-insurance platform — carries none of the costs \
+                     itself and sells to a hundred clients that do; it has no traveller-facing \
+                     flow to run a pair through, so the method changes: the evidence is the \
+                     public place where it says what it integrates, and the finding is that \
+                     entry requirements are not on that list. For each, find what it already \
+                     integrates for its clients — payment, travel insurance, e-visa, anything \
+                     a trip depends on — who its clients are, and where an entry-requirements \
+                     condition is missing for those clients. What a mistake costs them here is \
+                     {stake}."
                 ),
                 "For each account, find the public place where it says what it integrates — \
                  the integrations page, the developer docs, the marketplace — and record \
@@ -1775,8 +1776,10 @@ mod tests {
 
         for task in &plan[..2] {
             let text = task.instruction.to_lowercase();
+            // "booking engine" names what a partner *is*; "booking flow" is
+            // the method it must never be handed.
             assert!(
-                !text.contains("booking"),
+                !text.contains("booking flow") && !text.contains("servicing flow"),
                 "{}: {}",
                 task.stage,
                 task.instruction
