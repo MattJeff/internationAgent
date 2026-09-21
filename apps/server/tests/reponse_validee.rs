@@ -269,7 +269,7 @@ async fn un_prospect_repond_le_siege_redige_le_fondateur_valide_et_ca_part() {
             .to_string(),
     );
 
-    let Some(server) = Server::start_with(&[
+    let Some(server) = Server::start_on_private_db_with(&[
         ("AGENTOS_LLM", "cli".to_owned()),
         ("PATH", model.path()),
         // Le vrai adaptateur, redirigé : `EMAIL_API_BASE` est refusé sans

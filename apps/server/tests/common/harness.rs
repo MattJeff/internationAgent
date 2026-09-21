@@ -174,8 +174,14 @@ impl Drop for Server {
 impl Server {
     /// `None` when there is no database — these assertions are about rows and
     /// sockets, and a mock of either would be a mock of the test.
-    pub async fn start() -> Option<Self> {
-        Self::start_with(&[]).await
+    /// Boot a server on a database of its own — the name says so at every
+    /// call site, because `crates/app/tests/scoped_deletes.rs` reads test
+    /// files for that word: a test that installs an operator ceiling writes
+    /// the one global policy row, and must visibly not do it in the shared
+    /// pool. The harness always did; moving it here took the word out of the
+    /// files that use it.
+    pub async fn start_on_private_db() -> Option<Self> {
+        Self::start_on_private_db_with(&[]).await
     }
 
     /// The same server, with `extra` layered over the environment it is spawned
@@ -183,7 +189,8 @@ impl Server {
     /// [`FakeModel`] shadows `claude` by putting a directory of its own in
     /// front, and `CliLlm` resolves the program off `PATH` with no variable to
     /// override it.
-    pub async fn start_with(extra: &[(&str, String)]) -> Option<Self> {
+    /// [`Self::start_on_private_db`] with extra environment for the server.
+    pub async fn start_on_private_db_with(extra: &[(&str, String)]) -> Option<Self> {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             eprintln!("SKIP: DATABASE_URL is unset; the end-to-end run needs a real Postgres");
             return None;

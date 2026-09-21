@@ -61,7 +61,7 @@ use common::harness::{APPROVER_SECRET, FakeModel, SECRET, Server, WEBHOOK_SECRET
 /// and every assertion here is about the same running process.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_posted_employee_is_provisioned_by_the_loops_and_the_edges_are_authenticated_correctly() {
-    let Some(server) = Server::start().await else {
+    let Some(server) = Server::start_on_private_db().await else {
         return;
     };
 
@@ -624,7 +624,7 @@ async fn a_company_is_drawn_takes_a_turn_talks_to_itself_and_meets_the_gate() {
         r#"{"tool": "message_colleague", "input": {"to": "fondateur", "kind": "question", "body": "An ad network wrote in about our spend. Do we answer them?"}}"#,
     );
 
-    let Some(server) = Server::start_with(&[
+    let Some(server) = Server::start_on_private_db_with(&[
         // Not `mock`: the in-process `ScriptedLlm` records every request it is
         // handed and none of that is reachable from out here. `cli` spawns a
         // program off PATH, and `FakeModel` owns the PATH.
