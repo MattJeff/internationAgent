@@ -1,3 +1,4 @@
+pub mod discovery; // 0113: reads each tenant's annuaires once a day, through the Gate
 pub mod inbound;
 pub mod initiative; // U37
 pub mod outbox; // U36

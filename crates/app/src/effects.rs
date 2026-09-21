@@ -2578,10 +2578,25 @@ impl Effects {
         url: &Url,
         segment: &str,
     ) -> Result<crate::prospects::Report, EffectError> {
+        self.discover_prospects_in(ok, url, segment, None).await
+    }
+
+    /// [`Effects::discover_prospects`] with the country the *caller* vouches
+    /// for. A page still does not say where a company is incorporated; a
+    /// `discovery_sources` row (`0113`) does, because a human posed it on the
+    /// member list of a national federation. `None` is `ZZ`, as before.
+    pub async fn discover_prospects_in<A: Subject<Of = BrowserRead>>(
+        &self,
+        ok: Authorized<A>,
+        url: &Url,
+        segment: &str,
+        country: Option<&str>,
+    ) -> Result<crate::prospects::Report, EffectError> {
         let allowed = ok.action().subject().domain.clone();
         let mut elsewhere = None;
+        let country = country.unwrap_or(crate::prospects::UNKNOWN_COUNTRY);
         let found = self
-            .scan_directory(&allowed, url, segment, &mut elsewhere)
+            .scan_directory(&allowed, url, segment, country, &mut elsewhere)
             .await;
         let mut detail = browse_detail(&allowed, elsewhere.as_ref());
         detail.insert("segment".to_owned(), json!(segment));
@@ -2596,6 +2611,7 @@ impl Effects {
         allowed: &Domain,
         url: &Url,
         segment: &str,
+        country: &str,
         elsewhere: &mut Option<Elsewhere>,
     ) -> Result<crate::prospects::Report, EffectError> {
         let page = self.load_page(allowed, url, WHOLE_PAGE, elsewhere).await?;
@@ -2618,8 +2634,9 @@ impl Effects {
             segment,
             // A page does not say where a company is incorporated and this does
             // not guess — `0033_prospect_listing.sql`'s own argument, and the
-            // reason `ZZ` exists.
-            country: crate::prospects::UNKNOWN_COUNTRY,
+            // reason `ZZ` exists. `discover_prospects` passes exactly that;
+            // only a posed source (`0113`) says otherwise, and a human said it.
+            country,
             employee_id: Some(self.principal.employee_id),
             // L'URL qu'on a demandée, qui est la nôtre — pas un octet que la
             // page a écrit. Elle devient `contacts.origin_ref` (0107), et c'est

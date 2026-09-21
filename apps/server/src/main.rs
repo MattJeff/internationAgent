@@ -555,6 +555,14 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
             "sequence",
             tokio::spawn(loops::sequence::run(db.clone(), cancel.clone())),
         ),
+        (
+            "discovery",
+            tokio::spawn(loops::discovery::run(
+                db.clone(),
+                ports.clone(),
+                cancel.clone(),
+            )),
+        ),
     ];
 
     let listener = TcpListener::bind(config.bind).await?;
@@ -860,6 +868,14 @@ fn app(
             // annuaire est un `BrowserRead` sur lequel la Gate statue pour un
             // siège.
             .merge(routes::prospects::router(
+                db.clone(),
+                gate.clone(),
+                ports.clone(),
+            ))
+            // Les annuaires relus chaque jour (0113) : poser en vérifie le
+            // `robots.txt` sous le même jeton `BrowserRead`, d'où la gate et
+            // le même `ports`.
+            .merge(routes::discovery::router(
                 db.clone(),
                 gate.clone(),
                 ports.clone(),

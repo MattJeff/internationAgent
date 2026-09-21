@@ -18,6 +18,7 @@ pub mod catalog; // the connectors we wrote down, so a customer clicks instead o
 pub mod content; // la boucle de citation : les questions qu'on veut gagner, ce qu'un moteur répond aujourd'hui, et ce qu'il manque pour y être
 pub mod cookie_jar; // le pot de cookies d'un employé, scellé sous browser://<locataire>/<employé>
 pub mod deliverability; // la délivrabilité du contenu : un mail qui ressemble à du spam ne part pas
+pub mod discovery; // le flux d'annuaires : les pages qu'un locataire fait relire chaque jour, sous le budget de `discover`
 pub mod effects; // U21
 pub mod files; // le classeur: the port a company's documents are kept behind, ours or the customer's
 pub mod flow_proposal; // the employee proposes a prospect's selectors, a human promotes them
