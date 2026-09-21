@@ -1429,7 +1429,7 @@ pub fn tools() -> Vec<ToolDef> {
                     },
                     "objective": {
                         "type": "object",
-                        "description": "Ce sur quoi il agit, union étiquetée par `role`. `international-buyer` : `what`, `quantity`, `max_unit_price {minor,currency}`, `delivery_country`, `requirements[]`. `sales-development` : `segment` (obligatoire, l'un de `airline`, `ota`, `corporate_travel`, `insurer`, `cruise_line` — **ce n'est pas la liste de `prospects_segments_list`**, qui en admet huit, épelle la croisière `cruise` et connaît `tmc`, `relocation` et `other` ; une valeur de là rend un 400 `objective_field`), `market` (code pays ISO-3166 à deux lettres, `FR` et non `France`), `target_accounts[]`. `customer-success` : `product`, `first_response_hours`, `escalate_to`. `growth` : `topic`, `market`, `measure`. `finance` : `period`, `currency`, `obligations[]`. `entry-requirements` : `destinations`, `passports[]`, `max_age_days`. `engineering` : `repository`, `checks`, `reviewer`. `managing` : `mission`, `seats {slug: role}`. Sauf `segment`, tout a un défaut : un objectif incomplet est stockable, et `initiatives_get` rend la question en `clarify` plutôt qu'un refus.",
+                        "description": "Ce sur quoi il agit, union étiquetée par `role`. `international-buyer` : `what`, `quantity`, `max_unit_price {minor,currency}`, `delivery_country`, `requirements[]`. `sales-development` : `segment` (obligatoire, l'un de `airline`, `ota`, `corporate_travel`, `insurer`, `cruise_line`, `partner` — `partner` est le PMS, le channel manager, le moteur en marque blanche : pas de tunnel voyageur, on cherche ce qu'il intègre — **ce n'est pas la liste de `prospects_segments_list`**, qui en admet neuf, épelle la croisière `cruise` et connaît `tmc`, `relocation` et `other` ; une valeur de là rend un 400 `objective_field`), `market` (code pays ISO-3166 à deux lettres, `FR` et non `France`), `target_accounts[]`. `customer-success` : `product`, `first_response_hours`, `escalate_to`. `growth` : `topic`, `market`, `measure`. `finance` : `period`, `currency`, `obligations[]`. `entry-requirements` : `destinations`, `passports[]`, `max_age_days`. `engineering` : `repository`, `checks`, `reviewer`. `managing` : `mission`, `seats {slug: role}`. Sauf `segment`, tout a un défaut : un objectif incomplet est stockable, et `initiatives_get` rend la question en `clarify` plutôt qu'un refus.",
                         "properties": {
                             "role": {
                                 "type": "string",
@@ -2016,9 +2016,9 @@ mod tests {
     /// **Deux listes fermées portent le même nom, et une seule est offerte.**
     ///
     /// Mesuré le 2026-09-11 : le geste « lancer une campagne » fait lire
-    /// `prospects_segments_list` (huit valeurs, la CHECK de la base), puis poser
+    /// `prospects_segments_list` (neuf valeurs, la CHECK de la base), puis poser
     /// un objectif `sales-development` — dont le `segment` est une *autre* liste
-    /// de cinq, qui épelle la croisière `cruise_line` et ignore `tmc`,
+    /// de six, qui épelle la croisière `cruise_line` et ignore `tmc`,
     /// `relocation` et `other`. Un modèle qui enchaîne les deux comme la carte
     /// l'y invite lit un 400. Le schéma d'`initiatives_set` ne peut pas porter
     /// un `enum` — l'objectif est une union étiquetée dans un objet libre — donc

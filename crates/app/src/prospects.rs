@@ -236,15 +236,16 @@ use uuid::Uuid;
 
 use crate::queue::COLUMNS;
 
-/// The segments `accounts_segment` in `0011_revenue.sql` permits.
+/// The segments `accounts_segment` permits — `0011_revenue.sql`'s eight plus
+/// `partner`, widened by `0117_un_partenaire_revend_a_cent_clients.sql`.
 ///
 /// Not [`agentos_domain::revenue::Segment`], and the difference is worth
 /// knowing: that enum has six variants, spells cruise `cruise_line`, and has no
-/// `relocation` or `other` — so it cannot name the FIDI movers or the ECTAA
-/// associations, and its spelling of cruise would violate the CHECK. The
-/// database is the authority here; this array is checked against it by
-/// `a_segment_the_check_refuses_is_refused_before_the_database_sees_it`.
-pub const SEGMENTS: [&str; 8] = [
+/// `relocation`, `partner` or `other` — so it cannot name the FIDI movers, the
+/// ECTAA associations or a PMS, and its spelling of cruise would violate the
+/// CHECK. The database is the authority here; this array is checked against it
+/// by `a_segment_the_check_refuses_is_refused_before_the_database_sees_it`.
+pub const SEGMENTS: [&str; 9] = [
     "airline",
     "ota",
     "corporate_travel",
@@ -252,6 +253,7 @@ pub const SEGMENTS: [&str; 8] = [
     "insurer",
     "cruise",
     "relocation",
+    "partner",
     "other",
 ];
 

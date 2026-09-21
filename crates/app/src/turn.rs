@@ -605,7 +605,7 @@ pub(crate) fn catalogue() -> [(&'static str, ActionKind, Risk, &'static str, Val
                         "description": "What kind of business this page lists, which is a \
                                         judgement about the directory and not something read off \
                                         it. One of: airline, ota, corporate_travel, tmc, \
-                                        insurer, cruise, relocation, other.",
+                                        insurer, cruise, relocation, partner, other.",
                         "enum": crate::prospects::SEGMENTS,
                     }
                 },
@@ -2359,8 +2359,8 @@ impl Turn {
                     parse(input).map_err(args("a directory to read"))?;
                 let (url, domain) = page_at(&url)?;
                 // Checked before the gate is troubled, and the message names
-                // the eight: `accounts_segment` is a CHECK constraint, so a
-                // ninth spelling is a write that fails after a page has been
+                // the nine: `accounts_segment` is a CHECK constraint, so a
+                // tenth spelling is a write that fails after a page has been
                 // loaded, which is a spent turn and a spent page load.
                 if !crate::prospects::SEGMENTS.contains(&segment.as_str()) {
                     return Err(format!(

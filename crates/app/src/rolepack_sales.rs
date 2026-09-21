@@ -71,6 +71,25 @@
 //!   proposing, in the only voice this pack has for proposing, and the line
 //!   `may_propose` draws around `PaymentCreate` and `ContractSign` would be
 //!   crossed by a sentence rather than by an action.
+//! * **The partner is a segment, not a target account** (« Le partenaire »).
+//!   On 2026-09-21 the seat, sent after BookingSync, found Smily — a property
+//!   management system for rental managers — and passed on it, correctly by
+//!   its plan: no traveller-facing booking flow, so nothing to reproduce. A
+//!   PMS, a channel manager, a white-label booking engine, an embedded
+//!   travel-insurance platform: none of them books a trip, and every one of
+//!   them resells an integration to a hundred clients at once, each of whom
+//!   sends travellers off without an entry condition. Putting such a company
+//!   in `target_accounts` under `ota` would hand the seat the same plan that
+//!   just refused it. What differs is not the account but the *method*: the
+//!   evidence is a public page where the partner says what it integrates and
+//!   entry requirements are not on it, and the qualifying question is how
+//!   many end clients rather than how many bookings. A method is what a
+//!   [`Segment`] carries, so [`Segment::Partner`] is one. And its tier is
+//!   [`Tier::Enterprise`] rather than the lowest one, because the asymmetry
+//!   in [`tier_for`] is about *evidence*: a partner redistributes the answer
+//!   to its own clients under its own name, and that is what the page says
+//!   only the Enterprise tier licenses — a fact about the licence, known
+//!   before any volume is, not a volume rounded up.
 //!
 //! Everything else — the briefing is a `&'static str` because the cache
 //! breakpoint sits at the end of the prefix, the plan is data recomputed each
@@ -109,6 +128,14 @@ chargebacks and the support tickets. Corporate travel and mobility teams carry \
 duty of care. Insurers and cruise lines carry the claims and the denied \
 boardings. Knowing which of these a prospect is tells you what a mistake costs \
 them, and that is the conversation.
+
+One kind of prospect carries none of this itself and sells to a hundred that \
+do: the integration partner — a property management system, a channel manager, \
+a white-label booking engine, an embedded travel-insurance platform. It has no \
+traveller-facing flow to run a pair through, so the method below changes for \
+it: the evidence is the public place where it says what it integrates, and the \
+finding is that entry requirements are not on that list. Its clients pay the \
+costs above; the partner is where the missing integration would live.
 
 # The job is evidence, not pitching
 
@@ -556,9 +583,35 @@ impl RolePack {
         let segment = objective.segment;
         let stake = segment.stake();
 
-        vec![
-            Task::new(
-                Stage::Research,
+        // A partner has no flow to run a pair through, so the three stages
+        // that are *about* the flow read differently; contact, approach and
+        // handoff are the same job. See the module docs, « Le partenaire ».
+        let (research, evidence, qualify) = if segment == Segment::Partner {
+            (
+                format!(
+                    "Research these {segment} accounts in {market}: {accounts}. For each, find \
+                     what it already integrates for its clients — payment, travel insurance, \
+                     e-visa, anything a trip depends on — who its clients are, and where an \
+                     entry-requirements condition is missing for those clients. What a \
+                     mistake costs them here is {stake}."
+                ),
+                "For each account, find the public place where it says what it integrates — \
+                 the integrations page, the developer docs, the marketplace — and record \
+                 exactly what it lists and what it does not: the URL, the date, the wording. \
+                 The finding is that entry requirements or visas are absent from that list, \
+                 quoted as the page shows it — never that anything on it is wrong. Reproduce \
+                 it a second time before it leaves this machine. An account that already \
+                 lists an entry-requirements integration, or whose page you cannot get back \
+                 to, gets no approach — report it as no finding."
+                    .to_owned(),
+                "Qualify the accounts that reply: how many end clients they serve, which \
+                 passports and destinations those clients' travellers carry, what their \
+                 clients ask for that is not integrated today, and who owns the integration \
+                 roadmap. Record their answers as given — estimate nothing on their behalf."
+                    .to_owned(),
+            )
+        } else {
+            (
                 // A sentence naming `find_prospects` belongs here — "the named
                 // accounts are where to start and not the whole market" is the
                 // founder's instruction in the place the model reads it in
@@ -576,9 +629,6 @@ impl RolePack {
                      requirements, and who owns that surface. What a mistake costs them here is \
                      {stake}."
                 ),
-            ),
-            Task::new(
-                Stage::Evidence,
                 "For each account, run a specific passport and destination pair through that \
                  flow yourself and record exactly what it showed: the pair, the page or step, \
                  the date and the wording. Look for a category the flow does not display, \
@@ -588,8 +638,19 @@ impl RolePack {
                  distinguished from one, a stay length with nothing about the agreement it \
                  rests on. Reproduce every finding a second time before it leaves this \
                  machine. An account you cannot reproduce a finding for, or whose flow shows \
-                 every category, gets no approach — report it as no finding.",
-            ),
+                 every category, gets no approach — report it as no finding."
+                    .to_owned(),
+                "Qualify the accounts that reply: volume, which passports and destinations, \
+                 which surface shows entry requirements today, what being wrong costs them, \
+                 and who owns the decision. Record their answers as given — estimate nothing \
+                 on their behalf."
+                    .to_owned(),
+            )
+        };
+
+        vec![
+            Task::new(Stage::Research, research),
+            Task::new(Stage::Evidence, evidence),
             Task::new(
                 Stage::Contact,
                 "For each account with a reproduced finding, identify the person accountable \
@@ -610,13 +671,7 @@ impl RolePack {
                     self.outreach_budget()
                 ),
             ),
-            Task::new(
-                Stage::Qualify,
-                "Qualify the accounts that reply: volume, which passports and destinations, \
-                 which surface shows entry requirements today, what being wrong costs them, \
-                 and who owns the decision. Record their answers as given — estimate nothing \
-                 on their behalf.",
-            ),
+            Task::new(Stage::Qualify, qualify),
             Task::new(
                 Stage::Handoff,
                 "Hand each qualified account to a human with the finding, its reproduction \
@@ -667,16 +722,22 @@ pub enum Segment {
     Insurer,
     /// Cruise lines.
     CruiseLine,
+    /// Integration partners: a PMS, a channel manager, a white-label booking
+    /// engine, an embedded travel-insurance platform. No traveller-facing
+    /// flow; they resell an integration to their own clients, who have one.
+    /// See the module docs (« Le partenaire ») for why this is a segment.
+    Partner,
 }
 
 impl Segment {
-    /// Every segment, so a sixth cannot slip past the tests.
-    pub const ALL: [Segment; 5] = [
+    /// Every segment, so a seventh cannot slip past the tests.
+    pub const ALL: [Segment; 6] = [
         Segment::Airline,
         Segment::Ota,
         Segment::CorporateTravel,
         Segment::Insurer,
         Segment::CruiseLine,
+        Segment::Partner,
     ];
 
     /// What being wrong costs this segment. Goes into the plan, never into the
@@ -702,6 +763,10 @@ impl Segment {
             Segment::CruiseLine => {
                 "denied boarding at the pier, where there is no re-route and the cabin sails empty"
             }
+            Segment::Partner => {
+                "every cost its clients carry, multiplied by the number of clients — and the \
+                 integration a client asks for that a competitor's platform already lists"
+            }
         }
     }
 
@@ -716,7 +781,8 @@ impl Segment {
             Segment::Airline | Segment::CorporateTravel | Segment::CruiseLine => {
                 &[Channel::Email, Channel::Voice]
             }
-            Segment::Ota | Segment::Insurer => &[Channel::Email],
+            // A partner's integration owner is a product person too.
+            Segment::Ota | Segment::Insurer | Segment::Partner => &[Channel::Email],
         }
     }
 
@@ -728,6 +794,7 @@ impl Segment {
             Segment::CorporateTravel => "corporate_travel",
             Segment::Insurer => "insurer",
             Segment::CruiseLine => "cruise_line",
+            Segment::Partner => "partner",
         }
     }
 }
@@ -740,6 +807,7 @@ impl fmt::Display for Segment {
             Segment::CorporateTravel => "corporate travel programme",
             Segment::Insurer => "travel insurer",
             Segment::CruiseLine => "cruise line",
+            Segment::Partner => "partner platform",
         })
     }
 }
@@ -832,8 +900,23 @@ pub struct TierFit {
 /// approach, which is why the plan calls this with `None`.
 ///
 /// The `segment` is what establishes commercial use and what the reason
-/// sentence names; it does not move the tier. Pure, so the plan stays pure.
+/// sentence names; it does not move the tier — with one exception that is
+/// the same rule read once more. A [`Segment::Partner`] redistributes the
+/// answer to its own clients under its own name, and the page licenses that
+/// under `Enterprise` alone (white label, redistribution). That is a fact
+/// about the licence, settled by what the partner *is* before any volume is
+/// stated, so naming it rounds nothing up. Pure, so the plan stays pure.
 pub fn tier_for(segment: Segment, monthly_requests: Option<u64>) -> TierFit {
+    if segment == Segment::Partner {
+        return TierFit {
+            tier: Tier::Enterprise,
+            reason: format!(
+                "a {segment} redistributes the answer to its own clients under its own name, \
+                 which only the Enterprise tier licenses — white label and redistribution — \
+                 whatever the volume"
+            ),
+        };
+    }
     let Some(volume) = monthly_requests else {
         return TierFit {
             tier: Tier::Starter,
@@ -1583,12 +1666,18 @@ mod tests {
     // -- the tier ----------------------------------------------------------
 
     /// No signal lowers the answer and never raises it: every segment lands on
-    /// the cheapest commercial tier, and none on the free one.
+    /// the cheapest commercial tier, and none on the free one. The partner is
+    /// the one exception and it is not a volume: see
+    /// `a_partner_is_enterprise_on_the_licence_and_not_on_a_volume`.
     #[test]
     fn without_a_volume_every_segment_sits_on_the_lowest_commercial_tier() {
         for segment in Segment::ALL {
             let fit = tier_for(segment, None);
-            assert_eq!(fit.tier, Tier::Starter, "{segment} was rounded up");
+            let lowest = match segment {
+                Segment::Partner => Tier::Enterprise,
+                _ => Tier::Starter,
+            };
+            assert_eq!(fit.tier, lowest, "{segment} was rounded up");
             assert!(
                 fit.reason.contains(&segment.to_string()),
                 "the reason does not name the segment: {}",
@@ -1644,11 +1733,105 @@ mod tests {
                 segment,
                 ..objective()
             });
-            assert!(plan[3].instruction.contains("Starter"), "{segment}");
+            let tier = tier_for(segment, None).tier.name();
+            assert!(plan[3].instruction.contains(tier), "{segment}");
             assert!(!plan[3].instruction.contains('$'), "{segment}");
         }
         assert!(!sales().may_propose(ActionKind::PaymentCreate));
         assert!(!sales().may_propose(ActionKind::ContractSign));
+    }
+
+    /// The one segment whose tier is settled by what it is: redistribution is
+    /// licensed under Enterprise alone, so no volume — none, or one the free
+    /// tier would hold — moves it.
+    #[test]
+    fn a_partner_is_enterprise_on_the_licence_and_not_on_a_volume() {
+        for volume in [None, Some(50), Some(30_000), Some(250_001)] {
+            let fit = tier_for(Segment::Partner, volume);
+            assert_eq!(fit.tier, Tier::Enterprise, "{volume:?}");
+            assert!(
+                fit.reason.contains("redistribut") && fit.reason.contains("partner platform"),
+                "the reason must say why the licence decides: {}",
+                fit.reason
+            );
+        }
+        assert_eq!(Tier::Enterprise.price_usd(), 600);
+    }
+
+    /// A partner has no booking flow, so the plan does not send the seat to
+    /// one — the 2026-09-21 refusal, made impossible rather than corrected.
+    /// The approach names Enterprise and the page, no price, no offer; the
+    /// stages that do not depend on a flow are byte-identical to an airline's.
+    #[test]
+    fn a_partner_plan_reads_integrations_and_never_a_booking_flow() {
+        let partner = Objective {
+            segment: Segment::Partner,
+            market: Some(CountryCode::parse("fr").expect("country")),
+            target_accounts: vec!["Smily".to_owned()],
+        };
+        let plan = sales().plan(&partner);
+        let stages: Vec<Stage> = plan.iter().map(|task| task.stage).collect();
+        assert_eq!(stages, Stage::SALES.to_vec());
+
+        for task in &plan[..2] {
+            let text = task.instruction.to_lowercase();
+            assert!(
+                !text.contains("booking"),
+                "{}: {}",
+                task.stage,
+                task.instruction
+            );
+            assert!(
+                !text.contains("passport and destination pair"),
+                "{}: {}",
+                task.stage,
+                task.instruction
+            );
+            assert!(
+                text.contains("integrat"),
+                "{}: {}",
+                task.stage,
+                task.instruction
+            );
+        }
+        let research = &plan[0].instruction;
+        assert!(research.contains("Smily") && research.contains("FR"));
+        assert!(research.contains("who its clients are"), "{research}");
+        let evidence = &plan[1].instruction;
+        assert!(evidence.contains("integrations page"), "{evidence}");
+        assert!(evidence.contains("absent from that list"), "{evidence}");
+        assert!(evidence.contains("Reproduce"), "{evidence}");
+        assert!(
+            evidence.contains("never that anything on it is wrong"),
+            "{evidence}"
+        );
+
+        let approach = &plan[3].instruction;
+        assert!(approach.contains("Enterprise"), "{approach}");
+        assert!(!approach.contains("Starter"), "{approach}");
+        assert!(approach.contains(PRICING_PAGE), "{approach}");
+        assert!(!approach.contains('$'), "{approach}");
+        assert!(!approach.contains("600"), "{approach}");
+        for word in ["offer", "discount", "deal", "for you", "I can give"] {
+            assert!(
+                !approach.to_lowercase().contains(&word.to_lowercase()),
+                "{word:?} in {approach}"
+            );
+        }
+
+        let qualify = &plan[4].instruction;
+        assert!(qualify.contains("how many end clients"), "{qualify}");
+        assert!(qualify.contains("passports and destinations"), "{qualify}");
+
+        // Contact and handoff are the same job for every segment.
+        let airline = sales().plan(&objective());
+        assert_eq!(plan[2], airline[2]);
+        assert_eq!(plan[5], airline[5]);
+
+        // And it still proposes neither money nor a signature.
+        assert!(!sales().may_propose(ActionKind::PaymentCreate));
+        assert!(!sales().may_propose(ActionKind::ContractSign));
+        assert_eq!(plan, sales().plan(&partner));
     }
 
     #[test]

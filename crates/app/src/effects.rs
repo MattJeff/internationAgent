@@ -186,7 +186,7 @@ pub const NO_POLICY: &str = "broken_policy";
 /// What [`Effects::discover_prospects`] answers when the segment it was handed
 /// is not one `accounts_segment` permits.
 ///
-/// A closed set, checked twice: `Turn::propose` names the eight to the model
+/// A closed set, checked twice: `Turn::propose` names the nine to the model
 /// before the gate is troubled, and this is the same refusal at the write.
 pub const BAD_SEGMENT: &str = "unknown_segment";
 

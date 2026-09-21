@@ -102,9 +102,10 @@ pub fn tools() -> Vec<ToolDef> {
                  400 `bad_segment`, et c'est la seule façon de connaître l'orthographe exacte \
                  attendue. C'est exactement la valeur qu'attend le champ `segment` de \
                  `prospects_import`. **Ce n'est pas la même liste que le `segment` d'un objectif \
-                 `sales-development`** posé par `initiatives_set` : celle-là en admet cinq \
-                 (`airline`, `ota`, `corporate_travel`, `insurer`, `cruise_line`), n'a ni `tmc`, \
-                 ni `relocation`, ni `other`, et épelle la croisière `cruise_line`. Prendre une \
+                 `sales-development`** posé par `initiatives_set` : celle-là en admet six \
+                 (`airline`, `ota`, `corporate_travel`, `insurer`, `cruise_line`, `partner`), \
+                 n'a ni `tmc`, ni `relocation`, ni `other`, et épelle la croisière \
+                 `cruise_line`. Prendre une \
                  valeur d'ici pour un objectif est un 400 `objective_field`.",
             method: Method::Get,
             path: "/v1/prospects/segments",
