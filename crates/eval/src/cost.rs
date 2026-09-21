@@ -359,7 +359,18 @@ pub fn by_model(sample: Sample, calls_per_turn: f64) -> Vec<(ModelId, usize, f64
 /// dit. La phrase a perdu « at $49 a month » et gagné « name no price » ;
 /// `51aaffc2dae7a911` est devenu `8f24a5b61db46939` pour ça et rien d'autre
 /// (mesuré : la suite `rolepack_sales::` seule a changé, 17/17).
-pub const DIGEST: &str = "8f24a5b61db46939";
+/// # Re-mesuré le 2026-09-21 au soir, `--dry-run 3`, pas re-piné sur précédent
+///
+/// Une ligne de catalogue est entrée : `file_draft`, le quatorzième verbe d'un
+/// tour, pour qu'un siège growth puisse ranger un article au lieu de le perdre
+/// dans un message interne. Et le schéma de `find_prospects` a gagné une
+/// valeur (`partner`). La règle du 2026-09-05 est sans exception : une ligne
+/// de catalogue se mesure, elle ne se re-pine pas. Trois runs sur une base
+/// neuve (`repin_autre_pan`) : 8,33 / 7,67 / 8,00 appels par tour, 7,7 k
+/// jetons par appel en entrée, ~420 en sortie — dans le ±20 % des figures du
+/// 09-05 (8,00 / 7,33 / 8,00 ; 7,4–7,5 k). `RECORDED` et la phrase de
+/// `docs/ORIZN.md` sont ceux de ces trois runs.
+pub const DIGEST: &str = "8f5754566640141c";
 
 // ---------------------------------------------------------------------------
 // The company, as the operator wrote it down

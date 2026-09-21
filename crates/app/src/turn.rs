@@ -180,6 +180,7 @@ const PAY: &str = "pay";
 const MESSAGE_COLLEAGUE: &str = "message_colleague";
 const BRIEF_DIRECT_REPORTS: &str = "brief_direct_reports";
 const ADD_WORK_ITEM: &str = "add_work_item";
+const FILE_DRAFT: &str = "file_draft";
 const UPDATE_WORK_ITEM: &str = "update_work_item";
 const PROMISE_AN_HOUR: &str = "promise_an_hour";
 const ISSUE_INVOICE: &str = "issue_invoice";
@@ -476,7 +477,7 @@ pub(crate) const BROWSE_RISK: Risk = Risk::Low;
 /// it — and the two audiences come from the same table read the same way, so a
 /// report named in the prefix and a report reached by a briefing cannot be
 /// different sets.
-pub(crate) fn catalogue() -> [(&'static str, ActionKind, Risk, &'static str, Value); 13] {
+pub(crate) fn catalogue() -> [(&'static str, ActionKind, Risk, &'static str, Value); 14] {
     [
         (
             SEND_EMAIL,
@@ -605,7 +606,7 @@ pub(crate) fn catalogue() -> [(&'static str, ActionKind, Risk, &'static str, Val
                         "description": "What kind of business this page lists, which is a \
                                         judgement about the directory and not something read off \
                                         it. One of: airline, ota, corporate_travel, tmc, \
-                                        insurer, cruise, relocation, other.",
+                                        insurer, cruise, relocation, partner, other.",
                         "enum": crate::prospects::SEGMENTS,
                     }
                 },
@@ -906,6 +907,51 @@ pub(crate) fn catalogue() -> [(&'static str, ActionKind, Risk, &'static str, Val
                     }
                 },
                 "required": ["item", "action"]
+            }),
+        ),
+        (
+            FILE_DRAFT,
+            // `InternalSend` as a floor key, `add_work_item`'s compromise and
+            // its argument: filing an article reaches nobody outside the
+            // company — it writes this tenant's own row and files an approval
+            // the founder decides — so there is no `Action` whose refusal
+            // would mean anything, and a pack that declines the internal
+            // channel declines the handover too. What the row is NOT is a
+            // publication: `content`, « La boucle se ferme, sauf le clic ».
+            ActionKind::InternalSend,
+            // Low, for `add_work_item`'s reason with more force: the turn that
+            // has just read the pages it is writing against is untrusted for
+            // the rest of its life, and `High` would withhold the one verb
+            // that turns its reading into a draft somebody can approve.
+            COLLEAGUE_RISK,
+            "File an article you have written, in full, for a human to publish. This is the \
+             handover: it stores the draft against the question it answers and puts the whole \
+             text in front of the founder, who approves it into a pull request on the \
+             company's site or refuses it with a reason you will read next time. It publishes \
+             nothing by itself. Use it instead of pasting the page into a message — a page in \
+             a message lands nowhere.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question the article answers, as a person would \
+                                        ask it — a sentence, not a keyword. The same wording \
+                                        as an earlier draft files against the same question."
+                    },
+                    "locale": {
+                        "type": "string",
+                        "description": "The language of the question and the article: `fr`, \
+                                        `en`, …"
+                    },
+                    "title": { "type": "string", "description": "The article's title." },
+                    "body": {
+                        "type": "string",
+                        "description": "The article, entire, in Markdown. What you write here \
+                                        is what the founder reads and what goes on the site."
+                    }
+                },
+                "required": ["question", "locale", "title", "body"]
             }),
         ),
         (
@@ -1790,6 +1836,11 @@ enum Proposal {
     /// resolved against the org chart at write time; the model never names a
     /// uuid and could not be told one.
     Work(Option<Slug>, String),
+    /// No subject and no ruling, for [`Proposal::Work`]'s reason: the article
+    /// is this tenant's own row, and the decision it needs is the founder's
+    /// approval, which `Effects::file_content_draft` files and the gate
+    /// redeems later — not a ruling on the filing.
+    Draft(DraftArgs),
     /// No subject and no ruling either, for [`Proposal::Work`]'s reason — see
     /// [`Effects::work_item`](crate::effects::Effects::work_item), which argues
     /// that both verbs are narrower than filing was.
@@ -1920,6 +1971,17 @@ struct WorkArgs {
     title: String,
     #[serde(default)]
     assignee: Option<String>,
+}
+
+/// Four fields, all the model's own words: what `Effects::file_content_draft`
+/// takes. No `question_id` — a seat is handed no list of questions and could
+/// only guess a uuid; the question is idempotent on its wording.
+#[derive(Debug, Deserialize)]
+struct DraftArgs {
+    question: String,
+    locale: String,
+    title: String,
+    body: String,
 }
 
 /// Two fields, and the second is a closed set. There is no `title` — an item's
@@ -2359,8 +2421,8 @@ impl Turn {
                     parse(input).map_err(args("a directory to read"))?;
                 let (url, domain) = page_at(&url)?;
                 // Checked before the gate is troubled, and the message names
-                // the eight: `accounts_segment` is a CHECK constraint, so a
-                // ninth spelling is a write that fails after a page has been
+                // the nine: `accounts_segment` is a CHECK constraint, so a
+                // tenth spelling is a write that fails after a page has been
                 // loaded, which is a spent turn and a spent page load.
                 if !crate::prospects::SEGMENTS.contains(&segment.as_str()) {
                     return Err(format!(
@@ -2475,6 +2537,23 @@ impl Turn {
                     .map(|to| Slug::parse(&to).map_err(|e| format!("assignee: {e}")))
                     .transpose()?;
                 Ok(Proposal::Work(assignee, title.to_owned()))
+            }
+            FILE_DRAFT => {
+                let args: DraftArgs = parse(input).map_err(args("an article"))?;
+                // Trimmed and bounded here, before a transaction, for
+                // `add_work_item`'s reason: an empty title or body is one tool
+                // result, not the end of the run.
+                for (name, value) in [
+                    ("question", &args.question),
+                    ("locale", &args.locale),
+                    ("title", &args.title),
+                    ("body", &args.body),
+                ] {
+                    if value.trim().is_empty() {
+                        return Err(format!("{name}: must not be empty"));
+                    }
+                }
+                Ok(Proposal::Draft(args))
             }
             UPDATE_WORK_ITEM => {
                 let WorkUpdateArgs { item, action } =
@@ -2914,6 +2993,28 @@ impl Turn {
                 performed(filed, move |()| {
                     Reply::Ok(format!(
                         "written down {whose}; it waits on the board and wakes nobody"
+                    ))
+                })
+            }
+            Proposal::Draft(args) => {
+                // No `gated!`, for `Proposal::Work`'s reason: the row is this
+                // tenant's own, and what gets ruled on is the approval the
+                // founder decides — not this filing.
+                let filed = self
+                    .effects
+                    .file_content_draft(
+                        args.question.trim(),
+                        args.locale.trim(),
+                        args.title.trim(),
+                        args.body.trim(),
+                    )
+                    .await;
+                performed(filed, |submitted: crate::content::Submitted| {
+                    Reply::Ok(format!(
+                        "filed as draft {}; the founder has been asked to publish or refuse it \
+                         (approval {}). Nothing is online yet, and you have nothing more to do \
+                         for this article until an answer comes back",
+                        submitted.draft.id, submitted.approval_id
                     ))
                 })
             }
@@ -3746,6 +3847,7 @@ mod tests {
                 BRIEF_DIRECT_REPORTS.to_owned(),
                 ADD_WORK_ITEM.to_owned(),
                 UPDATE_WORK_ITEM.to_owned(),
+                FILE_DRAFT.to_owned(),
             ],
             "a pack listing PaymentCreate bought `pay` back on an untrusted turn"
         );
@@ -3814,6 +3916,7 @@ mod tests {
                 BRIEF_DIRECT_REPORTS.to_owned(),
                 ADD_WORK_ITEM.to_owned(),
                 UPDATE_WORK_ITEM.to_owned(),
+                FILE_DRAFT.to_owned(),
                 // `AppointmentBook`, and it survives the same ceiling for the
                 // same reason the two above it do: `default_ceiling` lists
                 // `Channel::Internal`, which is what `always_denies` asks about
@@ -3865,6 +3968,7 @@ mod tests {
                     BRIEF_DIRECT_REPORTS.to_owned(),
                     ADD_WORK_ITEM.to_owned(),
                     UPDATE_WORK_ITEM.to_owned(),
+                    FILE_DRAFT.to_owned(),
                 ],
                 "an employee with no charter lost the one thing it was left"
             );
@@ -3902,6 +4006,7 @@ mod tests {
                 BRIEF_DIRECT_REPORTS.to_owned(),
                 ADD_WORK_ITEM.to_owned(),
                 UPDATE_WORK_ITEM.to_owned(),
+                FILE_DRAFT.to_owned(),
             ],
             "a policy that permits payments bought `pay` back on an untrusted turn"
         );
@@ -3974,6 +4079,7 @@ mod tests {
                     // buys and the whole of what it buys.
                     ADD_WORK_ITEM,
                     UPDATE_WORK_ITEM,
+                    FILE_DRAFT,
                 ],
             ),
             // One kind, one tool, one ruling — the shape every row had before
@@ -4172,6 +4278,7 @@ mod tests {
                     BRIEF_DIRECT_REPORTS.to_owned(),
                     ADD_WORK_ITEM.to_owned(),
                     UPDATE_WORK_ITEM.to_owned(),
+                    FILE_DRAFT.to_owned(),
                 ],
                 "the unchartered floor stopped being the internal channel's four schemas"
             );
@@ -4196,6 +4303,7 @@ mod tests {
                 BRIEF_DIRECT_REPORTS.to_owned(),
                 ADD_WORK_ITEM.to_owned(),
                 UPDATE_WORK_ITEM.to_owned(),
+                FILE_DRAFT.to_owned(),
             ]
         );
         // And what it still does not carry, which is the half worth asserting:

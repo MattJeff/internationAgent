@@ -86,10 +86,59 @@
 //! Le chemin B — un domaine web à nous — n'est pas ici et n'est pas commencé.
 //! Publier dix clients sur un domaine à nous serait une ferme de contenu, et
 //! le § 5 explique pourquoi c'est un refus et pas un manque.
+//!
+//! # La boucle se ferme, sauf le clic
+//!
+//! Mesuré le 2026-09-22 : tout ce qui précède était posé et **personne ne le
+//! faisait tourner**. Le siège growth rédigeait la nuit et la page finissait
+//! dans un message interne — son tour n'avait aucun outil qui range un
+//! brouillon ; aucun dépôt n'était configuré ; et la mesure n'était appelée
+//! que par un humain. Trois seams, un seul principe : la boucle tourne seule,
+//! et **un humain clique une fois**, au seul endroit où quelque chose sort de
+//! chez nous.
+//!
+//! ## Pourquoi publier passe par une approbation
+//!
+//! Le pack growth ne publie pas, ne poste pas, n'achète pas — à dessein
+//! (`rolepack_service::GROWTH_BRIEFING` : « a draft can be argued with before
+//! anybody outside sees it ; a post cannot be unposted »). Ce dépôt n'a donc
+//! pas à lui donner un outil qui pousse dans le dépôt du client : il lui donne
+//! `file_draft`, qui range l'article et **dépose une approbation** avec le
+//! texte intégral ([`submit`]). Le fondateur reçoit le mail qu'une lettre
+//! retenue lui vaut déjà — même événement, même gestionnaire, même boîte
+//! (`effects::notify_approver`) — et fait un des deux gestes :
+//! `approvals_approve` appelle [`publish`], c'est-à-dire [`propose`] avec le
+//! dépôt du siège ; `approvals_deny` archive le brouillon avec le motif
+//! ([`drafts::archive`]), que le siège relira avant d'écrire le suivant.
+//!
+//! Ce n'est pas un deuxième circuit d'approbation à côté de la pull request :
+//! la pull request reste la relecture du texte, chez le client, avec le diff.
+//! L'approbation d'ici est **la décision de sortir de chez nous** — la même
+//! que pour une lettre à un inconnu — et elle est prise sur le texte entier,
+//! dans un mail, parce que c'est la seule surface que le fondateur lit chaque
+//! jour. Sans dépôt configuré, l'approbation attend et le mail dit quoi faire
+//! d'abord (`content_repos_set`) ; l'approbation n'est pas dépensée pour
+//! l'apprendre.
+//!
+//! ## Pourquoi la mesure est hebdomadaire
+//!
+//! `loops::citation` mesure chaque question d'un locataire qui a un dépôt avec
+//! un `site`, tous les [`MEASURE_EVERY`] jours, sous le siège de ce dépôt et
+//! derrière la même Gate que `content_questions_measure`. Une semaine et pas
+//! un jour : une page de résultats bouge en semaines, une série hebdomadaire
+//! sur un an est cinquante points lisibles, et chaque mesure est une lecture
+//! chez un tiers — `robots.txt` de `lite.duckduckgo.com` l'autorise
+//! (vérifié le 2026-09-11, en tête de ce fichier), mais un moteur qu'on
+//! interroge cent fois par jour est un moteur qu'on finira par ne plus avoir
+//! le droit de lire. La réclamation est `content_repos.measured_on`, posée
+//! **avant** la lecture ([`repos::claim_measure`]), pour qu'un siège que la
+//! Gate refuse ne soit pas retenté toutes les trente secondes.
 
-use agentos_domain::action::{Domain, McpTool};
-use agentos_domain::ids::Slug;
-use agentos_store::db::{StoreError, TenantTx};
+use agentos_domain::action::{Action, Domain, McpTool};
+use agentos_domain::ids::{EmployeeId, Slug};
+use agentos_store::approvals::{self, ApprovalError, NewApproval};
+use agentos_store::db::{Db, StoreError, TenantTx};
+use agentos_store::outbox::{self, NewEvent};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -97,8 +146,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use url::Url;
 use uuid::Uuid;
 
-use crate::effects::{BrowserRead, EffectError, Effects, McpCall};
-use crate::gate::{Denied, PolicyGate};
+use crate::effects::{APPROVAL_REQUESTED_EVENT, BrowserRead, EffectError, Effects, McpCall};
+use crate::gate::{APPROVER_ROLE, Denied, PolicyGate};
 use crate::turn::WHOLE_PAGE;
 
 // ---------------------------------------------------------------------------
@@ -999,6 +1048,9 @@ pub mod drafts {
         /// confondue avec `url` — l'une est l'adresse d'une relecture, l'autre
         /// celle d'un article en ligne. `migrations/0102` argumente.
         pub review_url: Option<String>,
+        /// Le motif d'un refus (`state = 'archived'`), recopié de
+        /// `approvals.decision_note` par [`archive`]. `migrations/0115`.
+        pub note: Option<String>,
         pub created_at: DateTime<Utc>,
         pub published_at: Option<DateTime<Utc>>,
     }
@@ -1028,7 +1080,7 @@ pub mod drafts {
             "INSERT INTO content_drafts \
                  (id, tenant_id, question_id, title, body, state, created_at) \
              VALUES ($1, $2, $3, $4, $5, 'draft', $6) \
-             RETURNING id, question_id, title, body, state, url, review_url, created_at, published_at",
+             RETURNING id, question_id, title, body, state, url, review_url, note, created_at, published_at",
         )
         .bind(Uuid::now_v7())
         .bind(tenant.as_uuid())
@@ -1044,7 +1096,7 @@ pub mod drafts {
     /// Tous les brouillons de ce locataire, du plus récent au plus ancien.
     pub async fn list(tx: &mut TenantTx<'_>) -> Result<Vec<Draft>, StoreError> {
         let rows = sqlx::query_as(
-            "SELECT id, question_id, title, body, state, url, review_url, created_at, published_at \
+            "SELECT id, question_id, title, body, state, url, review_url, note, created_at, published_at \
                FROM content_drafts ORDER BY created_at DESC",
         )
         .fetch_all(&mut ***tx)
@@ -1086,7 +1138,7 @@ pub mod drafts {
                         WHEN $4::text IS NULL THEN NULL \
                         ELSE coalesce(published_at, $5) END \
               WHERE id = $1 \
-             RETURNING id, question_id, title, body, state, url, review_url, created_at, published_at",
+             RETURNING id, question_id, title, body, state, url, review_url, note, created_at, published_at",
         )
         .bind(id)
         .bind(revision.title)
@@ -1120,10 +1172,35 @@ pub mod drafts {
             "UPDATE content_drafts \
                 SET state = 'proposed', review_url = $2 \
               WHERE id = $1 AND state = 'draft' \
-             RETURNING id, question_id, title, body, state, url, review_url, created_at, published_at",
+             RETURNING id, question_id, title, body, state, url, review_url, note, created_at, published_at",
         )
         .bind(id)
         .bind(review_url)
+        .fetch_optional(&mut ***tx)
+        .await?;
+        Ok(row)
+    }
+
+    /// **Refuser un brouillon**, avec le motif que le fondateur a écrit.
+    ///
+    /// Ce que `approvals_deny` fait d'un brouillon : ni `draft` — il serait
+    /// reproposé au prochain tour — ni supprimé — le motif est la seule chose
+    /// qu'un siège qui réécrit le même article doit lire. `note` est exigé par
+    /// le CHECK de `0115` ; un refus sans mot est écrit « refusé ».
+    /// `None` : la ligne n'existe pas ou n'est plus un brouillon.
+    pub async fn archive(
+        tx: &mut TenantTx<'_>,
+        id: Uuid,
+        note: Option<&str>,
+    ) -> Result<Option<Draft>, StoreError> {
+        let row = sqlx::query_as(
+            "UPDATE content_drafts \
+                SET state = 'archived', note = $2 \
+              WHERE id = $1 AND state = 'draft' \
+             RETURNING id, question_id, title, body, state, url, review_url, note, created_at, published_at",
+        )
+        .bind(id)
+        .bind(note.filter(|n| !n.trim().is_empty()).unwrap_or("refusé"))
         .fetch_optional(&mut ***tx)
         .await?;
         Ok(row)
@@ -1280,6 +1357,217 @@ pub mod repos {
         .await?;
         Ok(Some(row))
     }
+
+    /// **Réclamer la mesure de la semaine** pour ce dépôt : pose `measured_on`
+    /// si le dépôt porte un `site` et n'a pas été mesuré depuis
+    /// [`super::MEASURE_EVERY`] jours, et rend la ligne. `None` sinon — y
+    /// compris quand un autre réplica vient de la réclamer : l'`UPDATE` est la
+    /// réclamation, la forme de `discovery::claim`.
+    pub async fn claim_measure(
+        tx: &mut TenantTx<'_>,
+        employee_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Repo>, StoreError> {
+        let row = sqlx::query_as(
+            "UPDATE content_repos SET measured_on = $2 \
+              WHERE employee_id = $1 AND site IS NOT NULL \
+                AND (measured_on IS NULL OR measured_on <= $2 - $3::int) \
+             RETURNING employee_id, server, repo, branch, folder, site, created_at",
+        )
+        .bind(employee_id)
+        .bind(now.date_naive())
+        .bind(super::MEASURE_EVERY)
+        .fetch_optional(&mut ***tx)
+        .await?;
+        Ok(row)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// La boucle se ferme, sauf le clic
+// ---------------------------------------------------------------------------
+
+/// La clé, dans le brouillon attaché à une approbation, qui dit « ceci est un
+/// article et pas une lettre » : `approvals.action->'draft'->>'content_draft'`
+/// est l'identifiant de la ligne de `content_drafts`. C'est ce que
+/// `routes::approvals` lit pour choisir l'exécuteur — la forme de la clé
+/// `invoice` d'une facture, et pour la même raison : une fois le tour fini,
+/// rien d'autre ne distingue deux approbations.
+pub const CONTENT_DRAFT_KEY: &str = "content_draft";
+
+/// Tous les combien de jours la boucle remesure les questions d'un locataire.
+/// Une mesure par semaine : la page de résultats d'un moteur bouge en
+/// semaines, pas en heures, et une série hebdomadaire sur un an est cinquante
+/// points lisibles là où une quotidienne en est trois cent soixante-cinq
+/// dont la plupart se répètent.
+pub const MEASURE_EVERY: i32 = 7;
+
+/// Combien de temps le fondateur a pour cliquer. Une lettre expire en 24 h
+/// parce qu'une réponse chaude meurt ; un article n'a pas cette horloge, et
+/// un fondateur qui lit son courrier le lundi ne doit pas trouver une file
+/// d'articles morts.
+const PUBLISH_TTL: chrono::TimeDelta = chrono::TimeDelta::days(7);
+
+/// L'action qu'une approbation de publication hache.
+///
+/// [`Action::McpCall`] sur `<handle>/create-pull-request` : c'est, mot pour
+/// mot, le geste qui engage le client dans [`propose`] — les trois autres
+/// outils écrivent sur une branche que personne ne lit. `handle` est celui du
+/// dépôt du siège quand il y en a un ; sans dépôt, c'est `github`, la clé du
+/// connecteur au catalogue, et le mail dit au fondateur de le brancher.
+///
+/// **Pas une nature de plus dans `ActionKind`**, et c'est décidé plutôt
+/// qu'omis. Une `ContentPublish` aurait dix sites de `match` à sa charge et
+/// aucune règle de politique à elle — la variante sans règle que
+/// `Effects::brief` refuse d'ajouter. Ce qui lie l'approbation à *ce*
+/// brouillon n'est pas le hachage mais la ligne : l'identifiant est dans le
+/// brouillon attaché, et l'exécuteur le lit là et nulle part ailleurs, comme
+/// la lettre d'un `EmailSend` (`routes::approvals::letter`).
+fn publish_action(handle: &Slug) -> Action {
+    Action::McpCall {
+        tool: McpTool::new(
+            handle.clone(),
+            Slug::parse(CREATE_PULL_REQUEST).expect("une constante de ce fichier"),
+        ),
+    }
+}
+
+/// Le handle que [`publish_action`] nomme : celui du dépôt, sinon `github`.
+fn publish_handle(repo: Option<&repos::Repo>) -> Slug {
+    repo.and_then(repos::Repo::handle)
+        .unwrap_or_else(|| Slug::parse("github").expect("une constante de ce fichier"))
+}
+
+/// Ce que [`submit`] a produit : le brouillon rangé, et l'approbation qui
+/// attend le fondateur.
+#[derive(Debug, Clone, Serialize)]
+pub struct Submitted {
+    pub draft: drafts::Draft,
+    pub approval_id: Uuid,
+}
+
+/// **Un siège pose un brouillon, et le fondateur l'apprend.**
+///
+/// Une transaction, trois lignes : le brouillon (`content_drafts`), une
+/// approbation `pending` hachée sur [`publish_action`] avec le texte intégral
+/// attaché, et l'événement [`APPROVAL_REQUESTED_EVENT`] dans l'outbox — le
+/// même que celui d'une lettre retenue, donc le même gestionnaire
+/// (`main::on_approval_requested`) et le même mail
+/// ([`crate::effects::notify_approver`], qui rend [`approval_mail`] quand le
+/// brouillon porte [`CONTENT_DRAFT_KEY`]). Rien de nouveau n'est câblé
+/// entre ici et la boîte du fondateur.
+///
+/// `seat` est le siège qui a écrit et **dont le dépôt sera lu** à
+/// l'approbation ; `requested_by` est l'étiquette de l'appelant, pour la
+/// règle des quatre yeux de `routes::approvals`.
+///
+/// [`APPROVAL_REQUESTED_EVENT`]: crate::effects::APPROVAL_REQUESTED_EVENT
+// Huit arguments, comme `t()` dans `mcp_tools` : une structure pour deux
+// appelants serait un nom de plus pour la même liste.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit(
+    tx: &mut TenantTx<'_>,
+    seat: EmployeeId,
+    seat_slug: &str,
+    requested_by: &str,
+    question_id: Uuid,
+    title: &str,
+    body: &str,
+    now: DateTime<Utc>,
+) -> Result<Submitted, StoreError> {
+    let draft = drafts::create(tx, question_id, title, body).await?;
+    let repo = repos::of(tx, seat.as_uuid()).await?;
+    let question: (String,) =
+        sqlx::query_as("SELECT question FROM content_questions WHERE id = $1")
+            .bind(question_id)
+            .fetch_one(&mut ***tx)
+            .await?;
+
+    let handle = publish_handle(repo.as_ref());
+    let action = publish_action(&handle);
+    let reason =
+        format!("publier « {title} » : une pull request dans le dépôt du siège {seat_slug}");
+    let filed = approvals::create(
+        tx,
+        &NewApproval {
+            employee_id: Some(seat),
+            action: &action,
+            requested_by,
+            required_role: APPROVER_ROLE,
+            reason: Some(&reason),
+            expires_at: now + PUBLISH_TTL,
+        },
+        now,
+    )
+    .await
+    .map_err(|err| match err {
+        ApprovalError::Store(err) => err,
+        other => StoreError::conflict(format!("approval could not be filed: {other}")),
+    })?;
+    let id = filed.id();
+
+    let attached = json!({
+        CONTENT_DRAFT_KEY: draft.id,
+        "question": question.0,
+        "title": title,
+        "body": body,
+        "repo": repo.as_ref().map(|r| r.repo.clone()),
+        // Le handle haché, pour que le mail recopie exactement ce que
+        // `approvals_approve` devra présenter.
+        "server": handle.as_str(),
+    });
+    approvals::attach_draft(tx, id, &attached).await?;
+    let mut event = NewEvent::new("approval", id.as_uuid(), APPROVAL_REQUESTED_EVENT);
+    event.dedupe_key = Some(format!("{APPROVAL_REQUESTED_EVENT}:{}", id.as_uuid()));
+    event.payload = json!({ "employee_id": seat.as_uuid(), "draft": attached });
+    outbox::enqueue(tx, &event, now).await?;
+
+    Ok(Submitted {
+        draft,
+        approval_id: id.as_uuid(),
+    })
+}
+
+/// Le mail au fondateur pour un article : l'objet et le corps.
+///
+/// Le texte **intégral**, les deux gestes tels qu'il les tape, et — quand le
+/// siège n'a pas de dépôt — la phrase qui dit quoi faire d'abord. Rendu par
+/// [`crate::effects::notify_approver`] à la place du gabarit d'une lettre.
+#[must_use]
+pub fn approval_mail(seat_slug: &str, approval: Uuid, draft: &Value) -> (String, String) {
+    let text = |key: &str| draft.get(key).and_then(Value::as_str).unwrap_or("?");
+    let (question, title, body) = (text("question"), text("title"), text("body"));
+    let repo = match draft.get("repo").and_then(Value::as_str) {
+        Some(repo) => format!("Dépôt : {repo}"),
+        None => "Aucun dépôt : `content_repos_set` d'abord, sinon l'approbation reste en \
+                 attente."
+            .to_owned(),
+    };
+    // L'action telle que le fondateur la recopie : le handle est celui que
+    // `submit` a haché, et il est relu ici depuis le même brouillon.
+    let handle = text("server");
+    let subject = format!("[approbation] {seat_slug} a écrit un article : {title}");
+    let body_text = format!(
+        "Le siège {seat_slug} a rédigé un article pour la question « {question} ».\n\
+         Approbation : {approval}\n\
+         Elle expire {ttl} jours après son dépôt.\n\
+         {repo}\n\
+         \n\
+         Titre : {title}\n\
+         \n\
+         {body}\n\
+         \n\
+         --\n\
+         Pour le publier — une pull request dans le dépôt du siège, que vous fusionnez \
+         ensuite — avec votre clé d'approbateur :\n\
+         approvals_approve id=\"{approval}\" \
+         action={{\"action\":\"mcp_call\",\"tool\":{{\"server\":\"{handle}\",\"name\":\"{tool}\"}}}}\n\
+         Pour le refuser, avec le motif que le siège lira :\n\
+         approvals_deny id=\"{approval}\" note=\"…\"\n",
+        ttl = PUBLISH_TTL.num_days(),
+        tool = CREATE_PULL_REQUEST,
+    );
+    (subject, body_text)
 }
 
 // ---------------------------------------------------------------------------
@@ -1548,6 +1836,46 @@ pub async fn propose(
         path,
         review_url,
     })
+}
+
+/// **Approuver, c'est proposer.** Ce que `approvals_approve` fait d'un
+/// brouillon une fois l'approbation dépensée : [`propose`] avec le dépôt du
+/// siège que l'`Effects` porte, puis `state = 'proposed'` et l'adresse de la
+/// relecture. Le même chemin que `content_drafts_propose` appelé à la main —
+/// il n'y en a pas deux.
+///
+/// [`ProposeError::NoRepo`] est rendu **avant** tout appel, et l'appelant
+/// doit l'avoir demandé avant de dépenser l'approbation : une approbation
+/// brûlée pour découvrir qu'il n'y a nulle part où pousser serait la décision
+/// d'un humain dépensée sur une réponse connue d'avance (`routes::approvals`
+/// fait le même contrôle pour un rail de paiement absent).
+pub async fn publish(
+    db: &Db,
+    effects: &Effects,
+    gate: &PolicyGate,
+    draft_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(drafts::Draft, Proposal), ProposeError> {
+    let principal = effects.principal();
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let draft = drafts::list(&mut tx)
+        .await?
+        .into_iter()
+        .find(|row| row.id == draft_id)
+        .ok_or(StoreError::NotFound)?;
+    let repo = repos::of(&mut tx, principal.employee_id.as_uuid()).await?;
+    tx.commit().await?;
+    let repo = repo.ok_or(ProposeError::NoRepo)?;
+
+    let proposal = propose(effects, gate, &repo, &draft, now).await?;
+
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let row = drafts::propose(&mut tx, draft.id, &proposal.review_url).await?;
+    tx.commit().await?;
+    // `None` : la ligne a cessé d'être un brouillon entre la lecture et
+    // maintenant. La pull request est ouverte ; l'état lu est rendu avec.
+    row.map(|row| (row, proposal))
+        .ok_or(ProposeError::NotADraft(draft.state))
 }
 
 /// Ce que la pull request dit d'elle-même, à la personne qui l'ouvre.
@@ -3368,6 +3696,218 @@ mod tests {
 
         drop_tenant(&db, a.tenant_id).await;
         drop_tenant(&db, b.tenant_id).await;
+    }
+
+    // -- la boucle se ferme, sauf le clic -------------------------------------
+
+    /// La ligne d'approbation telle que `routes::approvals` la lit : l'état,
+    /// l'action hachée, le brouillon attaché.
+    async fn approval_row(db: &Db, tenant: TenantId, id: Uuid) -> (String, Value, Value) {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let row = sqlx::query_as(
+            "SELECT state, action->'action', action->'draft' FROM approvals WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&mut **tx)
+        .await
+        .expect("approval row");
+        tx.rollback().await.expect("rollback");
+        row
+    }
+
+    /// Le mail que `main::on_approval_requested` ferait partir pour ce
+    /// brouillon attaché, lu dans la boîte mock.
+    async fn founder_mail(principal: &Principal, approval: Uuid, draft: &Value) -> String {
+        let email = Arc::new(crate::mocks::MockEmailProvider::new());
+        let ports = Ports {
+            email: email.clone(),
+            ..crate::mocks::ports()
+        };
+        let seat = agentos_domain::employee::Employee::new(
+            principal.employee_id,
+            principal.tenant_id,
+            Slug::parse("lena").expect("slug"),
+            Domain::parse("acme.example.com").expect("domain"),
+            Utc::now(),
+        );
+        crate::effects::notify_approver(
+            &ports,
+            "fondateur@acme.example.com",
+            &seat,
+            approval,
+            draft,
+        )
+        .await
+        .expect("notify");
+        let sent = email.sent_emails();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].subject.contains("article"), "{}", sent[0].subject);
+        sent[0].body_text.clone()
+    }
+
+    /// **Un brouillon posé par un siège est une approbation `pending` avec le
+    /// texte intégral, un événement dans l'outbox, et un mail qui porte le
+    /// texte et les deux gestes — et, sans dépôt, la phrase qui dit quoi
+    /// faire d'abord.**
+    #[tokio::test]
+    async fn un_brouillon_pose_par_un_siege_devient_une_approbation_et_un_mail() {
+        let Some(db) = db().await else { return };
+        let (principal, _) = seed(&db).await;
+        let now = Utc::now();
+
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        let question = questions::add(
+            &mut tx,
+            "faut-il un visa pour le Japon",
+            "fr",
+            Source::SearchSuggest,
+            1,
+        )
+        .await
+        .expect("add");
+        let submitted = submit(
+            &mut tx,
+            principal.employee_id,
+            "lena",
+            "employee:lena",
+            question.id,
+            "Faut-il un visa pour le Japon ?",
+            "Non, pour un séjour de moins de 90 jours.\n\nLe détail par passeport…",
+            now,
+        )
+        .await
+        .expect("submit");
+        tx.commit().await.expect("commit");
+        assert_eq!(submitted.draft.state, "draft");
+
+        // Une approbation `pending`, hachée sur `github/create-pull-request`
+        // — aucun dépôt, donc le connecteur — avec le texte attaché.
+        let (state, action, draft) =
+            approval_row(&db, principal.tenant_id, submitted.approval_id).await;
+        assert_eq!(state, "pending");
+        assert_eq!(
+            action,
+            json!({ "action": "mcp_call", "tool": { "server": "github", "name": "create-pull-request" } })
+        );
+        assert_eq!(draft[CONTENT_DRAFT_KEY], json!(submitted.draft.id));
+        assert_eq!(
+            draft["body"],
+            json!("Non, pour un séjour de moins de 90 jours.\n\nLe détail par passeport…")
+        );
+        assert!(draft["repo"].is_null());
+
+        // L'événement qui réveille le gestionnaire du mail, une fois.
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        let events: Vec<(String,)> =
+            sqlx::query_as("SELECT event_type FROM outbox_events WHERE aggregate_id = $1")
+                .bind(submitted.approval_id)
+                .fetch_all(&mut **tx)
+                .await
+                .expect("outbox");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(events, vec![(APPROVAL_REQUESTED_EVENT.to_owned(),)]);
+
+        // Le mail : le texte entier, les deux gestes, et la phrase du dépôt.
+        let mail = founder_mail(&principal, submitted.approval_id, &draft).await;
+        for needle in [
+            "Le détail par passeport…",
+            "Faut-il un visa pour le Japon ?",
+            &format!("approvals_approve id=\"{}\"", submitted.approval_id),
+            r#"action={"action":"mcp_call","tool":{"server":"github","name":"create-pull-request"}}"#,
+            &format!("approvals_deny id=\"{}\"", submitted.approval_id),
+            "Aucun dépôt : `content_repos_set` d'abord",
+        ] {
+            assert!(mail.contains(needle), "{needle:?} absent de :\n{mail}");
+        }
+
+        // Avec un dépôt : le handle du dépôt est haché, et la phrase disparaît.
+        seed_repo(&db, &principal, None).await;
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        let second = submit(
+            &mut tx,
+            principal.employee_id,
+            "lena",
+            "employee:lena",
+            question.id,
+            "Bis",
+            "Corps",
+            now,
+        )
+        .await
+        .expect("submit");
+        tx.commit().await.expect("commit");
+        let (_, action, draft) = approval_row(&db, principal.tenant_id, second.approval_id).await;
+        assert_eq!(action["tool"]["server"], json!(HANDLE));
+        assert_eq!(draft["repo"], json!("acme/site"));
+        let mail = founder_mail(&principal, second.approval_id, &draft).await;
+        assert!(mail.contains("Dépôt : acme/site"), "{mail}");
+        assert!(!mail.contains("Aucun dépôt"), "{mail}");
+
+        drop_tenant(&db, principal.tenant_id).await;
+    }
+
+    /// **Approuver, c'est proposer** : le dépôt du siège, son dossier, sa
+    /// branche — et sans dépôt, rien n'est prononcé et le brouillon reste un
+    /// brouillon.
+    #[tokio::test]
+    async fn approuver_propose_dans_le_depot_du_siege_et_sans_depot_ne_prononce_rien() {
+        let Some(db) = db().await else { return };
+        let (principal, _) = seed(&db).await;
+        install_tool_policy(
+            &db,
+            principal.tenant_id,
+            &[
+                GET_FILE_CONTENTS,
+                CREATE_BRANCH,
+                CREATE_OR_UPDATE_FILE,
+                CREATE_PULL_REQUEST,
+            ],
+        )
+        .await;
+        let github = FauxGithub::new("https://github.com/acme/site/pull/9");
+        let effects = Effects::new(db.clone(), ports_calling(github.clone()), principal.clone());
+        let gate = PolicyGate::new(db.clone());
+
+        let draft = seed_draft(&db, &principal, "Faut-il un visa pour le Japon").await;
+        let refused = publish(&db, &effects, &gate, draft.id, Utc::now()).await;
+        assert!(matches!(refused, Err(ProposeError::NoRepo)), "{refused:?}");
+        assert!(github.tools().is_empty(), "no repo, nothing pronounced");
+
+        seed_repo(&db, &principal, None).await;
+        let (row, proposal) = publish(&db, &effects, &gate, draft.id, Utc::now())
+            .await
+            .expect("published");
+        assert_eq!(
+            github.args(2)["path"],
+            json!("content/blog/faut-il-un-visa-pour-le-japon.md")
+        );
+        assert_eq!(github.args(3)["base"], json!("main"));
+        assert_eq!(row.state, "proposed");
+        assert_eq!(
+            row.review_url.as_deref(),
+            Some("https://github.com/acme/site/pull/9")
+        );
+        assert_eq!(proposal.review_url, "https://github.com/acme/site/pull/9");
+
+        // Refuser : archivé avec le motif, et un brouillon proposé ne se
+        // refuse plus.
+        let other = seed_draft(&db, &principal, "Un autre").await;
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        let archived = drafts::archive(&mut tx, other.id, Some("trop court"))
+            .await
+            .expect("archive");
+        let already = drafts::archive(&mut tx, draft.id, None)
+            .await
+            .expect("archive");
+        tx.commit().await.expect("commit");
+        let archived = archived.expect("archived");
+        assert_eq!(
+            (archived.state.as_str(), archived.note.as_deref()),
+            ("archived", Some("trop court"))
+        );
+        assert!(already.is_none(), "a proposed draft is not a draft");
+
+        drop_tenant(&db, principal.tenant_id).await;
     }
 
     async fn drop_tenant(db: &Db, tenant: TenantId) {

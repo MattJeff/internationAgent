@@ -360,9 +360,9 @@ struct DiscoverBody {
     /// que le tour, pour que la chose sur laquelle la Gate statue et la chose
     /// chargée ne puissent pas être deux endroits.
     url: String,
-    /// L'un des huit de `GET /v1/prospects/segments`. **Le seul jugement que
+    /// L'un des neuf de `GET /v1/prospects/segments`. **Le seul jugement que
     /// l'appelant porte**, et la page ne le porte pas : `accounts_segment` est
-    /// une CHECK, donc une neuvième orthographe serait une écriture qui échoue
+    /// une CHECK, donc une dixième orthographe serait une écriture qui échoue
     /// après qu'une page a été chargée.
     segment: String,
 }

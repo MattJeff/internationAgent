@@ -510,6 +510,62 @@ inatteignable d'ici — aucun de ses noms n'est prononçable, et un
 `/mcp/messagerie` branché sous le handle `social` rend `404 no_social_binding`
 parce qu'il ne sert aucun des cinq.
 
+## Un post LinkedIn tiré d'un article : proposé, relu, publié sur un clic
+
+Écrit le 2026-09-22 (`crates/app/src/social_post.rs`). Le siège growth rédige
+et ne poste pas — c'est son pack, et ça ne change pas. Ce qui existe en plus :
+quand un article du client passe à `published` (`content_drafts.url`
+constatée), l'événement outbox **`content.published`** (`aggregate_id` =
+l'`id` du brouillon ; émis par la boucle contenu, lu par
+`main::on_content_published`) fait proposer au siège growth du locataire
+(`employee_charters.role = 'growth'`) **un post LinkedIn tiré de l'article** :
+titre, premier paragraphe, adresse. Pas de modèle : le texte est tiré, pas
+rédigé — le jour où la voix du pack manque, c'est un tour du siège qui écrit et
+`social_post::propose` qui pose, l'aval ne bouge pas.
+
+**Vérifié avant qu'une approbation existe** : ≤ 1 300 caractères, aucun prix
+(`€`, `$`, `£`, `49 EUR`…), aucun lien raccourci (`bit.ly`, `lnkd.in`, `t.co`…).
+Un post qui tombe n'arrive jamais dans la boîte du fondateur.
+
+**Puis le circuit des lettres, tel quel** : une approbation de nature
+`Action::McpCall` sur `social/post-publish` — la nature qu'un siège a déjà pour
+publier (§ « Et l'employé, lui ? ») — avec le texte attaché sur la ligne
+(`action->'draft'`, `platform: "linkedin"`), l'événement `approval.requested`,
+le mail au fondateur (`AGENTOS_APPROVAL_NOTIFY`) qui porte le texte intégral et
+les deux gestes :
+
+```
+approvals_approve id="<id>" action={"action":"mcp_call","tool":{"server":"social","name":"post-publish"}}
+approvals_deny    id="<id>" note="<motif>"
+```
+
+`social_post_preview_get` (avec l'`account_id` de `social_accounts_list` et ce
+texte) le rend tel qu'il paraîtra. **Approuver** cherche le compte LinkedIn
+connecté **avant** de dépenser le clic, puis publie via l'outil
+`post-publish` du service, sur ce compte, avec `idempotency_key =
+approval:<id>` ; `social_posts_list` le montre ensuite. **Sans compte connecté**
+: `501 no_social_account`, l'approbation reste `pending`, et la réponse comme
+le mail disent le geste — `social_connect_url_get platform="linkedin"`, ouvrir
+l'URL, revenir approuver. Sans agrégateur branché ou sans outil déclaré, c'est
+le mot de `/v1/social` (`404 no_social_binding`, `403 tool_not_declared`), et
+rien n'est dépensé non plus. **Refuser** archive le post : la ligne `denied`
+avec `decision_note` est l'archive, il n'y a pas de seconde table.
+
+**Un seul réseau, et pourquoi rien ne part quand le compte se connecte.**
+LinkedIn seul, parce que c'est là que sont les acheteurs — voyagistes,
+assureurs, TMC ; X, Instagram, TikTok et YouTube ne sont pas prononcés par
+cette brique. Et un compte connecté après coup ne libère rien : l'approbation
+attend toujours le clic, parce qu'un post posté sans relecture est un post
+signé de l'entreprise, et que celui qui connecte le compte n'a pas relu ce qui
+a été proposé pendant qu'il n'en avait pas.
+
+**Le geste du fondateur pour connecter LinkedIn**, dans l'ordre : les étapes 1
+à 4 du tableau ci-dessus si l'agrégateur n'est pas branché (`accounts-list`
+et `post-publish` déclarés, le second en `write`), puis
+`social_connect_url_get platform="linkedin"`, ouvrir l'URL rendue, autoriser ;
+`social_accounts_list` montre alors le compte `connected`, et le clic
+`approvals_approve` du mail publie.
+
 ## L'entrée au catalogue — plus tard, et pourquoi
 
 **Ce que le rattachement n'a pas changé** : le service n'a toujours pas d'entrée

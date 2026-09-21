@@ -186,7 +186,7 @@ pub const NO_POLICY: &str = "broken_policy";
 /// What [`Effects::discover_prospects`] answers when the segment it was handed
 /// is not one `accounts_segment` permits.
 ///
-/// A closed set, checked twice: `Turn::propose` names the eight to the model
+/// A closed set, checked twice: `Turn::propose` names the nine to the model
 /// before the gate is troubled, and this is the same refusal at the write.
 pub const BAD_SEGMENT: &str = "unknown_segment";
 
@@ -1432,6 +1432,13 @@ impl Effects {
         &self.principal
     }
 
+    /// Le port MCP derrière cette façade — pour une **lecture** qui précède un
+    /// jeton (« y a-t-il un compte connecté ? » avant de dépenser un clic,
+    /// `social_post::approve`). Une écriture passe par [`Self::call_tool`].
+    pub fn mcp(&self) -> &dyn McpCaller {
+        self.ports.mcp.as_ref()
+    }
+
     /// Put the letter a seat wants to send on the approval row the gate just
     /// filed for it.
     ///
@@ -1487,6 +1494,60 @@ impl Effects {
             );
         }
         attached == Some(true)
+    }
+
+    /// **Ranger un article, et le mettre devant le fondateur.**
+    ///
+    /// Le verbe `file_draft` d'un tour. Pas un effet au sens de la Gate — rien
+    /// ne sort de chez nous — et pas de jeton, pour la raison de
+    /// [`Self::post_work`] : ce qui est écrit est une ligne de ce locataire et
+    /// une approbation `pending`, et c'est l'approbation qui sera jugée. La
+    /// question est ajoutée si elle n'existe pas (`content::questions::add`
+    /// est idempotent sur le couple question/locale), en provenance
+    /// `search_suggest` : c'est ce qu'un siège growth a relevé, pas ce qu'un
+    /// client a demandé. Voir `content`, « La boucle se ferme, sauf le clic ».
+    pub async fn file_content_draft(
+        &self,
+        question: &str,
+        locale: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<crate::content::Submitted, EffectError> {
+        let now = Utc::now();
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+        // Le slug du siège, pour le mail. Borné au locataire par la RLS.
+        let seat: String = sqlx::query_scalar("SELECT slug FROM employees WHERE id = $1")
+            .bind(self.principal.employee_id.as_uuid())
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|err| EffectError::Unavailable(StoreError::from(err)))?;
+        let question = crate::content::questions::add(
+            &mut tx,
+            question,
+            locale,
+            crate::content::Source::SearchSuggest,
+            1,
+        )
+        .await
+        .map_err(EffectError::Unavailable)?;
+        let submitted = crate::content::submit(
+            &mut tx,
+            self.principal.employee_id,
+            seat.as_str(),
+            &self.principal.actor.label(),
+            question.id,
+            title,
+            body,
+            now,
+        )
+        .await
+        .map_err(EffectError::Unavailable)?;
+        tx.commit().await.map_err(EffectError::Unavailable)?;
+        Ok(submitted)
     }
 
     /// Send the rendered email to the address on the token.
@@ -4527,12 +4588,17 @@ pub async fn notify_approver(
     let text = |key: &str| draft.get(key).and_then(Value::as_str).unwrap_or("?");
     let (to, subject, body) = (text("to"), text("subject"), text("body"));
     let slug = seat.slug();
-    let email = OutboundEmail {
-        from: seat.address().to_string(),
-        to: vec![notify.to_owned()],
-        subject: format!("[approbation] {slug} veut écrire à {to} : {subject}"),
-        body_text: format!(
-            "Le siège {slug} a rédigé un e-mail que la politique retient pour relecture.\n\
+    // Un article, un post LinkedIn, ou une lettre : le même mail, le même
+    // événement, les deux mêmes gestes — seuls l'objet et le corps changent.
+    let (subject, body_text) = if draft.get(crate::content::CONTENT_DRAFT_KEY).is_some() {
+        crate::content::approval_mail(slug.as_str(), approval, draft)
+    } else if let Some(post) = crate::social_post::letter(slug, approval, draft) {
+        post
+    } else {
+        (
+            format!("[approbation] {slug} veut écrire à {to} : {subject}"),
+            format!(
+                "Le siège {slug} a rédigé un e-mail que la politique retient pour relecture.\n\
              Approbation : {approval}\n\
              Elle expire 24 h après son dépôt ; passé ce délai, seule approvals_deny la \
              retire de la file.\n\
@@ -4549,7 +4615,14 @@ pub async fn notify_approver(
              action={{\"action\":\"email_send\",\"to\":\"{to}\"}}\n\
              Pour le refuser :\n\
              approvals_deny id=\"{approval}\"\n"
-        ),
+            ),
+        )
+    };
+    let email = OutboundEmail {
+        from: seat.address().to_string(),
+        to: vec![notify.to_owned()],
+        subject,
+        body_text,
         in_reply_to: None,
         unsubscribe_token: None,
         attachments: Vec::new(),

@@ -114,13 +114,13 @@ use serde_json::{Map, Value, json};
 /// working day it was requested in is a standing authorisation nobody
 /// remembers granting. Make it configurable the day an operator asks, not
 /// before.
-const APPROVAL_TTL: TimeDelta = TimeDelta::hours(24);
+pub const APPROVAL_TTL: TimeDelta = TimeDelta::hours(24);
 
 /// The role a human must hold to redeem an approval this gate files.
 ///
 /// Stored on the approval for the approval UI to enforce; this crate has no
 /// notion of who is clicking. ponytail: constant until roles exist.
-const APPROVER_ROLE: &str = "approver";
+pub const APPROVER_ROLE: &str = "approver";
 
 /// Audit payload key holding the counterparty an action addresses. Read back
 /// by [`PolicyGate::contacts`] to derive the cold-outreach budget, so the two
@@ -3413,12 +3413,16 @@ mod tests {
             },
         )
         .await;
+        // A domain of this tenant's own: `tenant_domains.domain` is unique across
+        // the database, so a literal would collide on the second run.
+        let dom = format!("getorizn-{}.test", principal.tenant_id.as_uuid().simple());
         let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
         sqlx::query(
             "INSERT INTO tenant_domains (tenant_id, domain, provider, status, is_primary) \
-             VALUES ($1, 'agents.getorizn.test', 'mock-email', 'verified', true)",
+             VALUES ($1, $2, 'mock-email', 'verified', true)",
         )
         .bind(principal.tenant_id.as_uuid())
+        .bind(format!("agents.{dom}"))
         .execute(&mut **tx)
         .await
         .expect("a sending domain");
@@ -3435,14 +3439,23 @@ mod tests {
         assert_eq!(err.code(), DenyReason::ContactBudgetExhausted.code());
 
         // Our own people still get through: the seat's domain and its parent.
-        for ours in ["sdr@agents.getorizn.test", "Mathis@GetOrizn.test"] {
-            gate.authorize(&principal, email(ours))
+        for ours in [
+            format!("sdr@agents.{dom}"),
+            format!("Mathis@{}", dom.to_uppercase()),
+        ] {
+            gate.authorize(&principal, email(&ours))
                 .await
                 .unwrap_or_else(|e| panic!("{ours} is one of us, not a stranger: {e}"));
         }
         // But not a neighbour two levels up.
         let err = gate
-            .authorize(&principal, email("x@orizn.test"))
+            .authorize(
+                &principal,
+                email(&format!(
+                    "x@orizn-{}.test",
+                    principal.tenant_id.as_uuid().simple()
+                )),
+            )
             .await
             .expect_err("a sibling domain is still a stranger");
         assert_eq!(err.code(), DenyReason::ContactBudgetExhausted.code());

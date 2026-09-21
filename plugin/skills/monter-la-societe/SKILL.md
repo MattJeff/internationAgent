@@ -204,9 +204,9 @@ Trois choses qu'on se prend une fois :
   `escalate_to`; `growth` veut `topic`, `market`, `measure`; `finance` veut `period`,
   `currency`, `obligations`.
 
-**Le piège des deux `segment`.** L'objectif `sales-development` en admet **cinq** — `airline`,
-`ota`, `corporate_travel`, `insurer`, `cruise_line` — et **ce n'est pas la liste de
-`prospects_segments_list`**, qui en admet huit, épelle la croisière `cruise` et connaît `tmc`,
+**Le piège des deux `segment`.** L'objectif `sales-development` en admet **six** — `airline`,
+`ota`, `corporate_travel`, `insurer`, `cruise_line`, `partner` — et **ce n'est pas la liste de
+`prospects_segments_list`**, qui en admet neuf, épelle la croisière `cruise` et connaît `tmc`,
 `relocation` et `other`. Prendre une valeur de l'une pour l'autre est un 400 `objective_field`.
 Deux listes, deux questions, jamais la même réponse recopiée.
 

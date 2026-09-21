@@ -713,7 +713,7 @@ database credential because `app_role` may not write `prospect_flows` — and th
 seller probes it twice, files a finding, and has its approach refused by
 `max_new_contacts_per_day`, which this deployment ships at `0`.
 
-> ### $453–$481 a month over 3 measured runs at 66 reserved turns a day (3 on claude-sonnet-5, 1 on claude-opus-5); $57 floor at 1.00 model calls per turn, $639 ceiling at 10.00
+> ### $473–$512 a month over 3 measured runs at 66 reserved turns a day (3 on claude-sonnet-5, 1 on claude-opus-5); $61 floor at 1.00 model calls per turn, $622 ceiling at 10.00
 >
 > **Re-measured 2026-09-05, and it went up more than fourfold.** Between the two
 > measurements the company gained `issue_invoice` and `send_invoice` in the

@@ -176,6 +176,7 @@ use agentos_app::effects::{
 use agentos_app::gate::{PolicyGate, Principal as GatePrincipal};
 use agentos_app::mocks::ProviderMessageId;
 use agentos_app::signature;
+use agentos_app::social_post;
 use agentos_domain::action::{Action, ActionKind, EmailAddress};
 use agentos_domain::ids::{ApprovalId, EmployeeId, InvoiceId};
 use agentos_domain::policy::DenyReason;
@@ -649,12 +650,13 @@ async fn approve(
     };
     let approval_id = ApprovalId::from_uuid(id);
 
-    // **Three arms with an executor now**: the payment, the signature, and the
-    // letter. Everything else is still minted, reported and dropped — there is
-    // nothing on the far side of those tokens to hand them to.
+    // **Four arms with an executor now**: the payment, the signature, the
+    // letter, and the LinkedIn post. Everything else is still minted, reported
+    // and dropped — there is nothing on the far side of those tokens to hand
+    // them to.
     //
     // The match is before the redemption and each arm redeems exactly once,
-    // which is the property this whole function rests on and which a fourth arm
+    // which is the property this whole function rests on and which a fifth arm
     // must keep.
     let Action::PaymentCreate { amount, payee } = body.action else {
         if let Action::ContractSign { title } = body.action {
@@ -662,6 +664,30 @@ async fn approve(
         }
         if let Action::EmailSend { to } = body.action {
             return letter(&state, &gate_principal, approval_id, &row, to, id).await;
+        }
+        // Un `McpCall` sur `social/post-publish` dont la ligne porte un post :
+        // le texte publié est celui de la ligne, jamais celui de la requête —
+        // l'argument de `letter`, mot pour mot.
+        if let Action::McpCall { tool } = &body.action
+            && *tool == social_post::tool()
+            && let Some(post) = row.draft.as_ref().and_then(social_post::post_draft)
+        {
+            return publish_post(&state, &gate_principal, approval_id, &row, &post, id).await;
+        }
+        // The fourth executor, chosen by the row and not by the variant: an
+        // article is an `McpCall` on `create-pull-request`, and only the
+        // attached draft says it is an article. `content::CONTENT_DRAFT_KEY`.
+        if let Some(draft) = content_draft_of(&row) {
+            return publish(
+                &state,
+                &gate_principal,
+                approval_id,
+                &row,
+                body.action,
+                draft,
+                id,
+            )
+            .await;
         }
         let authorized = state
             .gate
@@ -1110,6 +1136,174 @@ async fn sign(
     }
 }
 
+/// [`NO_SIGNATURE_CONNECTOR`] pour un post : aucun compte LinkedIn connecté.
+/// L'approbation reste `pending`, la réponse porte le geste, et le même clic
+/// publie le jour où le compte est là — après relecture, jamais tout seul.
+const NO_SOCIAL_ACCOUNT: &str = "no_social_account";
+
+/// [`ENVELOPE_NOT_SENT`] pour un post : l'approbation est dépensée et le
+/// service n'a pas publié.
+const POST_NOT_PUBLISHED: &str = "post_not_published";
+
+/// Publish the LinkedIn post the approver just read, and nothing else.
+///
+/// `agentos_app::social_post::approve` porte l'ordre — le compte avant le
+/// rachat, la publication après — et cette route ne fait que traduire ses
+/// refus en HTTP, avec le `Fleet` de **ce** locataire comme port MCP,
+/// exactement comme [`sign`].
+async fn publish_post(
+    state: &Approvals,
+    gate_principal: &GatePrincipal,
+    approval_id: ApprovalId,
+    row: &Decidable,
+    post: &social_post::PostDraft,
+    id: Uuid,
+) -> Result<Json<Value>, ApiError> {
+    let mcp: Arc<dyn McpCaller> = state.fleets.for_tenant(gate_principal.tenant_id);
+    let ports = Arc::new(Ports {
+        mcp,
+        ..(*state.ports).clone()
+    });
+    let effects = Effects::new(state.db.clone(), ports, gate_principal.clone());
+    match social_post::approve(
+        &state.gate,
+        &effects,
+        gate_principal,
+        approval_id,
+        &row.nonce,
+        post,
+    )
+    .await
+    {
+        Ok(published) => Ok(Json(json!({
+            "id": id.to_string(),
+            "state": "redeemed",
+            "decision_id": published.decision_id.to_string(),
+            "post": published.post.into_inner_for_rendering(),
+        }))),
+        Err(social_post::ApproveError::NoAccount) => {
+            tracing::warn!(
+                approval_id = %id,
+                "an approved post was refused: this company has no LinkedIn account connected"
+            );
+            Err(ApiError::new(
+                StatusCode::NOT_IMPLEMENTED,
+                NO_SOCIAL_ACCOUNT,
+                "this company has no LinkedIn account connected, so this post cannot be published",
+            )
+            .with_detail(social_post::CONNECT_HINT)
+            .with_extension("state", json!("pending")))
+        }
+        // Le mot de `/v1/social` — pas branché, pas déclaré, en panne — et
+        // rien n'est dépensé.
+        Err(social_post::ApproveError::Unreachable(err)) => {
+            Err(super::social::refus(err).with_extension("state", json!("pending")))
+        }
+        Err(social_post::ApproveError::Denied(denied)) => Err(denied.into()),
+        Err(social_post::ApproveError::NotPublished {
+            decision_id,
+            reason,
+        }) => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            POST_NOT_PUBLISHED,
+            "the approval was redeemed and the social service did not publish the post",
+        )
+        .with_extension("state", json!("redeemed"))
+        .with_extension("decision_id", json!(decision_id.to_string()))
+        .with_extension("detail", json!(reason))),
+    }
+}
+/// What an approved article reports when the seat has no repository.
+///
+/// [`NO_SIGNATURE_CONNECTOR`]'s sibling, from the same argument: nothing was
+/// attempted, the approval stays `pending`, and the same button works the day
+/// `content_repos_set` has been called. `501`, for the reading HTTP already has.
+const NO_REPO: &str = "no_repo";
+
+/// The approval is spent and the pull request is not open.
+///
+/// [`ENVELOPE_NOT_SENT`]'s sibling. `content::propose` argues what is left
+/// behind when GitHub fails between the second and the fourth call.
+const NOT_PROPOSED: &str = "not_proposed";
+
+/// The `content_drafts` row an approval was filed for, read off the attached
+/// draft — the one place it lives. `None` for a letter, a payment, a contract.
+fn content_draft_of(row: &Decidable) -> Option<Uuid> {
+    row.draft
+        .as_ref()?
+        .get(agentos_app::content::CONTENT_DRAFT_KEY)?
+        .as_str()?
+        .parse()
+        .ok()
+}
+
+/// **Publish the article the approver just read** — `content::publish`,
+/// which is `content_drafts_propose` by another door.
+///
+/// [`sign`]'s order: ask whether there is anywhere to push, redeem, push. The
+/// first step writes nothing, so a seat with no repository leaves the
+/// approval `pending` and the founder with one sentence to act on. A failure
+/// after the redemption is a `502` carrying `state: "redeemed"`, for
+/// [`approve`]'s reason — two facts that disagree, both true.
+async fn publish(
+    state: &Approvals,
+    gate_principal: &GatePrincipal,
+    approval_id: ApprovalId,
+    row: &Decidable,
+    action: Action,
+    draft: Uuid,
+    id: Uuid,
+) -> Result<Json<Value>, ApiError> {
+    let mut tx = state.db.tenant_tx(gate_principal.tenant_id).await?;
+    let repo =
+        agentos_app::content::repos::of(&mut tx, gate_principal.employee_id.as_uuid()).await?;
+    tx.commit().await?;
+    if repo.is_none() {
+        tracing::warn!(
+            approval_id = %id,
+            "an approved article was refused: this seat has no repository"
+        );
+        return Err(ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            NO_REPO,
+            "this seat has no repository, so there is nowhere to push the article",
+        )
+        .with_detail("aucun dépôt : `content_repos_set` d'abord, puis approuver de nouveau.")
+        .with_extension("state", json!("pending")));
+    }
+
+    let authorized = state
+        .gate
+        .redeem_approval(gate_principal, approval_id, &row.nonce, action)
+        .await?;
+    let decision_id = authorized.decision_id().as_uuid().to_string();
+
+    // This tenant's GitHub, as `routes::content::propose_draft` binds it.
+    let mcp: Arc<dyn McpCaller> = state.fleets.for_tenant(gate_principal.tenant_id);
+    let ports = Arc::new(Ports {
+        mcp,
+        ..(*state.ports).clone()
+    });
+    let effects = Effects::new(state.db.clone(), ports, gate_principal.clone());
+    match agentos_app::content::publish(&state.db, &effects, &state.gate, draft, Utc::now()).await {
+        Ok((row, proposal)) => Ok(Json(json!({
+            "id": id.to_string(),
+            "state": "redeemed",
+            "decision_id": decision_id,
+            "draft": row,
+            "proposal": proposal,
+        }))),
+        Err(err) => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            NOT_PROPOSED,
+            "the approval was redeemed and the pull request was not opened",
+        )
+        .with_extension("state", json!("redeemed"))
+        .with_extension("decision_id", json!(decision_id))
+        .with_extension("propose_error", json!(err.code()))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // deny
 // ---------------------------------------------------------------------------
@@ -1158,6 +1352,14 @@ async fn deny(
             "approval_already_decided",
             "this approval has already been decided",
         ));
+    }
+
+    // An article refused is archived with the reason, in the same
+    // transaction, so the seat that wrote it reads why before the next one.
+    // `None` here — already proposed, or gone — changes nothing: the refusal
+    // stands on the approval either way.
+    if let Some(draft) = content_draft_of(&row) {
+        agentos_app::content::drafts::archive(&mut tx, draft, body.note.as_deref()).await?;
     }
 
     // Same transaction as the UPDATE: a refusal nobody recorded is a refusal
@@ -2159,6 +2361,92 @@ mod tests {
         assert_eq!(state_of(&db, tenant, id).await, "pending");
     }
 
+    // -- the LinkedIn post -------------------------------------------------
+
+    /// **Un post proposé par le siège growth : la file le montre, refuser
+    /// l'archive avec le motif, et approuver sans agrégateur ne dépense rien.**
+    ///
+    /// La flotte est vide, donc le clic tombe sur le mot de `/v1/social` —
+    /// `404 no_social_binding`, qui dit quoi brancher — et la ligne reste
+    /// `pending` : le même clic publie le jour où le compte est là. Le chemin
+    /// avec un compte connecté et celui sans compte sont éprouvés dans
+    /// `agentos_app::social_post`, où l'agrégateur se remplace par un faux.
+    #[tokio::test]
+    async fn a_post_is_shown_refused_with_a_note_and_never_spent_without_an_aggregator() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db).await;
+        let text = "Vérifier un visa par API\n\nCe que répond un moteur aujourd'hui.";
+
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let first = social_post::propose(&mut tx, employee, "lena", text, None, now)
+            .await
+            .expect("proposed");
+        let second = social_post::propose(&mut tx, employee, "lena", text, None, now)
+            .await
+            .expect("proposed twice by hand");
+        tx.commit().await.expect("commit");
+
+        let gate = PolicyGate::new(db.clone());
+        let app = mount(&db, &gate, keys(tenant, "approver", SECRET));
+
+        // La file rend le texte que le fondateur relit.
+        let (status, queue) = call(&app, "/v1/approvals", SECRET, None).await;
+        assert_eq!(status, StatusCode::OK, "{queue}");
+        let shown = queue["approvals"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .find(|row| row["id"] == json!(first.as_uuid().to_string()))
+            .expect("the post is in the queue");
+        assert_eq!(shown["draft"]["text"], json!(text), "{queue}");
+        assert_eq!(shown["draft"]["platform"], json!("linkedin"), "{queue}");
+
+        // Approuver sans agrégateur : le mot de `/v1/social`, rien de dépensé.
+        let uri = format!("/v1/approvals/{}/approve", first.as_uuid());
+        let (status, answer) = call(
+            &app,
+            &uri,
+            SECRET,
+            Some(json!({ "action": social_post::action() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+        assert_eq!(answer["code"], json!("no_social_binding"), "{answer}");
+        assert_eq!(answer["state"], json!("pending"), "{answer}");
+        assert_eq!(state_of(&db, tenant, first).await, "pending");
+
+        // Refuser archive le post avec le motif.
+        let uri = format!("/v1/approvals/{}/deny", second.as_uuid());
+        let (status, answer) = call(
+            &app,
+            &uri,
+            SECRET,
+            Some(json!({ "note": "trop tôt : l'article n'est pas encore indexé" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let (state, note, draft): (String, Option<String>, Value) = sqlx::query_as(
+            "SELECT state, decision_note, action->'draft' FROM approvals WHERE id = $1",
+        )
+        .bind(second.as_uuid())
+        .fetch_one(&mut **tx)
+        .await
+        .expect("the row");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(state, "denied");
+        assert_eq!(
+            note.as_deref(),
+            Some("trop tôt : l'article n'est pas encore indexé")
+        );
+        assert_eq!(
+            draft["text"],
+            json!(text),
+            "le post archivé garde son texte"
+        );
+    }
+
     // -- the letter --------------------------------------------------------
 
     /// **What a founder actually reads, and what leaves when they say yes.**
@@ -2356,6 +2644,119 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(answer["code"], json!("approval_already_decided"));
         assert_eq!(state_of(&db, tenant, id).await, "denied");
+    }
+
+    // -- un article ----------------------------------------------------------
+
+    /// Un brouillon posé par le siège, tel que `content::submit` le pose :
+    /// l'approbation, le texte attaché, et l'action à recopier.
+    async fn filed_article(
+        db: &Db,
+        tenant: TenantId,
+        employee: EmployeeId,
+    ) -> (ApprovalId, Uuid, Value) {
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let question = agentos_app::content::questions::add(
+            &mut tx,
+            "faut-il un visa pour le Japon",
+            "fr",
+            agentos_app::content::Source::SearchSuggest,
+            1,
+        )
+        .await
+        .expect("question");
+        let submitted = agentos_app::content::submit(
+            &mut tx,
+            employee,
+            "lena",
+            "employee:lena",
+            question.id,
+            "Faut-il un visa pour le Japon ?",
+            "Non, sous 90 jours.",
+            now,
+        )
+        .await
+        .expect("submit");
+        let (action,): (Value,) =
+            sqlx::query_as("SELECT action->'action' FROM approvals WHERE id = $1")
+                .bind(submitted.approval_id)
+                .fetch_one(&mut **tx)
+                .await
+                .expect("action");
+        tx.commit().await.expect("commit");
+        (
+            ApprovalId::from_uuid(submitted.approval_id),
+            submitted.draft.id,
+            action,
+        )
+    }
+
+    async fn draft_state(db: &Db, tenant: TenantId, draft: Uuid) -> (String, Option<String>) {
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let row = sqlx::query_as("SELECT state, note FROM content_drafts WHERE id = $1")
+            .bind(draft)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("draft");
+        tx.commit().await.expect("commit");
+        row
+    }
+
+    /// **Sans dépôt, approuver un article laisse l'approbation `pending` et
+    /// dit quoi faire d'abord ; refuser l'archive avec le motif.**
+    ///
+    /// Le chemin avec dépôt — quatre outils prononcés sur le GitHub du
+    /// locataire — est éprouvé dans `agentos_app::content` contre son faux
+    /// GitHub, parce qu'une `Fleet` ne se remplace pas par un double ici ;
+    /// `publish` y est la même fonction que cette route appelle.
+    #[tokio::test]
+    async fn approving_an_article_without_a_repo_stays_pending_and_denying_archives_it() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db).await;
+        let gate = PolicyGate::new(db.clone());
+        let app = mount(&db, &gate, keys(tenant, "approver", SECRET));
+
+        let (id, draft, action) = filed_article(&db, tenant, employee).await;
+        let (status, queue) = call(&app, "/v1/approvals", SECRET, None).await;
+        assert_eq!(status, StatusCode::OK, "{queue}");
+        assert_eq!(
+            queue["approvals"][0]["draft"]["body"],
+            json!("Non, sous 90 jours."),
+            "the queue shows the article: {queue}"
+        );
+
+        let uri = format!("/v1/approvals/{}/approve", id.as_uuid());
+        let (status, answer) = call(&app, &uri, SECRET, Some(json!({ "action": &action }))).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{answer}");
+        assert_eq!(answer["code"], json!("no_repo"), "{answer}");
+        assert_eq!(answer["state"], json!("pending"), "{answer}");
+        assert!(
+            answer["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("content_repos_set")),
+            "{answer}"
+        );
+        assert_eq!(state_of(&db, tenant, id).await, "pending");
+        assert_eq!(draft_state(&db, tenant, draft).await.0, "draft");
+
+        let uri = format!("/v1/approvals/{}/deny", id.as_uuid());
+        let (status, answer) = call(
+            &app,
+            &uri,
+            SECRET,
+            Some(json!({ "note": "trop court pour être cité" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(state_of(&db, tenant, id).await, "denied");
+        assert_eq!(
+            draft_state(&db, tenant, draft).await,
+            (
+                "archived".to_owned(),
+                Some("trop court pour être cité".to_owned())
+            )
+        );
     }
 
     // -- capability requests -----------------------------------------------

@@ -1930,14 +1930,17 @@ impl Growth {
                     "Draft the work on {topic} in full — the page, the brief or the campaign \
                      copy, not an outline. Every claim about the product comes from the \
                      documentation; a claim you cannot source is written down as a question \
-                     instead."
+                     instead. A page goes through `file_draft`, whole, against the question \
+                     it answers — never pasted into a message, where it lands nowhere."
                 ),
             ),
             Task::new(
                 Stage::Handoff,
-                "Hand the draft to a human to publish, with what it is for, who it is aimed at, \
-                 and what you expect it to do. You publish nothing, post nothing, buy no \
-                 advertising and send no campaign yourself.",
+                "The handover of a page is `file_draft`: it puts the whole text in front of \
+                 the founder, who publishes it or refuses it with a reason you will read next \
+                 time. Say in a message what it is for, who it is aimed at, and what you \
+                 expect it to do — but the text itself goes through `file_draft`. You publish \
+                 nothing, post nothing, buy no advertising and send no campaign yourself.",
             ),
             Task::new(
                 Stage::Measure,
@@ -3085,6 +3088,7 @@ mod tests {
                     "brief_direct_reports",
                     "add_work_item",
                     "update_work_item",
+                    "file_draft",
                     "promise_an_hour",
                 ],
                 &[
@@ -3097,6 +3101,7 @@ mod tests {
                     "brief_direct_reports",
                     "add_work_item",
                     "update_work_item",
+                    "file_draft",
                     "promise_an_hour",
                 ],
             ),
@@ -3113,6 +3118,7 @@ mod tests {
                     "brief_direct_reports",
                     "add_work_item",
                     "update_work_item",
+                    "file_draft",
                     "promise_an_hour",
                 ],
                 &[
@@ -3125,6 +3131,7 @@ mod tests {
                     "brief_direct_reports",
                     "add_work_item",
                     "update_work_item",
+                    "file_draft",
                     "promise_an_hour",
                 ],
             ),
@@ -3142,6 +3149,7 @@ mod tests {
                     "brief_direct_reports",
                     "add_work_item",
                     "update_work_item",
+                    "file_draft",
                     "promise_an_hour",
                 ],
                 &[
@@ -3154,6 +3162,7 @@ mod tests {
                     "brief_direct_reports",
                     "add_work_item",
                     "update_work_item",
+                    "file_draft",
                     "promise_an_hour",
                 ],
             ),
@@ -3171,6 +3180,7 @@ mod tests {
                     "brief_direct_reports",
                     "add_work_item",
                     "update_work_item",
+                    "file_draft",
                 ],
                 &[
                     "read_page",
@@ -3181,6 +3191,7 @@ mod tests {
                     "brief_direct_reports",
                     "add_work_item",
                     "update_work_item",
+                    "file_draft",
                 ],
             ),
             // The only row with `issue_invoice`, and it is the only row where
@@ -3208,6 +3219,7 @@ mod tests {
                     "brief_direct_reports",
                     "add_work_item",
                     "update_work_item",
+                    "file_draft",
                     "promise_an_hour",
                     "issue_invoice",
                     "send_invoice",
@@ -3222,6 +3234,7 @@ mod tests {
                     "brief_direct_reports",
                     "add_work_item",
                     "update_work_item",
+                    "file_draft",
                     "promise_an_hour",
                     "send_invoice",
                 ],
@@ -3243,6 +3256,7 @@ mod tests {
                     "brief_direct_reports",
                     "add_work_item",
                     "update_work_item",
+                    "file_draft",
                 ],
                 &[
                     "read_page",
@@ -3253,6 +3267,7 @@ mod tests {
                     "brief_direct_reports",
                     "add_work_item",
                     "update_work_item",
+                    "file_draft",
                 ],
             ),
             // A third identical row, and it is the honest picture of what a
@@ -3275,6 +3290,7 @@ mod tests {
                     "brief_direct_reports",
                     "add_work_item",
                     "update_work_item",
+                    "file_draft",
                 ],
                 &[
                     "read_page",
@@ -3285,6 +3301,7 @@ mod tests {
                     "brief_direct_reports",
                     "add_work_item",
                     "update_work_item",
+                    "file_draft",
                 ],
             ),
             // **The shortest row in the table, and the only one with no
@@ -3304,12 +3321,14 @@ mod tests {
                     "brief_direct_reports",
                     "add_work_item",
                     "update_work_item",
+                    "file_draft",
                 ],
                 &[
                     "message_colleague",
                     "brief_direct_reports",
                     "add_work_item",
                     "update_work_item",
+                    "file_draft",
                 ],
             ),
         ];

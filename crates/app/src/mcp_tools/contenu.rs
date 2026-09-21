@@ -238,14 +238,23 @@ pub fn tools() -> Vec<ToolDef> {
             "content_drafts_add",
             "Ranger un article écrit pour une question",
             "Ouvre un brouillon sur une question. Le texte est celui que tu viens d'écrire : rien dans ce \
-             déploiement n'engendre de prose, et `content_briefs_get` ne rend que la structure à couvrir.",
+             déploiement n'engendre de prose, et `content_briefs_get` ne rend que la structure à couvrir. \
+             Avec `employee_id`, le brouillon est celui d'un siège : une approbation part au fondateur \
+             avec le texte intégral, `approvals_approve` la transforme en pull request dans le dépôt de \
+             ce siège et `approvals_deny` l'archive avec le motif. Sans `employee_id`, c'est un brouillon \
+             à toi, que `content_drafts_propose` pousse quand tu le décides.",
             Method::Post,
             "/v1/content/drafts",
             schema(
                 json!({
                     "question_id": question_id(),
                     "title": { "type": "string", "description": "Le titre de l'article." },
-                    "body": { "type": "string", "description": "Le texte entier." }
+                    "body": { "type": "string", "description": "Le texte entier." },
+                    "employee_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Le siège qui a écrit l'article et dont le dépôt sera lu à l'approbation. Facultatif : donné, une approbation est déposée et le fondateur reçoit le texte."
+                    }
                 }),
                 &["question_id", "title", "body"],
             ),
