@@ -1136,6 +1136,11 @@ fn handlers(config: &Config, agent: Agent, engine: ProvisioningEngine) -> Handle
     // verified form body — and `Ports` is process-wide, so this is one `Arc`
     // bump and not a second set of adapters.
     let ports = agent.ports.clone();
+    // Registered whether or not `AGENTOS_APPROVAL_NOTIFY` is set — an event
+    // with no handler is eight retries and a dead letter, and the app emits
+    // this one on every escalated letter. Absent address = the handler says
+    // so and returns `Ok`.
+    let notify = (ports.clone(), config.approval_notify.clone());
     let mut handlers = Handlers::default()
         .on(routes::employees::CREATED_EVENT, Arc::new(on_created))
         .on(
@@ -1160,6 +1165,12 @@ fn handlers(config: &Config, agent: Agent, engine: ProvisioningEngine) -> Handle
         // the *absence* of this line is a permanent error stream about a
         // decision that is working exactly as designed.
         .on("employee.step.disabled", Arc::new(on_step_disabled))
+        .on(
+            agentos_app::effects::APPROVAL_REQUESTED_EVENT,
+            Arc::new(move |event, tx| {
+                on_approval_requested(notify.0.clone(), notify.1.clone(), event, tx)
+            }),
+        )
         .on(
             agentos_app::inbound::TURN_EVENT,
             Arc::new(move |event, tx| agent.clone().on_turn(event, tx)),
@@ -1531,6 +1542,66 @@ fn field<'a>(event: &'a OutboxEvent, key: &str) -> &'a str {
         .get(key)
         .and_then(Value::as_str)
         .unwrap_or("?")
+}
+
+/// `approval.requested` : une lettre attend un humain, et l'humain l'apprend.
+///
+/// Émis par `Effects::attach_email_draft` dans la transaction qui pose le
+/// brouillon, donc le corps est complet quand ce gestionnaire se réveille. Il
+/// va au fondateur par `agentos_app::effects::notify_approver` — la plate-forme
+/// qui écrit à l'opérateur, pas un siège à un inconnu, et c'est pour cela
+/// qu'aucun jeton de la Gate n'est frappé ici : la politique juge ce qu'un
+/// modèle veut faire dehors, et l'adresse de destination est une variable
+/// que l'opérateur a posée lui-même.
+///
+/// **Sans `AGENTOS_APPROVAL_NOTIFY`, rien ne part et une ligne le dit.** `Ok`
+/// et pas une erreur : la file d'hier — `approvals_list` — existe toujours,
+/// et huit réessais puis une lettre morte par approbation raconteraient une
+/// panne là où il n'y a qu'un choix. Le journal du démarrage l'a déjà dit
+/// une fois ; celui-ci le redit à chaque lettre retenue, avec son `id`, pour
+/// que l'opérateur qui cherche « où est passée cette réponse ? » trouve la
+/// réponse à côté de la question.
+///
+/// Idempotent par `id` d'approbation : la clé du fournisseur en dérive, et le
+/// port ne renvoie pas deux fois la même clé — l'outbox est au-moins-une-fois,
+/// et un rejeu après un `COMMIT` perdu n'écrit pas deux lettres.
+fn on_approval_requested<'a>(
+    ports: Arc<Ports>,
+    notify: Option<String>,
+    event: &'a OutboxEvent,
+    tx: &'a mut TenantTx<'_>,
+) -> Handled<'a> {
+    Box::pin(async move {
+        let approval = event.aggregate_id;
+        let Some(notify) = notify else {
+            tracing::info!(
+                approval = %approval,
+                "an approval entered the queue with its draft; AGENTOS_APPROVAL_NOTIFY is unset, \
+                 so nobody is written to and it waits on approvals_list"
+            );
+            return Ok(());
+        };
+        // Terminal : l'événement est écrit par nous, et un identifiant qui ne
+        // se lit pas ne se lira pas mieux au huitième essai.
+        let employee_id = field(event, "employee_id")
+            .parse()
+            .map(EmployeeId::from_uuid)
+            .map_err(|_| Failure::Terminal("the event names no employee".to_owned()))?;
+        let stored = employee_store::load(tx, employee_id)
+            .await
+            .map_err(|err| format!("could not load the seat that asked: {err}"))?;
+        let draft = event.payload.get("draft").cloned().unwrap_or(Value::Null);
+        agentos_app::effects::notify_approver(&ports, &notify, &stored.employee, approval, &draft)
+            .await
+            .map_err(|err| format!("the founder could not be written to: {err}"))?;
+        tracing::info!(
+            approval = %approval,
+            employee_id = %employee_id.as_uuid(),
+            to = %notify,
+            "an approval entered the queue with its draft; the founder was written to"
+        );
+        Ok(())
+    })
 }
 
 /// `employee.suspended`: recorded, and nothing else.
@@ -5734,6 +5805,122 @@ mod tests {
         tx.commit().await.expect("commit");
     }
 
+    /// **Une approbation retenue parvient au fondateur, une fois, avec son
+    /// `id` et son brouillon ; sans adresse, rien ne part.**
+    ///
+    /// Le gestionnaire appelé comme le poller l'appelle — sa propre
+    /// transaction par tentative. Deux tentatives sur le même événement sont
+    /// le rejeu d'un `COMMIT` perdu, et le fournisseur ne doit voir qu'une
+    /// lettre ; un second événement sans `AGENTOS_APPROVAL_NOTIFY` n'en
+    /// ajoute aucune.
+    #[tokio::test]
+    async fn une_approbation_retenue_parvient_au_fondateur_une_fois() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; the handler loads the seat from Postgres");
+            return;
+        };
+        let db = Db::connect(&url).await.expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let now = Utc::now();
+        let tenant = TenantId::new_v7(now);
+        let employee_id = EmployeeId::from_uuid(Uuid::now_v7());
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("INSERT INTO tenants (id, slug, name) VALUES ($1, $2, $2)")
+            .bind(tenant.as_uuid())
+            .bind(format!("notif-{}", tenant.as_uuid().simple()))
+            .execute(&mut *tx)
+            .await
+            .expect("insert tenant");
+        tx.commit().await.expect("commit tenant");
+        let employee = Employee::new(
+            employee_id,
+            tenant,
+            Slug::parse("lena").expect("slug"),
+            Domain::parse("acme.example.com").expect("domain"),
+            now,
+        );
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        employee_store::insert(&mut tx, &employee)
+            .await
+            .expect("insert employee");
+        tx.commit().await.expect("commit employee");
+
+        let email = Arc::new(agentos_app::mocks::MockEmailProvider::new());
+        let ports = Arc::new(Ports {
+            email: email.clone(),
+            ..agentos_app::mocks::ports()
+        });
+        let approval = Uuid::now_v7();
+        let event = |aggregate_id: Uuid| OutboxEvent {
+            id: Uuid::now_v7(),
+            tenant_id: tenant,
+            aggregate_type: "approval".to_owned(),
+            aggregate_id,
+            event_type: agentos_app::effects::APPROVAL_REQUESTED_EVENT.to_owned(),
+            payload: json!({
+                "employee_id": employee_id.as_uuid(),
+                "draft": {
+                    "to": "claire@example.com",
+                    "subject": "Re : jeudi",
+                    "body": "Oui, jeudi 10 h convient.",
+                },
+            }),
+            attempt_count: 1,
+            available_at: now,
+            last_error: None,
+        };
+
+        let founder = Some("fondateur@acme.example.com".to_owned());
+        for _ in 0..2 {
+            let mut tx = db.tenant_tx(tenant).await.expect("tx");
+            on_approval_requested(ports.clone(), founder.clone(), &event(approval), &mut tx)
+                .await
+                .expect("notify");
+            tx.commit().await.expect("commit");
+        }
+        assert_eq!(
+            email.sent_count(),
+            1,
+            "a replayed event must not write twice"
+        );
+        let sent = email.sent_emails();
+        assert_eq!(sent[0].to, vec!["fondateur@acme.example.com".to_owned()]);
+        assert_eq!(sent[0].from, "lena@acme.example.com");
+        for needle in [
+            &approval.to_string(),
+            "Oui, jeudi 10 h convient.",
+            "approvals_approve id=",
+            "approvals_deny id=",
+        ] {
+            assert!(
+                sent[0].body_text.contains(needle),
+                "{needle:?} absent:\n{}",
+                sent[0].body_text
+            );
+        }
+
+        // Sans adresse : un autre événement, rien de plus dans la boîte.
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        on_approval_requested(ports.clone(), None, &event(Uuid::now_v7()), &mut tx)
+            .await
+            .expect("unset is not a failure");
+        tx.commit().await.expect("commit");
+        assert_eq!(
+            email.sent_count(),
+            1,
+            "AGENTOS_APPROVAL_NOTIFY unset must send nothing"
+        );
+
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("DELETE FROM tenants WHERE id = $1")
+            .bind(tenant.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .expect("delete tenant");
+        tx.commit().await.expect("commit");
+    }
+
     /// A [`Config`] with nothing in it but what [`handlers`] reads.
     fn test_config(tenant: TenantId) -> Config {
         Config {
@@ -5754,6 +5941,8 @@ mod tests {
             platform_keys: crate::auth::PlatformKeys::default(),
             // Same reason: `/metrics` is not mounted from this config either.
             metrics_key: None,
+            // Unset: the handler registers either way and says so per event.
+            approval_notify: None,
             mock_adapters: Vec::new(),
             // Every adapter a mock, which is what this test's engine is built
             // with anyway.
