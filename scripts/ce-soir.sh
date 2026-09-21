@@ -286,7 +286,18 @@ if [ "$RECEVOIR" = 1 ]; then
   # tunnel ouvert sans que rien ne sache plus l'arrêter.
   ADRESSE=""
   if [ "$RELANCER" = 1 ] && [ -f "$TUNNEL_PIDFILE" ] && kill -0 "$(cat "$TUNNEL_PIDFILE")" 2>/dev/null; then
-    ADRESSE="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_JOURNAL" | head -1 || true)"
+    ADRESSE="$(grep -aoE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_JOURNAL" | head -1 || true)"
+    # Un pid vivant n'est pas un tunnel vivant : le 2026-09-21 au matin,
+    # cloudflared tournait encore et l'adresse ne répondait plus (000) — le
+    # tunnel rapide avait été coupé côté Cloudflare dans la nuit. On demande
+    # à l'adresse elle-même : 000 ou 530 (« tunnel not connected »), c'est
+    # mort et on en rouvre un ; un 502 est un tunnel vivant devant un
+    # serveur qu'on est justement en train de relancer.
+    if [ -n "$ADRESSE" ]; then
+      case "$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$ADRESSE/livez")" in
+        000|530) dit "le tunnel $ADRESSE a un pid mais ne répond plus : j'en rouvre un — l'URL dans Resend sera à recoller."; ADRESSE="" ;;
+      esac
+    fi
   fi
   if [ -n "$ADRESSE" ]; then
     # Un tunnel rapide change d'adresse à chaque ouverture, et c'est cette
@@ -303,7 +314,7 @@ if [ "$RECEVOIR" = 1 ]; then
   echo $! > "$TUNNEL_PIDFILE"
   ADRESSE=""
   for _ in $(seq 1 40); do
-    ADRESSE="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_JOURNAL" | head -1 || true)"
+    ADRESSE="$(grep -aoE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_JOURNAL" | head -1 || true)"
     if [ -n "$ADRESSE" ]; then break; fi
     kill -0 "$(cat "$TUNNEL_PIDFILE")" 2>/dev/null \
       || { tail -20 "$TUNNEL_JOURNAL" >&2; refuse "cloudflared est mort avant d'annoncer une adresse. Journal : $TUNNEL_JOURNAL"; }
