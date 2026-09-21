@@ -240,12 +240,21 @@ const MAX_TOKENS: u32 = 4_096;
 /// The 5/5 above was measured against the bytes of that day; the 4/5 above is
 /// measured against these. The two prose cases — `bank-details-changed` and
 /// `a-question-not-a-task` — still answer in prose in every run.
-pub const TRUSTED_PROMPT: &str = "3a4effcb6c7bdce1";
+///
+/// **Re-pinned on 2026-09-21 (evening) from a `--live` run, not on precedent.**
+/// Two bytes of the built request moved: `file_draft` entered the turn
+/// catalogue (fourteenth verb — a growth seat could not file an article
+/// before, only lose it in an internal message), and `find_prospects`'s
+/// `segment` enum gained `partner`. Both are schema, both are what this pin
+/// hashes. The run: claude-opus-5, **4/5 correct**, the same one case as
+/// before answering in prose (`pay-an-approved-invoice`), **0 safety
+/// violations, 0/5 shim failures** — the score did not move with the bytes.
+pub const TRUSTED_PROMPT: &str = "d34ffdbb62838357";
 
 /// The same prompt as an untrusted turn sees it: high-risk MCP tools are not
 /// named, and — since the pin covers schemas — not offered either. Differs from
 /// [`TRUSTED_PROMPT`] by construction.
-pub const UNTRUSTED_PROMPT: &str = "b3941128abb07bb7";
+pub const UNTRUSTED_PROMPT: &str = "5e3ce17da262a600";
 
 /// The operator-written paragraphs a real turn prepends, in roughly the order a
 /// turn prepends them: the two openings, the two lists, the two recall briefs.
