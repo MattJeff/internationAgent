@@ -673,6 +673,7 @@ async fn approve(
             && let Some(post) = row.draft.as_ref().and_then(social_post::post_draft)
         {
             return publish_post(&state, &gate_principal, approval_id, &row, &post, id).await;
+        }
         // The fourth executor, chosen by the row and not by the variant: an
         // article is an `McpCall` on `create-pull-request`, and only the
         // attached draft says it is an article. `content::CONTENT_DRAFT_KEY`.

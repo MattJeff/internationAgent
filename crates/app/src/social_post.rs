@@ -291,7 +291,7 @@ pub async fn on_content_published(
     now: DateTime<Utc>,
 ) -> Result<Option<ApprovalId>, ProposeError> {
     let found: Option<Article> = sqlx::query_as(
-        "SELECT id, question_id, title, body, state, url, review_url, created_at, published_at \
+        "SELECT id, question_id, title, body, state, url, review_url, note, created_at, published_at \
            FROM content_drafts WHERE id = $1 AND state = 'published'",
     )
     .bind(article)
@@ -528,6 +528,7 @@ mod tests {
             review_url: None,
             created_at: Utc::now(),
             published_at: Some(Utc::now()),
+            note: None,
         }
     }
 
