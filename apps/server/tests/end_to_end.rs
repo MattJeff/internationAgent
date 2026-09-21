@@ -451,6 +451,7 @@ async fn a_posted_employee_is_provisioned_by_the_loops_and_the_edges_are_authent
         "initiative",
         "sequence",
         "discovery",
+        "citation",
     ] {
         assert!(
             logs.contains(&format!("\"loop_name\":\"{loop_name}\"")),
@@ -461,7 +462,7 @@ async fn a_posted_employee_is_provisioned_by_the_loops_and_the_edges_are_authent
     // than also catching a loop's own "…loop drained" farewell line.
     assert_eq!(
         logs.matches("\"loop_name\":").count(),
-        7,
+        8,
         "every loop has to be joined, not all but one:\n{logs}"
     );
     assert!(

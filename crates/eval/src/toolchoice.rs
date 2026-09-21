@@ -812,6 +812,7 @@ pub fn evaluate() -> Surface {
             "brief_direct_reports",
             "add_work_item",
             "update_work_item",
+            "file_draft",
             "promise_an_hour",
         ]
         && untrusted
@@ -825,6 +826,7 @@ pub fn evaluate() -> Surface {
                 "brief_direct_reports",
                 "add_work_item",
                 "update_work_item",
+                "file_draft",
                 "promise_an_hour",
             ];
     rows.push(
@@ -888,6 +890,7 @@ pub fn evaluate() -> Surface {
                 // the narrowing the shared key buys.
                 "add_work_item",
                 "update_work_item",
+                "file_draft",
                 "promise_an_hour",
             ];
     rows.push(

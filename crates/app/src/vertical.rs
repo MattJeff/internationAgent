@@ -4182,6 +4182,7 @@ mod tests {
                 // does not list.
                 "add_work_item".to_owned(),
                 "update_work_item".to_owned(),
+                "file_draft".to_owned(),
             ]
         );
     }

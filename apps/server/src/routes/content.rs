@@ -395,6 +395,12 @@ struct NewDraft {
     title: String,
     /// Le texte, écrit par un employé avec son modèle. Rien ici ne l'engendre.
     body: String,
+    /// Le siège qui a écrit. Donné, le brouillon part en approbation au
+    /// fondateur avec le texte intégral, et c'est le dépôt de ce siège que
+    /// l'approbation lira (`content::submit`). Omis : un brouillon de
+    /// l'opérateur, que `content_drafts_propose` pousse quand il le décide.
+    #[serde(default)]
+    employee_id: Option<Uuid>,
 }
 
 async fn add_draft(
@@ -404,13 +410,43 @@ async fn add_draft(
 ) -> Result<Response, ApiError> {
     let Json(body) = body.map_err(|err| ApiError::bad_request(err.body_text()))?;
     let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
-    let row = drafts::create(&mut tx, body.question_id, &body.title, &body.body)
+    let Some(seat) = body.employee_id else {
+        let row = drafts::create(&mut tx, body.question_id, &body.title, &body.body)
+            .await
+            // Une question qui n'est pas à ce locataire n'existe pas dans cette
+            // transaction, donc la clé étrangère tombe : c'est un 404, pas un 500.
+            .map_err(|_| ApiError::not_found())?;
+        tx.commit().await?;
+        return Ok((StatusCode::CREATED, Json(json!({ "draft": row }))).into_response());
+    };
+    // Le slug, pour le mail — et la preuve que le siège est à ce locataire,
+    // avant qu'une approbation le nomme.
+    let slug: Option<String> = sqlx::query_scalar("SELECT slug FROM employees WHERE id = $1")
+        .bind(seat)
+        .fetch_optional(&mut **tx)
         .await
-        // Une question qui n'est pas à ce locataire n'existe pas dans cette
-        // transaction, donc la clé étrangère tombe : c'est un 404, pas un 500.
-        .map_err(|_| ApiError::not_found())?;
+        .map_err(StoreError::from)?;
+    let Some(slug) = slug else {
+        return Err(ApiError::not_found());
+    };
+    let submitted = content::submit(
+        &mut tx,
+        EmployeeId::from_uuid(seat),
+        &slug,
+        &principal.actor.label(),
+        body.question_id,
+        &body.title,
+        &body.body,
+        Utc::now(),
+    )
+    .await
+    .map_err(|_| ApiError::not_found())?;
     tx.commit().await?;
-    Ok((StatusCode::CREATED, Json(json!({ "draft": row }))).into_response())
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "draft": submitted.draft, "approval_id": submitted.approval_id })),
+    )
+        .into_response())
 }
 
 /// La révision d'un brouillon. `url` présent veut dire publié.

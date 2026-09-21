@@ -563,6 +563,14 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
                 cancel.clone(),
             )),
         ),
+        (
+            "citation",
+            tokio::spawn(loops::citation::run(
+                db.clone(),
+                ports.clone(),
+                cancel.clone(),
+            )),
+        ),
     ];
 
     let listener = TcpListener::bind(config.bind).await?;
