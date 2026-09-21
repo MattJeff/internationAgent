@@ -170,9 +170,11 @@
 use std::sync::Arc;
 
 use agentos_app::effects::{
-    ContractSign, Effects, EmailSend, McpCaller, PaymentCreate, Ports, RenderedEmail,
+    AppointmentBook, ContractSign, Effects, EmailSend, McpCaller, PaymentCreate, Ports,
+    RenderedEmail,
 };
 use agentos_app::gate::{PolicyGate, Principal as GatePrincipal};
+use agentos_app::mocks::ProviderMessageId;
 use agentos_app::signature;
 use agentos_domain::action::{Action, ActionKind, EmailAddress};
 use agentos_domain::ids::{ApprovalId, EmployeeId, InvoiceId};
@@ -831,12 +833,22 @@ const ENVELOPE_NOT_SENT: &str = "envelope_not_sent";
 /// actually goes, by giving `redeem_approval` the ledger call the payment arm
 /// already makes.
 ///
-/// `in_reply_to` is deliberately absent. The thread this was a reply to is on
-/// the seat's turn and not on the row, so the letter goes out as its own
-/// message — the same thing that happens today when
-/// `Effects::reply_target` finds nothing, and a worse-looking email is a better
-/// outcome than a route that reconstructs a thread from an identifier it did
-/// not rule on.
+/// `in_reply_to` used to be deliberately absent — "the thread is on the seat's
+/// turn and not on the row" — and `reponse_validee.rs` measured what that
+/// costs: the reply the founder validated left as a new message, so the
+/// prospect saw a stranger writing twice. It is on the row now, beside the
+/// subject and the body, put there by the same `json!` in `turn.rs` from the
+/// `reply_target` the turn resolved. This route still reconstructs nothing: it
+/// reads the letter, threading included, and sends that.
+///
+/// And once the letter has left it is **recorded the way a turn records
+/// one** — `Effects::chase`, under an `AppointmentBook` ruling: the outbound
+/// `messages` row with its body, the sequence told, the follow-up booked.
+/// Without that call the thread stopped at the prospect's question, and the
+/// seat's next turn re-read a conversation nobody had answered; the same test
+/// found that too. The ruling is asked for exactly as `turn::perform` asks,
+/// and refused the same way: the letter is gone either way, and a refusal
+/// here is a follow-up not booked, not a send undone.
 async fn letter(
     state: &Approvals,
     gate_principal: &GatePrincipal,
@@ -869,6 +881,11 @@ async fn letter(
         invoice: Option<Uuid>,
         #[serde(default)]
         from: Option<String>,
+        /// The provider id of the message this answers, when the turn that
+        /// drafted it was woken on a thread. `None` on a draft written before
+        /// the key existed, and on an approach: both go out as new mail.
+        #[serde(default)]
+        in_reply_to: Option<String>,
     }
 
     // The last instant at which nothing has been spent, exactly as the payment
@@ -893,7 +910,12 @@ async fn letter(
 
     let authorized = state
         .gate
-        .redeem_approval(gate_principal, approval_id, &row.nonce, EmailSend { to })
+        .redeem_approval(
+            gate_principal,
+            approval_id,
+            &row.nonce,
+            EmailSend { to: to.clone() },
+        )
         .await?;
     let decision_id = authorized.decision_id().as_uuid().to_string();
 
@@ -941,17 +963,38 @@ async fn letter(
         // sur ce chemin. Y écrire une adresse donnerait à lire un choix qui
         // n'en est pas un.
         from: String::new(),
-        subject: draft.subject,
+        subject: draft.subject.clone(),
         body_text: draft.body,
-        in_reply_to: None,
+        in_reply_to: draft.in_reply_to.map(ProviderMessageId::new),
     };
     match effects.send_email(authorized, rendered).await {
-        Ok(sent) => Ok(Json(json!({
-            "id": id.to_string(),
-            "state": "redeemed",
-            "decision_id": decision_id,
-            "email": { "provider_message_id": sent.id.as_str() },
-        }))),
+        Ok(sent) => {
+            // Recorded as a turn records it — see the function's doc. The
+            // ruling is the turn's own (`turn::perform`, after `send_email`),
+            // and its refusal is handled the same way: logged, not fatal.
+            match state.gate.authorize(gate_principal, AppointmentBook).await {
+                Ok(ok) => {
+                    if let Err(err) = effects.chase(ok, &to, &draft.subject, &sent).await {
+                        tracing::warn!(
+                            approval_id = %id,
+                            error = %err,
+                            "the approved letter left and was not recorded on its thread"
+                        );
+                    }
+                }
+                Err(denied) => tracing::warn!(
+                    approval_id = %id,
+                    code = denied.code(),
+                    "the approved letter left and no follow-up was booked"
+                ),
+            }
+            Ok(Json(json!({
+                "id": id.to_string(),
+                "state": "redeemed",
+                "decision_id": decision_id,
+                "email": { "provider_message_id": sent.id.as_str() },
+            })))
+        }
         // Both facts, because they disagree and both are true — the payment
         // arm's shape. The approval is spent whatever this says.
         Err(err) => Err(ApiError::new(
