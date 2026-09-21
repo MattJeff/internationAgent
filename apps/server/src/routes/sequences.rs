@@ -10,7 +10,7 @@
 //! Même auth que [`super::outreach`] : la clé du locataire, sous
 //! `with_api_stack`, donc RLS sur tout ce que ces handlers lisent.
 
-use agentos_app::sequence::{self, DefineError, EnrollError, Feed, FeedError, Step};
+use agentos_app::sequence::{self, DefineError, EnrollError, Feed, FeedError, Step, UnenrollError};
 use agentos_domain::ids::{EmployeeId, SequenceId};
 use agentos_store::db::{Db, StoreError};
 use agentos_store::policy::PolicyLoadError;
@@ -32,6 +32,10 @@ pub fn router(db: Db) -> Router {
         .route("/v1/sequences", get(list).post(define))
         .route("/v1/sequences/{id}", axum::routing::delete(archive))
         .route("/v1/sequences/{id}/enroll", post(enroll))
+        .route(
+            "/v1/sequences/{id}/enroll/{contact_id}",
+            axum::routing::delete(unenroll),
+        )
         .route("/v1/sequences/{id}/feed", put(set_feed).delete(remove_feed))
         .route("/v1/sequences/{id}/runs", get(runs))
         .route("/v1/sequences/{id}/variants", get(variants))
@@ -121,6 +125,30 @@ async fn archive(
 
 /// `POST /v1/sequences/{id}/enroll` — 201 `{run_id}` ; 409 déjà inscrit ; 403
 /// adresse suppressée ; 404 séquence, contact ou siège inconnus ici.
+/// `DELETE /v1/sequences/{id}/enroll/{contact_id}` — retirer un contact d'une
+/// séquence. 404 s'il n'y a pas de run actif de ce contact ici : rien à
+/// défaire. Le contact reste joignable ; la suppression est un autre geste.
+async fn unenroll(
+    State(db): State<Db>,
+    principal: Principal,
+    Path((id, contact_id)): Path<(Uuid, Uuid)>,
+) -> Result<Response, ApiError> {
+    let mut tx = db.tenant_tx(principal.tenant_id).await?;
+    let run = sequence::unenroll(&mut tx, SequenceId::from_uuid(id), contact_id, Utc::now())
+        .await
+        .map_err(|err| match err {
+            UnenrollError::NotFound => {
+                ApiError::not_found().with_detail("no active run for this contact in this sequence")
+            }
+            UnenrollError::Store(err) => ApiError::from(err),
+        })?;
+    tx.commit().await?;
+    Ok(
+        Json(json!({ "run_id": run.as_uuid(), "state": "stopped", "stop_reason": "unenrolled" }))
+            .into_response(),
+    )
+}
+
 async fn enroll(
     State(db): State<Db>,
     principal: Principal,

@@ -1026,6 +1026,68 @@ async fn book(
     Ok(())
 }
 
+/// Pourquoi un retrait a échoué.
+#[derive(Debug, thiserror::Error)]
+pub enum UnenrollError {
+    /// Pas de run actif de ce contact dans cette séquence — jamais inscrit,
+    /// déjà fini, ou déjà retiré. Un 404, pas un 409 : il n'y a rien à
+    /// défaire.
+    #[error("no active run for this contact in this sequence")]
+    NotFound,
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+impl From<sqlx::Error> for UnenrollError {
+    fn from(err: sqlx::Error) -> Self {
+        Self::Store(err.into())
+    }
+}
+
+/// Retirer un contact d'une séquence : son run actif passe `stopped` avec la
+/// raison `unenrolled` (0118), et la promesse qui n'a pas encore sonné est
+/// annulée pour que le siège ne soit pas réveillé pour rien.
+///
+/// C'est le geste qui manquait le 2026-09-20 : `archive` ferme une séquence
+/// entière et laisse ses runs finir, la suppression vaut pour toutes les
+/// séquences. Ici le contact reste joignable, il n'est plus dans celle-là.
+/// Une promesse pas encore sonnée est réglée sur-le-champ : `cancelled` si son
+/// heure n'est pas venue, `no_work` si elle est déjà due —
+/// `appointments_outcome_agrees_with_the_clock` (0072) n'admet `cancelled`
+/// qu'avant l'heure, et une promesse due dont le run est arrêté n'a plus
+/// rien à faire sonner. Dans les deux cas le siège n'est pas réveillé.
+pub async fn unenroll(
+    tx: &mut TenantTx<'_>,
+    sequence: SequenceId,
+    contact: Uuid,
+    now: DateTime<Utc>,
+) -> Result<SequenceRunId, UnenrollError> {
+    let run: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM sequence_runs \
+          WHERE sequence_id = $1 AND contact_id = $2 AND state = 'active'",
+    )
+    .bind(sequence.as_uuid())
+    .bind(contact)
+    .fetch_optional(&mut ***tx)
+    .await?;
+    let Some(run) = run else {
+        return Err(UnenrollError::NotFound);
+    };
+    let run = SequenceRunId::from_uuid(run);
+    stop(tx, run, "stopped", Some("unenrolled"), now).await?;
+    sqlx::query(
+        "UPDATE appointments \
+            SET rang_at = $2, \
+                outcome = CASE WHEN at > $2 THEN 'cancelled' ELSE 'no_work' END \
+          WHERE sequence_run_id = $1 AND rang_at IS NULL",
+    )
+    .bind(run.as_uuid())
+    .bind(now)
+    .execute(&mut ***tx)
+    .await?;
+    Ok(run)
+}
+
 async fn stop(
     tx: &mut TenantTx<'_>,
     run: SequenceRunId,
@@ -2129,6 +2191,57 @@ mod tests {
     /// **No charter: the run waits, and is replayed the moment one exists.**
     /// Not before — a blind replay would spend both chances on the same
     /// absence — and the replayed wake sends and the run finishes.
+    /// Le geste qui manquait le 2026-09-20 : retirer un contact arrête son run
+    /// tout de suite, annule la promesse qui n'a pas sonné, et ne touche à
+    /// rien d'autre — un second retrait est un 404, pas un second arrêt.
+    #[tokio::test]
+    async fn unenrolling_stops_the_run_and_cancels_its_unrung_promise() {
+        let Some(f) = fixture_alone("desinscrit").await else {
+            return;
+        };
+        let t0 = Utc::now().trunc_subsecs(6);
+        let seq = defined(&f, &[email("hello")]).await;
+        let run = enrolled(&f, seq, t0).await;
+        tick(&f, run, t0).await;
+        let before = promises(&f, run).await;
+        assert_eq!(before.len(), 1);
+        assert!(!before[0].1, "the promise has not rung");
+
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        let stopped = unenroll(&mut tx, seq, f.contact, t0 + TimeDelta::minutes(1))
+            .await
+            .expect("unenroll");
+        assert_eq!(stopped, run);
+        let (state, reason): (String, Option<String>) =
+            sqlx::query_as("SELECT state, stop_reason FROM sequence_runs WHERE id = $1")
+                .bind(run.as_uuid())
+                .fetch_one(&mut **tx)
+                .await
+                .expect("row");
+        assert_eq!(
+            (state.as_str(), reason.as_deref()),
+            ("stopped", Some("unenrolled"))
+        );
+        let settled: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM appointments \
+              WHERE sequence_run_id = $1 AND rang_at IS NOT NULL \
+                AND outcome IN ('cancelled', 'no_work')",
+        )
+        .bind(run.as_uuid())
+        .fetch_one(&mut **tx)
+        .await
+        .expect("count");
+        assert_eq!(
+            settled, 1,
+            "the unrung promise is settled, not left to ring"
+        );
+
+        // Nothing to undo twice.
+        let again = unenroll(&mut tx, seq, f.contact, t0 + TimeDelta::minutes(2)).await;
+        assert!(matches!(again, Err(UnenrollError::NotFound)), "{again:?}");
+        tx.rollback().await.expect("rollback");
+    }
+
     #[tokio::test]
     async fn no_charter_is_replayed_once_the_charter_is_there() {
         let Some(f) = fixture_alone("rejeu_charte").await else {
