@@ -73,8 +73,9 @@ for arg in "$@"; do
     --arreter) ACTION=arreter ;;
     --effacer) ACTION=effacer ;;
     --relancer) RELANCER=1 ;;
+    --veille) ACTION=veille ;;
     -h|--help) sed -n '3,41p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "je ne connais pas « $arg ». --reel, --recevoir, --relancer, --arreter, --effacer, --help." >&2; exit 2 ;;
+    *) echo "je ne connais pas « $arg ». --reel, --recevoir, --relancer, --veille, --arreter, --effacer, --help." >&2; exit 2 ;;
   esac
 done
 
@@ -130,6 +131,26 @@ arreter() {
 }
 
 case "$ACTION" in
+  veille)
+    # Le 2026-09-21 à 18:13 UTC les quatre boucles se sont tues — pas une ligne
+    # de journal pendant vingt-quatre heures — alors que /livez répondait 200 :
+    # la fournée de 08:00 n'est pas partie. Un serveur qui répond n'est pas un
+    # serveur qui travaille ; ce qui le dit, c'est son journal. Cette veille
+    # relance le serveur seul (tunnel et Chrome gardés) quand le journal n'a
+    # plus bougé depuis $VEILLE_MINUTES minutes. C'est une béquille, pas un
+    # diagnostic : la cause est à trouver dans le serveur.
+    VEILLE_MINUTES="${VEILLE_MINUTES:-20}"
+    dit "veille : je relance le serveur seul si $JOURNAL n'a plus bougé depuis $VEILLE_MINUTES min (Ctrl-C pour arrêter)."
+    while :; do
+      sleep 300
+      [ -f "$JOURNAL" ] || continue
+      age=$(( $(date +%s) - $(stat -f %m "$JOURNAL") ))
+      if [ "$age" -gt $(( VEILLE_MINUTES * 60 )) ]; then
+        dit "$(date -u +%FT%TZ) : journal muet depuis $((age/60)) min — relance."
+        "$0" --relancer --reel --recevoir </dev/null || dit "la relance a échoué ; je réessaierai dans 5 min."
+      fi
+    done
+    exit 0 ;;
   arreter) arreter; exit 0 ;;
   effacer)
     arreter
