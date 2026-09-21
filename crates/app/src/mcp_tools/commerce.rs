@@ -646,12 +646,14 @@ pub fn tools() -> Vec<ToolDef> {
             title: "Où en est chaque inscrit d'une séquence",
             description: "Rend, pour une séquence, chaque contact inscrit et sa position : le pas \
                  courant, quand le prochain est dû, et pourquoi le run s'est arrêté le cas échéant \
-                 (`replied`, `max_touches`, `not_sent`, `done`). C'est la lecture qui explique \
-                 pourquoi une séquence semble ne rien faire — `not_sent` veut dire que le siège a \
-                 été réveillé et que rien n'est parti, souvent parce que la Gate a refusé. L'`id` \
-                 vient de `sequences_list`. Un run bloqué en `not_sent` se diagnostique sur \
-                 `refusals_get` et `domains_primary_get` — un plafond journalier épuisé est la \
-                 cause la plus fréquente.",
+                 (`replied`, `max_touches`, `not_sent`, `declined`, `done`). C'est la lecture \
+                 qui explique pourquoi une séquence semble ne rien faire — `not_sent` veut dire \
+                 que le siège a été réveillé, rejoué au plus deux fois, et que rien n'est parti ; \
+                 `declined` que le siège a posé une question au fondateur au lieu d'écrire, et \
+                 que c'est sa décision, pas une panne. L'`id` vient de `sequences_list`. Un run \
+                 en `not_sent` se diagnostique sur `refusals_get` et `domains_primary_get` — un \
+                 plafond journalier épuisé est rejoué le lendemain, et meurt `not_sent` s'il \
+                 l'est encore.",
             method: Method::Get,
             path: "/v1/sequences/{id}/runs",
             schema: schema(
