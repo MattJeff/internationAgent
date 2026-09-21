@@ -58,7 +58,7 @@ create table if not exists discovery_sources (
                              )),
   country        text        constraint discovery_sources_country_iso
                              check (country is null or country ~ '^[A-Z]{2}$'),
-  employee_id    uuid        not null references employees (id) on delete cascade,
+  employee_id    uuid        not null,
   hour           smallint    not null default 7
                              constraint discovery_sources_hour check (hour between 0 and 23),
   read_on        date,
@@ -67,7 +67,11 @@ create table if not exists discovery_sources (
   failures       smallint    not null default 0,
   last_outcome   text,
   created_at     timestamptz not null default now(),
-  constraint discovery_sources_one_per_host unique (tenant_id, host)
+  constraint discovery_sources_one_per_host unique (tenant_id, host),
+  -- `0103` : une clé vers `employees` porte le locataire, sinon Postgres la
+  -- vérifie hors de la RLS et un locataire peut poser une source sur le siège
+  -- d'un autre.
+  foreign key (tenant_id, employee_id) references employees (tenant_id, id) on delete cascade
 );
 
 -- ---------------------------------------------------------------------------
