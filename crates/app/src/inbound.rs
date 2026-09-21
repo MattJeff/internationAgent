@@ -3389,6 +3389,26 @@ const fn trust_str(label: TrustLabel) -> &'static str {
 /// with two hundred open questions has a problem no reminder is going to fix.
 const MAX_OUTSTANDING: i64 = 20;
 
+/// How long a question waits before the same seat may put another to the same
+/// colleague.
+///
+/// Measured the night of 2026-09-20: a `customer-success` seat on a 15-minute
+/// cadence asked the founder the same "status check" twenty-five times, one per
+/// tick, none answered. The thread was already one — `conversation_for` keys
+/// the internal channel on (recipient, sender) — so what multiplied was rows,
+/// not threads, and the founder's desk read twenty-five identical lines.
+/// `outstanding_note` already tells the asker *do not ask the same thing
+/// again*; this is the store refusing when the prompt was not enough.
+///
+/// A day, because the founder's chair takes no turns and is read by a person:
+/// nobody answers an internal question in a quarter of an hour, and a question
+/// still open after a day is one the asker may fairly put again. Not per
+/// subject — "identical in substance" is a judgement the store cannot make on
+/// two paragraphs a model rewrote — so the unit is the pair: one open question
+/// per colleague at a time. A seat with a genuinely new question for somebody
+/// who has not answered its last one is blocked on that person either way.
+const QUESTION_PATIENCE: chrono::TimeDelta = chrono::TimeDelta::hours(24);
+
 /// What one employee is doing to another.
 ///
 /// Four kinds, one row, one delivery path — the argument for that is in
@@ -3544,6 +3564,16 @@ pub enum InternalError {
     )]
     NoTurnsLeft(&'static str),
 
+    /// This seat's last question to that colleague is still unanswered and
+    /// younger than [`QUESTION_PATIENCE`]. Asking again is a second line on
+    /// the same desk, not a second chance of an answer.
+    #[error(
+        "your previous question to that colleague is still waiting for an answer; do not \
+         ask again today — wait, work around it, or say in your reply that you are blocked \
+         on it"
+    )]
+    StillPending,
+
     /// The recipient's policy would not load, so its turn budget cannot be
     /// known. Fails closed: no budget that can be read is no message.
     #[error("your colleague's policy is unusable, so nothing can be sent to it")]
@@ -3563,6 +3593,7 @@ impl InternalError {
             InternalError::NotYourThread => "not_your_thread",
             InternalError::NotAnOwner => "not_an_owner",
             InternalError::NoTurnsLeft(code) => code,
+            InternalError::StillPending => "question_still_pending",
             InternalError::RecipientPolicyUnusable => "recipient_policy_unusable",
             InternalError::Store(_) => "store",
         }
@@ -3906,6 +3937,33 @@ async fn answerable(
     .map_err(StoreError::from)
 }
 
+/// Whether `asker` already has a question to `answerer` that nobody answered,
+/// younger than [`QUESTION_PATIENCE`]. Same anti-join as [`unanswered`]:
+/// "unanswered" is derived, never stored.
+async fn still_pending(
+    tx: &mut TenantTx<'_>,
+    asker: EmployeeId,
+    answerer: EmployeeId,
+    now: DateTime<Utc>,
+) -> Result<bool, StoreError> {
+    sqlx::query_scalar(
+        "SELECT exists( \
+             SELECT 1 FROM messages q \
+              WHERE q.internal_kind = 'question' \
+                AND q.employee_id = $1 \
+                AND q.sender = (SELECT slug FROM employees WHERE id = $2) \
+                AND q.created_at > $3 \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM messages a WHERE a.answers_message_id = q.id))",
+    )
+    .bind(answerer.as_uuid())
+    .bind(asker.as_uuid())
+    .bind(now - QUESTION_PATIENCE)
+    .fetch_one(&mut ***tx)
+    .await
+    .map_err(StoreError::from)
+}
+
 /// Move a thread to its new owner. `false` when it was not the sender's to
 /// move.
 ///
@@ -4033,12 +4091,11 @@ pub async fn send(
         }
     };
 
-    // The only thing here that refuses a well-formed message, and it refuses
-    // exactly one way now: `Exhausted`, a seat that has spent a budget it has.
-    // `NoBudget` is unreachable from here — `wakes` is that same zero, read off
-    // the same `EffectivePolicy` — and it is still mapped rather than asserted,
-    // because a refusal that escaped should be a coded tool result and not a
-    // panic.
+    // The thing here that refuses a well-formed message, and it refuses one
+    // way: `Exhausted`, a seat that has spent a budget it has. `NoBudget` is
+    // unreachable from here — `wakes` is that same zero, read off the same
+    // `EffectivePolicy` — and it is still mapped rather than asserted, because
+    // a refusal that escaped should be a coded tool result and not a panic.
     if wakes {
         turns::reserve(tx, recipient, now.date_naive(), &policy)
             .await
@@ -4046,6 +4103,15 @@ pub async fn send(
                 turns::TurnBudgetError::Store(err) => InternalError::Store(err),
                 other => InternalError::NoTurnsLeft(other.code()),
             })?;
+    }
+
+    // And the second way, since 2026-09-21: one open question per colleague at
+    // a time — see `QUESTION_PATIENCE`. After the reservation so that a
+    // colleague out of turns is told *that* first, which is the older and the
+    // harder wall; the reservation costs nothing on this path because every
+    // caller rolls back what it refused.
+    if errand == Errand::Question && still_pending(tx, from, recipient, now).await? {
+        return Err(InternalError::StillPending);
     }
 
     let from_slug = slug_of(tx, from).await?;
@@ -7945,12 +8011,17 @@ mod tests {
 
         // Strictly alternating, which is what a runaway pair looks like: every
         // message is a reply to the one before it and each one wakes the other.
+        // Literally a reply since `QUESTION_PATIENCE`: Bruno asks, Lena
+        // answers, Bruno asks again — a second question on an unanswered one
+        // would be refused for that and not for the budget this test is about.
         let mut sent = 0;
         let mut refused = Vec::new();
+        let mut open: Option<Thread> = None;
         for round in 1..=6 {
-            let (from, to, errand) = match round % 2 {
-                1 => (lena, "bruno", Errand::Order),
-                _ => (bruno, "lena", Errand::Question),
+            let (from, to, errand, thread) = match (round % 2, open.take()) {
+                (1, None) => (lena, "bruno", Errand::Order, None),
+                (1, Some(question)) => (lena, "bruno", Errand::Answer, Some(question)),
+                _ => (bruno, "lena", Errand::Question, None),
             };
             match say(
                 &db,
@@ -7960,12 +8031,18 @@ mod tests {
                 errand,
                 "and another thing",
                 TrustLabel::Trusted,
-                None,
+                thread,
                 &format!("spin-{round}"),
             )
             .await
             {
-                Ok(_) => sent += 1,
+                Ok(delivered) => {
+                    sent += 1;
+                    open = (errand == Errand::Question).then_some(Thread {
+                        conversation_id: delivered.conversation_id,
+                        message_id: delivered.message_id,
+                    });
+                }
                 Err(err) => refused.push(err.code()),
             }
         }
@@ -8463,6 +8540,105 @@ mod tests {
         );
         assert_eq!(note, None);
         assert_eq!(link, Some(asked.message_id));
+    }
+
+    /// **Une deuxième question au même collègue, sans réponse entre-temps, ne
+    /// crée pas de ligne** — et repart une fois la première répondue.
+    ///
+    /// Vingt-cinq « status check » en une nuit sur le bureau du fondateur, le
+    /// 2026-09-20 : c'est ce que ce test interdit. Le refus est un code fermé
+    /// (`question_still_pending`) rendu au modèle, et il coûte zéro tour au
+    /// destinataire — il tombe avant `turns::reserve`.
+    #[tokio::test]
+    async fn une_question_qui_attend_encore_sa_reponse_ne_repart_pas() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena, bruno) = company(&db, 5).await;
+
+        let asked = say(
+            &db,
+            tenant,
+            lena,
+            "bruno",
+            Errand::Question,
+            "Did the goods receipt for PO-4471 ever arrive?",
+            TrustLabel::Trusted,
+            None,
+            "q-again-1",
+        )
+        .await
+        .expect("the first question goes");
+
+        let refused = say(
+            &db,
+            tenant,
+            lena,
+            "bruno",
+            Errand::Question,
+            "Any news on the goods receipt for PO-4471?",
+            TrustLabel::Trusted,
+            None,
+            "q-again-2",
+        )
+        .await
+        .expect_err("the same seat asking the same colleague again is refused");
+        assert_eq!(refused.code(), "question_still_pending");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM messages WHERE employee_id = $1 AND internal_kind = 'question'",
+        )
+        .bind(bruno.as_uuid())
+        .fetch_one(&mut **tx)
+        .await
+        .expect("count");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(rows, 1, "the refused question must not have landed");
+
+        // Bruno may still ask Lena: the unit is the pair, in that direction.
+        say(
+            &db,
+            tenant,
+            bruno,
+            "lena",
+            Errand::Question,
+            "Which warehouse was PO-4471 delivered to?",
+            TrustLabel::Trusted,
+            None,
+            "q-again-3",
+        )
+        .await
+        .expect("the other direction is not blocked");
+
+        // Answered, and Lena's next question goes through.
+        say(
+            &db,
+            tenant,
+            bruno,
+            "lena",
+            Errand::Answer,
+            "It arrived on the 12th.",
+            TrustLabel::Trusted,
+            Some(Thread {
+                conversation_id: asked.conversation_id,
+                message_id: asked.message_id,
+            }),
+            "a-again-1",
+        )
+        .await
+        .expect("the answer goes back");
+        say(
+            &db,
+            tenant,
+            lena,
+            "bruno",
+            Errand::Question,
+            "And the packing list?",
+            TrustLabel::Trusted,
+            None,
+            "q-again-4",
+        )
+        .await
+        .expect("an answered question frees the next one");
     }
 
     /// An answer has to be an answer to a question that was actually put to

@@ -395,6 +395,11 @@ enum Outcome {
     ///
     /// It costs one query per cadence and resolves by itself the moment a flow
     /// is configured or a prospect's three days are up. Nothing has to notice.
+    ///
+    /// Since 2026-09-21 the two service seats say it too — see
+    /// [`support_due`] and [`growth_due`] — for the night that showed why: a
+    /// `customer-success` seat with no ticket spent its twenty turns reading a
+    /// domain that is not a site and telling the founder so, twenty-five times.
     NoWork(String),
     /// A turn ran to completion.
     Turn,
@@ -1061,6 +1066,19 @@ async fn assignment_for(
         _ => None,
     };
 
+    // The same refusal, same place, for the two service seats — and only on a
+    // **cadence** turn, for the reason the sales arm gives about a sequence: a
+    // promise kept (`due.kept`) carries its own work and is never refused here.
+    // The founder's chair wears no charter and returns `Ok(None)` above, so it
+    // reaches neither arm; it never took a turn and still does not.
+    if due.kept.is_none() {
+        match &charter {
+            Charter::Support { .. } => support_due(db, due, now).await?,
+            Charter::Growth { .. } => growth_due(db, due, now).await?,
+            _ => {}
+        }
+    }
+
     Ok(Some(Assignment {
         due: due.clone(),
         identity: format!(
@@ -1131,6 +1149,89 @@ async fn sales_work_for(
     read.map_err(|err: agentos_store::revenue::RevenueError| {
         Outcome::Failed(format!("could not read this seller's prospects: {err}"))
     })
+}
+
+/// Is anything due on a support seat's cadence turn?
+///
+/// Three things, and the sentence names all three because the operator reading
+/// `last_detail` has to know what was looked at, not only that nothing was
+/// found: a thread of this seat's whose last word is the counterparty's (an
+/// email or any non-internal channel), an internal question put to this seat
+/// that nobody answered, and an open item on its own board. Appointments are
+/// not counted — one that rings is a `kept` wake and never comes through here.
+///
+/// [`Outcome::Failed`] when the store will not answer, not [`Outcome::NoWork`]:
+/// the same distinction [`sales_work_for`] draws, for the same reader.
+async fn support_due(db: &Db, due: &Woken, now: DateTime<Utc>) -> Result<(), Outcome> {
+    let mut tx = db
+        .tenant_tx(due.tenant_id)
+        .await
+        .map_err(|err| Outcome::Failed(format!("no tenant transaction: {err}")))?;
+    let read: Result<(i64, i64, i64), sqlx::Error> = sqlx::query_as(
+        "SELECT \
+           (SELECT count(*) FROM conversations c \
+             WHERE c.employee_id = $1 AND c.channel <> 'internal' \
+               AND EXISTS (SELECT 1 FROM messages m \
+                            WHERE m.conversation_id = c.id AND m.direction = 'inbound' \
+                              AND m.received_at > COALESCE( \
+                                  (SELECT max(o.received_at) FROM messages o \
+                                    WHERE o.conversation_id = c.id \
+                                      AND o.direction = 'outbound'), \
+                                  '-infinity'::timestamptz))), \
+           (SELECT count(*) FROM messages q \
+             WHERE q.employee_id = $1 AND q.internal_kind = 'question' \
+               AND NOT EXISTS (SELECT 1 FROM messages a WHERE a.answers_message_id = q.id)), \
+           (SELECT count(*) FROM work_items \
+             WHERE assignee_id = $1 AND closed_at IS NULL)",
+    )
+    .bind(due.employee_id.as_uuid())
+    .fetch_one(&mut **tx)
+    .await;
+    let _ = tx.rollback().await;
+    let (threads, questions, items) =
+        read.map_err(|err| Outcome::Failed(format!("could not read this seat's inbox: {err}")))?;
+    if threads + questions + items > 0 {
+        return Ok(());
+    }
+    Err(Outcome::NoWork(format!(
+        "nothing is due: 0 threads with an unanswered inbound, 0 internal questions \
+         unanswered, 0 open items on this seat's board, and no appointment woke this turn; \
+         looked at {}",
+        now.to_rfc3339_opts(SecondsFormat::Secs, true)
+    )))
+}
+
+/// Is a growth seat's cadence turn due — has a period gone by since its last?
+///
+/// One `turn` per [`rolepack_service::Growth::MEASURE_PERIOD`], read off
+/// `turn_outcomes` (0099): that row is written only for a beat that thought,
+/// so a failed turn does not use up the day. The pack argues the period.
+async fn growth_due(db: &Db, due: &Woken, now: DateTime<Utc>) -> Result<(), Outcome> {
+    let mut tx = db
+        .tenant_tx(due.tenant_id)
+        .await
+        .map_err(|err| Outcome::Failed(format!("no tenant transaction: {err}")))?;
+    let read: Result<Option<DateTime<Utc>>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT max(at) FROM turn_outcomes WHERE employee_id = $1 AND code = $2",
+    )
+    .bind(due.employee_id.as_uuid())
+    .bind(TURN)
+    .fetch_one(&mut **tx)
+    .await;
+    let _ = tx.rollback().await;
+    let last = read
+        .map_err(|err| Outcome::Failed(format!("could not read this seat's last turn: {err}")))?;
+    match last {
+        Some(at) if now - at < rolepack_service::Growth::MEASURE_PERIOD => {
+            Err(Outcome::NoWork(format!(
+                "nothing is due: this seat took its turn of the period at {}, and the \
+                 measure takes one point per {} h",
+                at.to_rfc3339_opts(SecondsFormat::Secs, true),
+                rolepack_service::Growth::MEASURE_PERIOD.num_hours()
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Write the outcome down, in its own short transaction.
@@ -4352,6 +4453,25 @@ pub(crate) mod tests {
         }
     }
 
+    /// One open item on this seat's board, so a support cadence turn is due at
+    /// all — since `support_due`, a seat with nothing waiting says `no_work`
+    /// and never reaches the model these fixtures script.
+    async fn give_work(db: &Db, tenant: TenantId, employee: EmployeeId) {
+        use agentos_domain::ids::WorkItemId;
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        agentos_store::backlog::post(
+            &mut tx,
+            WorkItemId::new_v7(now),
+            "answer the customs email",
+            Some(employee),
+            None,
+        )
+        .await
+        .expect("post");
+        tx.commit().await.expect("commit");
+    }
+
     /// What the live run wrote: five tickets and five emails, in the first
     /// person, having called nothing at all.
     const NARRATED_A_DAY: &str = "I worked through the ticket queue today. Five tickets handled \
@@ -4378,6 +4498,7 @@ pub(crate) mod tests {
         use agentos_app::mocks::ScriptedLlm;
 
         let employee = seed_due(db, tenant, slug, Some(supporting())).await;
+        give_work(db, tenant, employee).await;
         let cancel = CancellationToken::new();
         let agent = Agent {
             db: db.clone(),
@@ -4412,6 +4533,202 @@ pub(crate) mod tests {
             .expect("ledger");
         tx.rollback().await.expect("rollback");
         (employee, billed)
+    }
+
+    /// What `take_turn` becomes once boxed, so `tick` can hold it.
+    type Taken = std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+
+    /// An agent over one scripted model, and the handle to count its calls.
+    fn scripted(
+        db: &Db,
+        script: Vec<agentos_app::mocks::LlmResponse>,
+    ) -> (
+        Arc<agentos_app::mocks::ScriptedLlm>,
+        CancellationToken,
+        impl Fn(Assignment) -> Taken + Clone + Send + Sync + 'static,
+    ) {
+        use agentos_app::gate::PolicyGate;
+        use agentos_app::mocks::ScriptedLlm;
+
+        let llm = Arc::new(ScriptedLlm::responses(script));
+        let cancel = CancellationToken::new();
+        let agent = Agent {
+            db: db.clone(),
+            llm: llm.clone(),
+            backend: agentos_app::mocks::LlmBackend::Mock,
+            credentials: agentos_app::mcp::Credentials::from_master_key("test-master-key"),
+            gate: PolicyGate::new(db.clone()),
+            ports: Arc::new(agentos_app::mocks::ports()),
+            embedder: agentos_app::knowledge::Embedder::default(),
+            fleets: crate::routes::mcp::Fleets::new().0,
+            cancel: cancel.clone(),
+        };
+        let take = move |assignment: Assignment| {
+            let agent = agent.clone();
+            Box::pin(async move { take_turn(agent, assignment).await }) as Taken
+        };
+        (llm, cancel, take)
+    }
+
+    /// Make this seat due again: the claim rescheduled it a cadence out.
+    async fn due_again(db: &Db, tenant: TenantId, employee: EmployeeId) {
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let hourly = Cadence::every(Duration::from_secs(3_600)).expect("cadence");
+        schedule::set(
+            &mut tx,
+            employee,
+            hourly,
+            Utc::now() - chrono::TimeDelta::days(1),
+        )
+        .await
+        .expect("set schedule");
+        tx.commit().await.expect("commit");
+    }
+
+    /// **Un siège client à qui rien n'est dû ne prend pas de tour** — zéro appel
+    /// au modèle, et un `detail` qui dit ce qui a été regardé. Un entrant non
+    /// répondu sur un de ses fils, et le tour suivant est pris.
+    ///
+    /// La nuit du 2026-09-20 : vingt tours brûlés sans un e-mail à traiter.
+    #[tokio::test]
+    async fn un_siege_client_sans_entrant_ni_tableau_ne_prend_pas_de_tour() {
+        use agentos_app::mocks::{LlmResponse, Usage};
+
+        let _guard = LOOP_LOCK.lock().await;
+        let Some(db) = db().await else { return };
+        clear_schedules(&db).await;
+        let tenant = seed_tenant(&db).await;
+        let seat = seed_due(&db, tenant, "oisif", Some(supporting())).await;
+        let (llm, cancel, take) = scripted(
+            &db,
+            vec![LlmResponse::text("Rien à faire.", Usage::new(4_000, 12, 0))],
+        );
+
+        assert_eq!(
+            tick(&db, &take, &cancel, Utc::now()).await.expect("tick"),
+            1
+        );
+        let (outcome, detail, _) = outcome_of(&db, tenant, seat).await;
+        assert_eq!(outcome, "no_work");
+        let detail = detail.expect("no_work carries what was looked at");
+        for looked_at in [
+            "unanswered inbound",
+            "internal questions",
+            "board",
+            "appointment",
+        ] {
+            assert!(detail.contains(looked_at), "{detail}");
+        }
+        assert!(
+            llm.requests().is_empty(),
+            "a seat with nothing due must not call the model"
+        );
+
+        // A stranger wrote in and nobody answered: one inbound, no outbound.
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let thread = ConversationId::new_v7(now);
+        sqlx::query(
+            "INSERT INTO conversations (id, tenant_id, employee_id, channel) \
+             VALUES ($1, $2, $3, 'email')",
+        )
+        .bind(thread.as_uuid())
+        .bind(tenant.as_uuid())
+        .bind(seat.as_uuid())
+        .execute(&mut **tx)
+        .await
+        .expect("conversation");
+        sqlx::query(
+            "INSERT INTO messages \
+                 (id, tenant_id, conversation_id, employee_id, channel, direction, sender, \
+                  trust_label, idempotency_key, received_at, created_at) \
+             VALUES ($1, $2, $3, $4, 'email', 'inbound', 'paul@prospect.example', \
+                     'untrusted', $5, $6, $6)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant.as_uuid())
+        .bind(thread.as_uuid())
+        .bind(seat.as_uuid())
+        .bind(format!("inbound:{}", thread.as_uuid()))
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .expect("inbound");
+        tx.commit().await.expect("commit");
+        due_again(&db, tenant, seat).await;
+
+        assert_eq!(
+            tick(&db, &take, &cancel, Utc::now()).await.expect("tick"),
+            1
+        );
+        assert_eq!(outcome_of(&db, tenant, seat).await.0, "turn");
+        assert_eq!(llm.requests().len(), 1);
+    }
+
+    /// **Un siège growth dans sa période ne prend pas de tour**, et le reprend
+    /// une fois la période passée. La période est celle du pack.
+    #[tokio::test]
+    async fn un_siege_growth_dans_sa_periode_ne_prend_pas_de_tour() {
+        use agentos_app::mocks::{LlmResponse, Usage};
+
+        let _guard = LOOP_LOCK.lock().await;
+        let Some(db) = db().await else { return };
+        clear_schedules(&db).await;
+        let tenant = seed_tenant(&db).await;
+        let growing = Charter::Growth {
+            objective: rolepack_service::Growth {
+                topic: "visa data for travel agencies".to_owned(),
+                market: Some(CountryCode::parse("FR").expect("a country")),
+                measure: Some("citations on the FR questions".to_owned()),
+            },
+        };
+        let seat = seed_due(&db, tenant, "croissance", Some(growing)).await;
+        let (llm, cancel, take) = scripted(
+            &db,
+            vec![LlmResponse::text("Rien à faire.", Usage::new(4_000, 12, 0))],
+        );
+
+        // A turn an hour ago, written the way `record` writes it.
+        let now = Utc::now();
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        initiative::record_turn_trace(
+            &mut tx,
+            tenant,
+            seat,
+            now - chrono::TimeDelta::hours(1),
+            TURN,
+            None,
+        )
+        .await
+        .expect("trace");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(tick(&db, &take, &cancel, now).await.expect("tick"), 1);
+        let (outcome, detail, _) = outcome_of(&db, tenant, seat).await;
+        assert_eq!(outcome, "no_work");
+        assert!(
+            detail.as_deref().is_some_and(|d| d.contains("24 h")),
+            "{detail:?}"
+        );
+        assert!(llm.requests().is_empty());
+
+        // The period has gone by.
+        let mut tx = db.admin_tx_bypassing_rls().await.expect("admin tx");
+        sqlx::query("UPDATE turn_outcomes SET at = $2 WHERE employee_id = $1")
+            .bind(seat.as_uuid())
+            .bind(now - rolepack_service::Growth::MEASURE_PERIOD - chrono::TimeDelta::minutes(1))
+            .execute(&mut *tx)
+            .await
+            .expect("age the trace");
+        tx.commit().await.expect("commit");
+        due_again(&db, tenant, seat).await;
+
+        assert_eq!(
+            tick(&db, &take, &cancel, Utc::now()).await.expect("tick"),
+            1
+        );
+        assert_eq!(outcome_of(&db, tenant, seat).await.0, "turn");
+        assert_eq!(llm.requests().len(), 1);
     }
 
     /// Everything this employee put in front of the gate, allowed or refused.
@@ -4460,6 +4777,7 @@ pub(crate) mod tests {
             quiet_runs: u32,
         ) -> (EmployeeId, String) {
             let employee = seed_due(db, tenant, slug, Some(supporting())).await;
+            give_work(db, tenant, employee).await;
 
             // Les passages vides d'avant, écrits par le vrai writer. Sur Haiku,
             // parce qu'il faut bien un modèle et que celui-ci ne change rien à

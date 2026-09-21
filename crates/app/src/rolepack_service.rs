@@ -1856,6 +1856,25 @@ pub struct Growth {
 }
 
 impl Growth {
+    /// How often a cadence turn of this pack is *due* at all: one per day.
+    ///
+    /// Nothing in a growth objective is dated. A ticket arrives, a prospect's
+    /// follow-up window closes, an appointment rings — a growth seat has none
+    /// of those; its work is the measure and the draft, and neither says when
+    /// it is next needed. So the pack says it. A day, for two reasons that
+    /// point the same way. The measure is a series in `content_citations` that
+    /// stacks one point per read of a results page that moves from one day to
+    /// the next (`docs/CONTENU.md`); ten reads in a day are ten copies of the
+    /// same point. And the draft waits on a human to publish it, who reads a
+    /// handover once a day at best — the night of 2026-09-20 a growth seat on
+    /// an hourly cadence spent ten turns re-reading a page that did not exist
+    /// and telling the founder so ten times.
+    ///
+    /// The loop reads it as "no `turn` of this seat in the last period", so a
+    /// turn that failed does not count as the day's and the seat tries again
+    /// on its next tick.
+    pub const MEASURE_PERIOD: chrono::TimeDelta = chrono::TimeDelta::hours(24);
+
     /// Everything nobody specified, in a stable order.
     pub fn gaps(&self) -> Vec<Gap> {
         let mut gaps = Vec::new();

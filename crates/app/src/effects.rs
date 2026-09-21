@@ -154,6 +154,24 @@ pub const READ_TOKEN: &str = "read_token";
 /// went somewhere nobody can name.
 pub const NO_LOCATION: &str = "no_location";
 
+/// What [`Effects::read_page`] answers once this employee's reads of a host have
+/// failed `unresolvable` twice today.
+///
+/// Measured the night of 2026-09-20: a `customer-success` seat tried its own
+/// company's apex domain — a sending domain with no A record, not a site — on
+/// every tick, twenty times, and each failure became a message to the founder.
+/// DNS does not change between ticks. Two identical answers in a day is the
+/// host saying it is not there; the third attempt is refused here, without a
+/// browser, and the code tells the model to stop rather than rephrase the URL.
+/// Per host and per day: it lifts at UTC midnight by itself, and a different
+/// host is a different question.
+pub const SITE_UNRESOLVABLE_TODAY: &str = "site_unresolvable_today";
+
+/// How many `unresolvable` answers from one host in a day
+/// [`SITE_UNRESOLVABLE_TODAY`] waits for. Two and not one: a resolver can drop
+/// a single lookup.
+const UNRESOLVABLE_STRIKES: i64 = 2;
+
 /// What [`Effects::discover_prospects`] answers when this employee's policy
 /// cannot be loaded at all.
 ///
@@ -1151,11 +1169,11 @@ pub enum EffectError {
     /// `add_work_item` in `turn::catalogue` — has produced one all along.
     ///
     /// *Facts about the recipient.* [`Effects::send_internal`] maps every
-    /// [`InternalError`] but `Store`, which is **six** and not four: no such
+    /// [`InternalError`] but `Store`, which is **seven** and not four: no such
     /// colleague on this employee's team, an answer to a question nobody asked
     /// it, somebody else's thread, a handover to a seat that owns nothing, a
-    /// recipient whose policy will not load, and a colleague with no turns left
-    /// in its day. [`Effects::post_work`] maps the same enum, from
+    /// recipient whose policy will not load, a colleague with no turns left
+    /// in its day, and a question put again while the last one is unanswered. [`Effects::post_work`] maps the same enum, from
     /// `inbound::may_assign`, and can only ever reach `unreachable_colleague`
     /// through it — `may_assign` calls two functions that fail with
     /// `StoreError` and returns `Unreachable` itself, so that is its whole
@@ -2772,6 +2790,9 @@ impl Effects {
         if !within(url.host_str(), allowed) {
             return Err(EffectError::OutOfScope(allowed.clone()));
         }
+        if self.unresolvable_today(allowed).await? >= UNRESOLVABLE_STRIKES {
+            return Err(EffectError::Refused(SITE_UNRESOLVABLE_TODAY));
+        }
         let session = self.browser_session().await?;
         match self
             .ports
@@ -2817,6 +2838,39 @@ impl Effects {
             // Only a broken adapter answers a text read with something else.
             _ => Err(EffectError::Refused("not_text")),
         }
+    }
+
+    /// How many of this employee's reads on `domain` failed `unresolvable`
+    /// since UTC midnight — read off the audit trail, which is where
+    /// [`Effects::record`] wrote them. See [`SITE_UNRESOLVABLE_TODAY`].
+    async fn unresolvable_today(&self, domain: &Domain) -> Result<i64, EffectError> {
+        let day_start = Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap_or_default()
+            .and_utc();
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+        let strikes: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log \
+              WHERE employee_id = $1 \
+                AND action_kind = 'provider_call_attempted' \
+                AND occurred_at >= $2 \
+                AND payload->>'effect' = 'browser_read' \
+                AND payload->>'error' = 'unresolvable' \
+                AND payload->'detail'->>'domain' = $3",
+        )
+        .bind(self.principal.employee_id.as_uuid())
+        .bind(day_start)
+        .bind(domain.as_str())
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|err| EffectError::Unavailable(err.into()))?;
+        let _ = tx.rollback().await;
+        Ok(strikes)
     }
 
     /// File a document a navigation brought back, and tell the model about it
@@ -3653,10 +3707,11 @@ impl Effects {
                     InternalError::Store(err) => EffectError::Unavailable(err),
                     // Unreachable colleague, unanswerable question, somebody
                     // else's thread, not the owner, a colleague out of turns, a
-                    // recipient whose policy will not load. **Six**, not the
-                    // four this comment used to name — the arm catches every
-                    // `InternalError` but `Store`, and two were missing. All six
-                    // are the world saying no to something the policy allows.
+                    // recipient whose policy will not load, a question still
+                    // pending. **Seven**, not the four this comment used to
+                    // name — the arm catches every `InternalError` but `Store`.
+                    // All seven are the world saying no to something the
+                    // policy allows.
                     refused => EffectError::Refused(refused.code()),
                 })
             }
@@ -7553,6 +7608,111 @@ mod tests {
         async fn release(&self, _binding: &ProviderBinding) -> Result<(), ProviderError> {
             Ok(())
         }
+    }
+
+    /// A host that does not resolve, counting how often it was asked.
+    struct DeadHostBrowser(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl BrowserProvider for DeadHostBrowser {
+        async fn ensure_context(
+            &self,
+            _ctx: &agentos_providers::EnsureCtx,
+        ) -> Result<agentos_providers::Provisioned, ProviderError> {
+            Ok(agentos_providers::Provisioned::new("mock-browser", "ctx-1"))
+        }
+
+        async fn act(
+            &self,
+            _session: &BrowserSession,
+            _step: BrowserStep<'_>,
+        ) -> Result<BrowserOutcome, ProviderError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ProviderError::Terminal {
+                code: "unresolvable",
+            })
+        }
+
+        async fn release(&self, _binding: &ProviderBinding) -> Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
+    /// **Un hôte qui ne résout pas deux fois dans la journée n'est plus tenté
+    /// une troisième.** Le 2026-09-20 un siège `customer-success` a lu
+    /// `getorizn.com` — un domaine d'envoi sans enregistrement A — à chaque
+    /// réveil, vingt fois. Le troisième essai est refusé ici sans navigateur,
+    /// avec un code fermé, et la ligne d'audit le porte.
+    #[tokio::test]
+    async fn un_hote_introuvable_deux_fois_nest_plus_tente_dans_la_journee() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let browser = Arc::new(DeadHostBrowser(std::sync::atomic::AtomicUsize::new(0)));
+        let effects = Effects::new(
+            db.clone(),
+            ports_browsing(browser.clone()),
+            principal.clone(),
+        );
+        provision_browser(&db, &principal).await;
+        let reading = || BrowserRead {
+            domain: Domain::parse("portal.example.com").expect("domain"),
+        };
+        let url = Url::parse("https://portal.example.com/").expect("url");
+
+        for strike in 1..=2 {
+            let token = gate(&db)
+                .authorize(&principal, reading())
+                .await
+                .expect("ok");
+            let err = effects
+                .read_page(token, &url, "body")
+                .await
+                .expect_err("the host does not resolve");
+            assert_eq!(err.code(), "unresolvable", "strike {strike}");
+        }
+        let token = gate(&db)
+            .authorize(&principal, reading())
+            .await
+            .expect("ok");
+        let err = effects
+            .read_page(token, &url, "body")
+            .await
+            .expect_err("the third read is refused before the browser");
+        assert_eq!(err.code(), SITE_UNRESOLVABLE_TODAY);
+        assert_eq!(
+            browser.0.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the browser must not be asked a third time"
+        );
+
+        // Another host is another question.
+        let token = gate(&db)
+            .authorize(
+                &principal,
+                BrowserRead {
+                    domain: Domain::parse("other.example.com").expect("domain"),
+                },
+            )
+            .await
+            .expect("ok");
+        let err = effects
+            .read_page(
+                token,
+                &Url::parse("https://other.example.com/").expect("url"),
+                "body",
+            )
+            .await
+            .expect_err("still dead, but this host has not been tried");
+        assert_eq!(err.code(), "unresolvable");
+
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows[2].1["error"],
+            json!(SITE_UNRESOLVABLE_TODAY),
+            "{}",
+            rows[2].1
+        );
     }
 
     /// **A tariff is a PDF, and until 2026-09-10 that read answered
