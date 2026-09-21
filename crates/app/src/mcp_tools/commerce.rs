@@ -260,6 +260,108 @@ pub fn tools() -> Vec<ToolDef> {
             // dans une file d'approche. Ni l'un ni l'autre ne se reprend.
             risk: Risk::Destructive,
         },
+        ToolDef {
+            name: "discovery_sources_list",
+            title: "Les annuaires relus chaque jour, et ce que chacun a rendu",
+            description: "Rend chaque annuaire que cette entreprise fait relire chaque jour \
+                 (`discovery_sources_add`), dans l'ordre où la boucle les sert — la première \
+                 posée passe la première et dépense le budget du jour en premier — avec son \
+                 segment, son pays, son siège, son heure UTC, le dernier jour lu (`read_on`), \
+                 combien de pages lues et de contacts créés en tout, et `last_outcome` : `12 \
+                 added`, `3 added, budget reached` (le `max_new_contacts_per_day` du siège est \
+                 dépensé, la source attend demain), `robots refused`, `denied: <code>`, \
+                 `unreadable: <code>`, ou `stalled` — trois jours de suite sans lecture, la \
+                 source n'est plus relue jusqu'à ce qu'on la retire et la repose. Les contacts \
+                 créés se lisent sur `contacts_list`.",
+            method: Method::Get,
+            path: "/v1/discovery/sources",
+            schema: nothing(),
+            query: &[],
+            raw_body: None,
+            risk: Risk::Read,
+        },
+        ToolDef {
+            name: "discovery_sources_add",
+            title: "Faire relire un annuaire chaque jour",
+            description: "Pose une page d'annuaire — la liste des membres d'une fédération, des \
+                 agences accréditées, des adhérents d'une chambre — que le serveur relira \
+                 **une fois par jour UTC**, au premier tick à partir de `hour` (7 h par défaut, \
+                 une heure avant le flux des séquences), par le même chemin que \
+                 `prospects_discover` : la Gate statue pour le siège, et le \
+                 `max_new_contacts_per_day` de ce siège borne ce qui est écrit — quand il est \
+                 atteint, la source note `budget reached` et attend demain, rien ici ne le \
+                 contourne. Poser lit `robots.txt` de l'hôte : un hôte qui nous refuse rend \
+                 422 `robots_refused` et rien n'est posé ; la boucle le relit chaque matin et \
+                 s'arrête le jour où il refuse. 400 `bad_segment` pour `other` — un annuaire \
+                 vaut par le segment qu'il nourrit, et le siège n'y trouverait rien à \
+                 reproduire — ou un segment hors de `prospects_segments_list` ; 409 \
+                 `duplicate_host` si une page de cet hôte est déjà posée (un annuaire, c'est \
+                 un hôte) ; 403 `channel_not_allowed` pour un siège sans le canal `web` ; 404 \
+                 siège inconnu. Le pays est **celui que vous affirmez** (`ZZ` sinon) : la \
+                 liste des membres d'une fédération nationale en a un, une page ne le dit \
+                 pas. Trois jours de suite sans lecture et la source est `stalled` : \
+                 `discovery_sources_remove` puis reposer.",
+            method: Method::Post,
+            path: "/v1/discovery/sources",
+            schema: schema(
+                json!({
+                    "url": {
+                        "type": "string",
+                        "description": "L'adresse absolue de la page où les adresses sont imprimées, `https://` compris."
+                    },
+                    "segment": {
+                        "type": "string",
+                        "enum": ["airline", "ota", "corporate_travel", "tmc", "insurer", "cruise", "relocation"],
+                        "description": "Ce que cette page liste — un jugement sur l'annuaire. `prospects_segments_list` moins `other`."
+                    },
+                    "country": {
+                        "type": "string",
+                        "minLength": 2,
+                        "maxLength": 2,
+                        "description": "ISO 3166-1 alpha-2 des sociétés listées, si la page est nationale. Absent : `ZZ`."
+                    },
+                    "employee_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "description": "Le siège dont le budget et la politique s'appliquent, tel que `employees_list` le rend. Sa politique doit porter le canal `web`."
+                    },
+                    "hour": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 23,
+                        "description": "L'heure UTC à partir de laquelle le jour est lu. Défaut 7."
+                    }
+                }),
+                &["url", "segment", "employee_id"],
+            ),
+            query: &[],
+            raw_body: None,
+            // Une machine qui lira un tiers chaque matin et écrira des lignes
+            // qui entreront dans une file d'approche : la classe de
+            // `prospects_discover`, en plus long.
+            risk: Risk::Destructive,
+        },
+        ToolDef {
+            name: "discovery_sources_remove",
+            title: "Ne plus relire un annuaire",
+            description: "Retire un annuaire de la liste : il n'est plus relu à partir de \
+                 maintenant. Les comptes et contacts qu'il a créés restent — ils sont à \
+                 l'entreprise, pas à la page. C'est aussi la première moitié du geste qui \
+                 fait repartir une source `stalled` (retirer, puis `discovery_sources_add`). \
+                 404 si la source n'est pas à cette entreprise. L'`id` vient de \
+                 `discovery_sources_list`.",
+            method: Method::Delete,
+            path: "/v1/discovery/sources/{id}",
+            schema: schema(
+                json!({
+                    "id": { "type": "string", "format": "uuid", "description": "L'annuaire, tel que `discovery_sources_list` le rend." }
+                }),
+                &["id"],
+            ),
+            query: &[],
+            raw_body: None,
+            risk: Risk::Write,
+        },
         // -------------------------------------------------------------------
         // outreach — l'activité commerciale, pas l'administration
         // -------------------------------------------------------------------
@@ -405,7 +507,7 @@ pub fn tools() -> Vec<ToolDef> {
             title: "Les séquences de l'entreprise",
             description: "Rend toutes les séquences définies, les vivantes d'abord puis les \
                  archivées, avec leurs pas, leur flux (`feed`, ce que `sequences_feed_set` a \
-                 posé — siège, `per_day`, `hour`, segment, pays, liste — ou null) et `fed_on`, le dernier jour UTC où le flux a inscrit quelqu'un. \
+                 posé — siège, `per_day`, `hour`, segment, pays, liste — ou null), `fed_on`, le dernier jour UTC où le flux a inscrit quelqu'un, et `welcomes_tier` (le palier Stripe qu'elle accueille, ou null). \
                  À appeler avant d'enrôler quelqu'un : c'est là que se lisent l'identifiant \
                  d'une séquence et le nombre de mails qu'elle promet. C'est la source de l'`id` \
                  de `sequences_enroll`, `sequences_feed_set`, `sequences_runs_list` et \
@@ -428,7 +530,14 @@ pub fn tools() -> Vec<ToolDef> {
                  la liste est refusée en 400 si elle est vide, dépasse 12 pas, n'a aucun pas \
                  `email`, saute hors de la liste ou boucle sans `wait` (elle tournerait à chaque \
                  tick), et en 409 `name_taken` si une séquence vivante porte déjà ce nom. Ce que \
-                 chaque variante a donné se lit sur `sequences_variants_measure`.",
+                 chaque variante a donné se lit sur `sequences_variants_measure`. **Avec \
+                 `welcomes_tier`, c'est un parcours d'accueil** : quand un abonnement Stripe de \
+                 ce palier arrive (webhook `customer.subscription.created`), le client est créé \
+                 comme contact et inscrit dessus par le siège `customer-success`, sans dépenser \
+                 un inconnu du jour — un client n'en est pas un. Le palier se nomme comme chez \
+                 Stripe (`price.nickname` en minuscules : `starter`, `gratuit`…) ; `upgrade`, \
+                 `downgrade` et `churned` accueillent un changement de palier et une \
+                 résiliation. Sans séquence pour un palier, rien ne part.",
             method: Method::Post,
             path: "/v1/sequences",
             schema: schema(
@@ -438,6 +547,11 @@ pub fn tools() -> Vec<ToolDef> {
                         "minLength": 1,
                         "maxLength": 200,
                         "description": "Unique parmi les séquences vivantes de l'entreprise."
+                    },
+                    "welcomes_tier": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Le palier Stripe que cette séquence accueille (`price.nickname` en minuscules, ou `lookup_key`, ou l'id du prix), ou `upgrade` / `downgrade` / `churned`. Absent : une séquence de prospection ordinaire."
                     },
                     "steps": {
                         "type": "array",

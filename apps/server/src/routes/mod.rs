@@ -38,6 +38,7 @@ pub mod desk;
 // le domaine d'envoi : au locataire, vérifié chez le fournisseur, posé chez
 // Cloudflare en un appel. `Hiring` y vit aussi — l'état des trois routes qui
 // embauchent, parce qu'embaucher enregistre le domaine au passage.
+pub mod discovery; // les annuaires qu'un locataire fait relire chaque jour
 pub mod domain;
 pub mod employees; // U31
 // le classeur: the founder files a document and gets those exact bytes back.

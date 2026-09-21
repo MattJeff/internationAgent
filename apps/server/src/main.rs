@@ -555,6 +555,14 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
             "sequence",
             tokio::spawn(loops::sequence::run(db.clone(), cancel.clone())),
         ),
+        (
+            "discovery",
+            tokio::spawn(loops::discovery::run(
+                db.clone(),
+                ports.clone(),
+                cancel.clone(),
+            )),
+        ),
     ];
 
     let listener = TcpListener::bind(config.bind).await?;
@@ -860,6 +868,14 @@ fn app(
             // annuaire est un `BrowserRead` sur lequel la Gate statue pour un
             // siège.
             .merge(routes::prospects::router(
+                db.clone(),
+                gate.clone(),
+                ports.clone(),
+            ))
+            // Les annuaires relus chaque jour (0113) : poser en vérifie le
+            // `robots.txt` sous le même jeton `BrowserRead`, d'où la gate et
+            // le même `ports`.
+            .merge(routes::discovery::router(
                 db.clone(),
                 gate.clone(),
                 ports.clone(),
@@ -1238,7 +1254,9 @@ fn handlers(config: &Config, agent: Agent, engine: ProvisioningEngine) -> Handle
 }
 
 /// `webhook.stripe.received` : une session Checkout payée règle la facture
-/// qu'elle nomme.
+/// qu'elle nomme — et un abonnement crée un client, qui reçoit le parcours de
+/// son palier (`agentos_app::stripe::record_stripe_customer`, seconde
+/// lecture, même transaction).
 ///
 /// La quatrième jointure, et la première qui fait entrer de l'argent. Comme
 /// celle de Smartlead, elle n'a rien à aller chercher : les octets vérifiés
@@ -1290,6 +1308,63 @@ fn on_stripe_webhook<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Ha
                 tracing::debug!(invoice = %id, "a stripe payment for an invoice already settled");
             }
             Settlement::NotOurs => tracing::debug!("a stripe delivery that settles nothing here"),
+        }
+
+        // La seconde lecture : un abonnement crée un client, et le client
+        // reçoit son parcours. L'argument est en tête de `agentos_app::stripe`.
+        let welcomed = agentos_app::stripe::record_stripe_customer(tx, body.as_bytes(), Utc::now())
+            .await
+            .map_err(|err| {
+                let why = format!("{}: {err}", err.code());
+                if err.is_retryable() {
+                    Failure::Retry(why)
+                } else {
+                    Failure::Terminal(why)
+                }
+            })?;
+        use agentos_app::stripe::Welcome;
+        match welcomed {
+            Welcome::Contact { account, contact } => {
+                tracing::info!(%account, %contact, "a stripe customer is a contact")
+            }
+            Welcome::Enrolled { tier, run } => {
+                tracing::info!(tier, run = %run, "a customer was enrolled on the welcome sequence of their tier")
+            }
+            Welcome::AlreadyEnrolled(tier) => {
+                tracing::debug!(
+                    tier,
+                    "a customer already on the welcome sequence of their tier"
+                )
+            }
+            Welcome::NoSequence(tier) => {
+                tracing::info!(
+                    tier,
+                    "no live sequence welcomes this tier; nothing was enrolled"
+                )
+            }
+            Welcome::NoSeat(tier) => tracing::warn!(
+                tier,
+                "no active customer-success seat to welcome a customer; nothing was enrolled"
+            ),
+            Welcome::Suppressed(who) => {
+                tracing::info!(
+                    who,
+                    "a stripe customer asked to be left alone; nothing was enrolled"
+                )
+            }
+            // The delivery that carries the address is seconds behind this
+            // one; the outbox retries in two minutes and dead-letters after
+            // eight tries, which is the visible answer to a customer with no
+            // address anywhere.
+            Welcome::NoContactYet(customer) => {
+                return Err(Failure::Retry(format!(
+                    "stripe customer {customer} has a subscription and no address here yet; \
+                     waiting for customer.created or checkout.session.completed"
+                )));
+            }
+            Welcome::Nothing | Welcome::NotOurs => {
+                tracing::debug!("a stripe delivery that welcomes nobody")
+            }
         }
         Ok(())
     })

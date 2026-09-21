@@ -5829,6 +5829,7 @@ pub(crate) mod tests {
                 brief: Some("dire bonjour".to_owned()),
                 variants: Vec::new(),
             }],
+            None,
         )
         .await
         .expect("define");

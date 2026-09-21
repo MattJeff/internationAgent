@@ -434,21 +434,30 @@ impl From<sqlx::Error> for DefineError {
 }
 
 /// Écrire une séquence. Le nom est unique parmi les vivantes du locataire.
+/// `welcomes_tier` en fait un parcours d'accueil (`0114`) : le palier Stripe
+/// qu'elle accueille, en minuscules, ou `upgrade` / `downgrade` / `churned` —
+/// `crate::stripe` § « Un abonnement crée un client » dit qui y inscrit.
 pub async fn define(
     tx: &mut TenantTx<'_>,
     name: &str,
     steps: &[Step],
+    welcomes_tier: Option<&str>,
 ) -> Result<SequenceId, DefineError> {
     validate(steps)?;
     let id = SequenceId::new_v7(Utc::now());
     let inserted = sqlx::query(
-        "INSERT INTO sequences (id, tenant_id, name, steps) VALUES ($1, $2, $3, $4) \
-         ON CONFLICT DO NOTHING",
+        "INSERT INTO sequences (id, tenant_id, name, steps, welcomes_tier) \
+         VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
     )
     .bind(id.as_uuid())
     .bind(tx.tenant_id().as_uuid())
     .bind(name.trim())
     .bind(serde_json::to_value(steps).map_err(|e| StoreError::conflict(e.to_string()))?)
+    .bind(
+        welcomes_tier
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty()),
+    )
     .execute(&mut ***tx)
     .await?
     .rows_affected();
@@ -470,13 +479,16 @@ pub struct Sequence {
     pub feed: Option<Feed>,
     /// Le dernier jour UTC nourri ; posé aussi à la pose du flux.
     pub fed_on: Option<NaiveDate>,
+    /// Le palier qu'elle accueille (`0114`), ou `None` : pas un parcours
+    /// d'accueil.
+    pub welcomes_tier: Option<String>,
 }
 
 /// Les séquences du locataire, vivantes d'abord, les plus récentes en tête.
 pub async fn list(tx: &mut TenantTx<'_>) -> Result<Vec<Sequence>, StoreError> {
     let rows = sqlx::query(
-        "SELECT id, name, steps, created_at, archived_at, feed, fed_on FROM sequences \
-         ORDER BY archived_at IS NOT NULL, created_at DESC",
+        "SELECT id, name, steps, created_at, archived_at, feed, fed_on, welcomes_tier \
+           FROM sequences ORDER BY archived_at IS NOT NULL, created_at DESC",
     )
     .fetch_all(&mut ***tx)
     .await?;
@@ -492,6 +504,7 @@ pub async fn list(tx: &mut TenantTx<'_>) -> Result<Vec<Sequence>, StoreError> {
                 .get::<Option<serde_json::Value>, _>("feed")
                 .and_then(|v| serde_json::from_value(v).ok()),
             fed_on: row.get("fed_on"),
+            welcomes_tier: row.get("welcomes_tier"),
         })
         .collect())
 }
@@ -1616,9 +1629,14 @@ mod tests {
 
     async fn defined(f: &Fixture, steps: &[Step]) -> SequenceId {
         let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
-        let id = define(&mut tx, &format!("seq-{}", Uuid::now_v7().simple()), steps)
-            .await
-            .expect("define");
+        let id = define(
+            &mut tx,
+            &format!("seq-{}", Uuid::now_v7().simple()),
+            steps,
+            None,
+        )
+        .await
+        .expect("define");
         tx.commit().await.expect("commit");
         id
     }
@@ -2405,15 +2423,17 @@ mod tests {
             return;
         };
         let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
-        let err = define(&mut tx, "x", &[wait(1)]).await.expect_err("shape");
+        let err = define(&mut tx, "x", &[wait(1)], None)
+            .await
+            .expect_err("shape");
         assert!(
             matches!(err, DefineError::Invalid(Invalid::NoEmail)),
             "{err}"
         );
-        let id = define(&mut tx, "intro", &[email("hi")])
+        let id = define(&mut tx, "intro", &[email("hi")], None)
             .await
             .expect("define");
-        let err = define(&mut tx, "intro", &[email("hi")])
+        let err = define(&mut tx, "intro", &[email("hi")], None)
             .await
             .expect_err("same name");
         assert!(matches!(err, DefineError::NameTaken), "{err}");
@@ -2435,7 +2455,7 @@ mod tests {
             Err(StoreError::NotFound)
         ));
         // The name is free again, and the archived one cannot enroll.
-        define(&mut tx, "intro", &[email("hi")])
+        define(&mut tx, "intro", &[email("hi")], None)
             .await
             .expect("name freed");
         let err = enroll(&mut tx, id, f.contact, f.lena, Utc::now())

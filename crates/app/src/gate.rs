@@ -1208,6 +1208,19 @@ impl PolicyGate {
         {
             standing = ContactStanding::Known;
         }
+        // Neither are the company's customers. The budget bounds cold
+        // outreach — strangers who asked for nothing. A contact whose account
+        // is `customer` has a contract, a key and an invoice with our name on
+        // it (`stripe::record_stripe_customer` writes both the state and the
+        // `contract` lawful basis); writing to them is not approaching them,
+        // and the welcome sequence of their tier must not spend a stranger's
+        // slot nor be refused for want of one.
+        if standing == ContactStanding::New
+            && let Some(address) = counterparty(action)
+            && is_customer(tx, &address).await?
+        {
+            standing = ContactStanding::Known;
+        }
         Ok((u32::try_from(new_today).unwrap_or(u32::MAX), standing))
     }
 
@@ -1592,6 +1605,20 @@ async fn is_own_domain(tx: &mut TenantTx<'_>, domain: &str) -> Result<bool, Deni
             .filter(|rest| rest.matches('.').count() >= 1);
         sends_from == domain || parent == Some(domain.as_str())
     }))
+}
+
+/// Whether `address` belongs to an active contact of an account in the
+/// `customer` state. The address is compared, never rendered; `contacts.email`
+/// is lower case by CHECK, so the comparison lowers too.
+async fn is_customer(tx: &mut TenantTx<'_>, address: &str) -> Result<bool, Denied> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM contacts c JOIN accounts a ON a.id = c.account_id \
+          WHERE c.email = $1 AND c.active AND a.state = 'customer')",
+    )
+    .bind(address.trim().to_ascii_lowercase())
+    .fetch_one(&mut ***tx)
+    .await
+    .map_err(|e| Denied::Unavailable(e.into()))
 }
 
 fn counterparty(action: &Action) -> Option<String> {
@@ -3418,6 +3445,70 @@ mod tests {
             .authorize(&principal, email("x@orizn.test"))
             .await
             .expect_err("a sibling domain is still a stranger");
+        assert_eq!(err.code(), DenyReason::ContactBudgetExhausted.code());
+    }
+
+    /// A paying customer is not a stranger either: a contact whose account is
+    /// `customer` spends none of the day's new contacts. The same person at a
+    /// `candidate` account still does — the state is what says "customer".
+    #[tokio::test]
+    async fn a_paying_customer_is_no_stranger() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db, "active").await;
+        let gate = with_policy(
+            &db,
+            &principal,
+            Scope::Tenant,
+            &PolicyLimits {
+                allowed_channels: BTreeSet::from([Channel::Email]),
+                max_new_contacts_per_day: 1,
+                ..PolicyLimits::default()
+            },
+        )
+        .await;
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        for (domain, state, who) in [
+            ("paying.test", "customer", "client@paying.test"),
+            ("looking.test", "candidate", "prospect@looking.test"),
+        ] {
+            let account = Uuid::now_v7();
+            sqlx::query(
+                "INSERT INTO accounts (id, tenant_id, legal_name, domain, segment, country, state) \
+                 VALUES ($1, $2, $3, $3, 'other', 'FR', $4)",
+            )
+            .bind(account)
+            .bind(principal.tenant_id.as_uuid())
+            .bind(domain)
+            .bind(state)
+            .execute(&mut **tx)
+            .await
+            .expect("account");
+            sqlx::query(
+                "INSERT INTO contacts (id, tenant_id, account_id, full_name, email, lawful_basis) \
+                 VALUES ($1, $2, $3, '', $4, 'contract')",
+            )
+            .bind(Uuid::now_v7())
+            .bind(principal.tenant_id.as_uuid())
+            .bind(account)
+            .bind(who)
+            .execute(&mut **tx)
+            .await
+            .expect("contact");
+        }
+        tx.commit().await.expect("commit");
+
+        // One stranger uses the whole budget of the day.
+        gate.authorize(&principal, email("someone@elsewhere.test"))
+            .await
+            .expect("the first stranger is within the budget");
+        // The customer still gets through; the prospect is a stranger.
+        gate.authorize(&principal, email("Client@Paying.test"))
+            .await
+            .expect("a customer is known, not a stranger");
+        let err = gate
+            .authorize(&principal, email("prospect@looking.test"))
+            .await
+            .expect_err("a candidate account's contact is still a stranger");
         assert_eq!(err.code(), DenyReason::ContactBudgetExhausted.code());
     }
 
