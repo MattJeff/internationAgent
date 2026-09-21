@@ -1432,6 +1432,13 @@ impl Effects {
         &self.principal
     }
 
+    /// Le port MCP derrière cette façade — pour une **lecture** qui précède un
+    /// jeton (« y a-t-il un compte connecté ? » avant de dépenser un clic,
+    /// `social_post::approve`). Une écriture passe par [`Self::call_tool`].
+    pub fn mcp(&self) -> &dyn McpCaller {
+        self.ports.mcp.as_ref()
+    }
+
     /// Put the letter a seat wants to send on the approval row the gate just
     /// filed for it.
     ///
@@ -4527,12 +4534,14 @@ pub async fn notify_approver(
     let text = |key: &str| draft.get(key).and_then(Value::as_str).unwrap_or("?");
     let (to, subject, body) = (text("to"), text("subject"), text("body"));
     let slug = seat.slug();
-    let email = OutboundEmail {
-        from: seat.address().to_string(),
-        to: vec![notify.to_owned()],
-        subject: format!("[approbation] {slug} veut écrire à {to} : {subject}"),
-        body_text: format!(
-            "Le siège {slug} a rédigé un e-mail que la politique retient pour relecture.\n\
+    // Un post LinkedIn plutôt qu'une lettre : même file, même événement, mêmes
+    // deux gestes — seuls l'objet et le corps changent.
+    let (subject, body_text) =
+        crate::social_post::letter(slug, approval, draft).unwrap_or_else(|| {
+            (
+                format!("[approbation] {slug} veut écrire à {to} : {subject}"),
+                format!(
+                    "Le siège {slug} a rédigé un e-mail que la politique retient pour relecture.\n\
              Approbation : {approval}\n\
              Elle expire 24 h après son dépôt ; passé ce délai, seule approvals_deny la \
              retire de la file.\n\
@@ -4549,7 +4558,14 @@ pub async fn notify_approver(
              action={{\"action\":\"email_send\",\"to\":\"{to}\"}}\n\
              Pour le refuser :\n\
              approvals_deny id=\"{approval}\"\n"
-        ),
+                ),
+            )
+        });
+    let email = OutboundEmail {
+        from: seat.address().to_string(),
+        to: vec![notify.to_owned()],
+        subject,
+        body_text,
         in_reply_to: None,
         unsubscribe_token: None,
         attachments: Vec::new(),

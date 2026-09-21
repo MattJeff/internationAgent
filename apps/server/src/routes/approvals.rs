@@ -176,6 +176,7 @@ use agentos_app::effects::{
 use agentos_app::gate::{PolicyGate, Principal as GatePrincipal};
 use agentos_app::mocks::ProviderMessageId;
 use agentos_app::signature;
+use agentos_app::social_post;
 use agentos_domain::action::{Action, ActionKind, EmailAddress};
 use agentos_domain::ids::{ApprovalId, EmployeeId, InvoiceId};
 use agentos_domain::policy::DenyReason;
@@ -649,12 +650,13 @@ async fn approve(
     };
     let approval_id = ApprovalId::from_uuid(id);
 
-    // **Three arms with an executor now**: the payment, the signature, and the
-    // letter. Everything else is still minted, reported and dropped — there is
-    // nothing on the far side of those tokens to hand them to.
+    // **Four arms with an executor now**: the payment, the signature, the
+    // letter, and the LinkedIn post. Everything else is still minted, reported
+    // and dropped — there is nothing on the far side of those tokens to hand
+    // them to.
     //
     // The match is before the redemption and each arm redeems exactly once,
-    // which is the property this whole function rests on and which a fourth arm
+    // which is the property this whole function rests on and which a fifth arm
     // must keep.
     let Action::PaymentCreate { amount, payee } = body.action else {
         if let Action::ContractSign { title } = body.action {
@@ -662,6 +664,15 @@ async fn approve(
         }
         if let Action::EmailSend { to } = body.action {
             return letter(&state, &gate_principal, approval_id, &row, to, id).await;
+        }
+        // Un `McpCall` sur `social/post-publish` dont la ligne porte un post :
+        // le texte publié est celui de la ligne, jamais celui de la requête —
+        // l'argument de `letter`, mot pour mot.
+        if let Action::McpCall { tool } = &body.action
+            && *tool == social_post::tool()
+            && let Some(post) = row.draft.as_ref().and_then(social_post::post_draft)
+        {
+            return publish_post(&state, &gate_principal, approval_id, &row, &post, id).await;
         }
         let authorized = state
             .gate
@@ -1107,6 +1118,84 @@ async fn sign(
         .with_extension("state", json!("redeemed"))
         .with_extension("decision_id", json!(decision_id))
         .with_extension("signature_error", json!(err.to_string()))),
+    }
+}
+
+/// [`NO_SIGNATURE_CONNECTOR`] pour un post : aucun compte LinkedIn connecté.
+/// L'approbation reste `pending`, la réponse porte le geste, et le même clic
+/// publie le jour où le compte est là — après relecture, jamais tout seul.
+const NO_SOCIAL_ACCOUNT: &str = "no_social_account";
+
+/// [`ENVELOPE_NOT_SENT`] pour un post : l'approbation est dépensée et le
+/// service n'a pas publié.
+const POST_NOT_PUBLISHED: &str = "post_not_published";
+
+/// Publish the LinkedIn post the approver just read, and nothing else.
+///
+/// `agentos_app::social_post::approve` porte l'ordre — le compte avant le
+/// rachat, la publication après — et cette route ne fait que traduire ses
+/// refus en HTTP, avec le `Fleet` de **ce** locataire comme port MCP,
+/// exactement comme [`sign`].
+async fn publish_post(
+    state: &Approvals,
+    gate_principal: &GatePrincipal,
+    approval_id: ApprovalId,
+    row: &Decidable,
+    post: &social_post::PostDraft,
+    id: Uuid,
+) -> Result<Json<Value>, ApiError> {
+    let mcp: Arc<dyn McpCaller> = state.fleets.for_tenant(gate_principal.tenant_id);
+    let ports = Arc::new(Ports {
+        mcp,
+        ..(*state.ports).clone()
+    });
+    let effects = Effects::new(state.db.clone(), ports, gate_principal.clone());
+    match social_post::approve(
+        &state.gate,
+        &effects,
+        gate_principal,
+        approval_id,
+        &row.nonce,
+        post,
+    )
+    .await
+    {
+        Ok(published) => Ok(Json(json!({
+            "id": id.to_string(),
+            "state": "redeemed",
+            "decision_id": published.decision_id.to_string(),
+            "post": published.post.into_inner_for_rendering(),
+        }))),
+        Err(social_post::ApproveError::NoAccount) => {
+            tracing::warn!(
+                approval_id = %id,
+                "an approved post was refused: this company has no LinkedIn account connected"
+            );
+            Err(ApiError::new(
+                StatusCode::NOT_IMPLEMENTED,
+                NO_SOCIAL_ACCOUNT,
+                "this company has no LinkedIn account connected, so this post cannot be published",
+            )
+            .with_detail(social_post::CONNECT_HINT)
+            .with_extension("state", json!("pending")))
+        }
+        // Le mot de `/v1/social` — pas branché, pas déclaré, en panne — et
+        // rien n'est dépensé.
+        Err(social_post::ApproveError::Unreachable(err)) => {
+            Err(super::social::refus(err).with_extension("state", json!("pending")))
+        }
+        Err(social_post::ApproveError::Denied(denied)) => Err(denied.into()),
+        Err(social_post::ApproveError::NotPublished {
+            decision_id,
+            reason,
+        }) => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            POST_NOT_PUBLISHED,
+            "the approval was redeemed and the social service did not publish the post",
+        )
+        .with_extension("state", json!("redeemed"))
+        .with_extension("decision_id", json!(decision_id.to_string()))
+        .with_extension("detail", json!(reason))),
     }
 }
 
@@ -2157,6 +2246,92 @@ mod tests {
         assert_eq!(answer["code"], json!("role_required"));
 
         assert_eq!(state_of(&db, tenant, id).await, "pending");
+    }
+
+    // -- the LinkedIn post -------------------------------------------------
+
+    /// **Un post proposé par le siège growth : la file le montre, refuser
+    /// l'archive avec le motif, et approuver sans agrégateur ne dépense rien.**
+    ///
+    /// La flotte est vide, donc le clic tombe sur le mot de `/v1/social` —
+    /// `404 no_social_binding`, qui dit quoi brancher — et la ligne reste
+    /// `pending` : le même clic publie le jour où le compte est là. Le chemin
+    /// avec un compte connecté et celui sans compte sont éprouvés dans
+    /// `agentos_app::social_post`, où l'agrégateur se remplace par un faux.
+    #[tokio::test]
+    async fn a_post_is_shown_refused_with_a_note_and_never_spent_without_an_aggregator() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db).await;
+        let text = "Vérifier un visa par API\n\nCe que répond un moteur aujourd'hui.";
+
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let first = social_post::propose(&mut tx, employee, "lena", text, None, now)
+            .await
+            .expect("proposed");
+        let second = social_post::propose(&mut tx, employee, "lena", text, None, now)
+            .await
+            .expect("proposed twice by hand");
+        tx.commit().await.expect("commit");
+
+        let gate = PolicyGate::new(db.clone());
+        let app = mount(&db, &gate, keys(tenant, "approver", SECRET));
+
+        // La file rend le texte que le fondateur relit.
+        let (status, queue) = call(&app, "/v1/approvals", SECRET, None).await;
+        assert_eq!(status, StatusCode::OK, "{queue}");
+        let shown = queue["approvals"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .find(|row| row["id"] == json!(first.as_uuid().to_string()))
+            .expect("the post is in the queue");
+        assert_eq!(shown["draft"]["text"], json!(text), "{queue}");
+        assert_eq!(shown["draft"]["platform"], json!("linkedin"), "{queue}");
+
+        // Approuver sans agrégateur : le mot de `/v1/social`, rien de dépensé.
+        let uri = format!("/v1/approvals/{}/approve", first.as_uuid());
+        let (status, answer) = call(
+            &app,
+            &uri,
+            SECRET,
+            Some(json!({ "action": social_post::action() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+        assert_eq!(answer["code"], json!("no_social_binding"), "{answer}");
+        assert_eq!(answer["state"], json!("pending"), "{answer}");
+        assert_eq!(state_of(&db, tenant, first).await, "pending");
+
+        // Refuser archive le post avec le motif.
+        let uri = format!("/v1/approvals/{}/deny", second.as_uuid());
+        let (status, answer) = call(
+            &app,
+            &uri,
+            SECRET,
+            Some(json!({ "note": "trop tôt : l'article n'est pas encore indexé" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let (state, note, draft): (String, Option<String>, Value) = sqlx::query_as(
+            "SELECT state, decision_note, action->'draft' FROM approvals WHERE id = $1",
+        )
+        .bind(second.as_uuid())
+        .fetch_one(&mut **tx)
+        .await
+        .expect("the row");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(state, "denied");
+        assert_eq!(
+            note.as_deref(),
+            Some("trop tôt : l'article n'est pas encore indexé")
+        );
+        assert_eq!(
+            draft["text"],
+            json!(text),
+            "le post archivé garde son texte"
+        );
     }
 
     // -- the letter --------------------------------------------------------

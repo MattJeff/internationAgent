@@ -167,7 +167,7 @@ async fn appeler(
 }
 
 /// Le mot du `Fleet`, traduit en la seule chose que l'appelant peut corriger.
-fn refus(err: ProviderError) -> ApiError {
+pub(crate) fn refus(err: ProviderError) -> ApiError {
     match err {
         // Rien n'est branché sous ce handle, ou le branchement ne sert pas cet
         // outil — un `/mcp/messagerie` branché sous ce nom tombe ici aussi.

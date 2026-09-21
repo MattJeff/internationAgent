@@ -1190,6 +1190,10 @@ fn handlers(config: &Config, agent: Agent, engine: ProvisioningEngine) -> Handle
         .on(
             agentos_app::inbound::TURN_EVENT,
             Arc::new(move |event, tx| agent.clone().on_turn(event, tx)),
+        )
+        .on(
+            agentos_app::social_post::CONTENT_PUBLISHED_EVENT,
+            Arc::new(on_content_published),
         );
 
     // One per environment registration, whose path segment is its provider name
@@ -1675,6 +1679,32 @@ fn on_approval_requested<'a>(
             to = %notify,
             "an approval entered the queue with its draft; the founder was written to"
         );
+        Ok(())
+    })
+}
+
+/// `content.published` : un article du client est en ligne, et le siège growth
+/// propose le post LinkedIn qui l'annonce — comme brouillon attaché à une
+/// approbation, donc par le même `approval.requested` et le même mail que les
+/// lettres. `agentos_app::social_post` porte l'argument ; ici on ne fait que
+/// tendre la transaction de l'événement.
+///
+/// `Ok` sur tout ce qui n'est pas une panne — pas de siège growth, article
+/// disparu, texte refusé — parce qu'aucun de ces cas ne change au huitième
+/// réessai, et le module le dit dans le journal.
+fn on_content_published<'a>(event: &'a OutboxEvent, tx: &'a mut TenantTx<'_>) -> Handled<'a> {
+    Box::pin(async move {
+        let proposed =
+            agentos_app::social_post::on_content_published(tx, event.aggregate_id, Utc::now())
+                .await
+                .map_err(|err| format!("the post could not be proposed: {err}"))?;
+        if let Some(approval) = proposed {
+            tracing::info!(
+                article = %event.aggregate_id,
+                approval = %approval.as_uuid(),
+                "a LinkedIn post was proposed for the published article; the founder is written to"
+            );
+        }
         Ok(())
     })
 }
