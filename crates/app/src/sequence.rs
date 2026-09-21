@@ -45,14 +45,74 @@
 //! de remonter le refus depuis `Effects`, et ça évite de réveiller un siège pour
 //! un envoi que la Gate refuserait de toute façon. Si la suppression arrive
 //! entre la réservation et le réveil, la Gate refuse, rien ne part, et le run
-//! s'arrête au tick suivant en `not_sent` — un délai de [`SEND_DEADLINE`] sans
-//! envoi après un réveil est la seule lecture possible de « le siège a été
-//! réveillé et rien n'est parti ».
+//! s'arrête en `not_sent` — un délai de [`SEND_DEADLINE`] sans envoi après le
+//! premier réveil est la seule lecture possible de « le siège a été réveillé et
+//! rien n'est parti ».
 //!
 //! `MAX_TOUCHES` reste la limite d'emails par fil : la séquence s'arrête là
 //! (`stopped`, `max_touches`) plutôt que de la contourner. Personne qui a
 //! ignoré trois mails n'attend le quatrième, et une séquence qui en promettrait
 //! cinq est une séquence dont les deux derniers pas ne s'exécutent pas.
+//!
+//! # Rejouer, ou pas
+//!
+//! Une promesse qui sonne est **consommée** (`0072`) : si le réveil n'envoie
+//! rien, personne ne la rejoue. Mesuré trois fois — la charte n'existait pas
+//! encore (`no_charter`, répétition du 2026-09-19), la Gate a refusé le sixième
+//! inconnu du jour (`contact_budget_exhausted`, 2026-09-20), le siège a posé
+//! une question au fondateur au lieu d'écrire (AssoConnect, 2026-09-20) — et
+//! chaque fois le run restait `active`, `step` inchangé, puis mourait
+//! `not_sent` un jour plus tard. Ce sont trois situations différentes qui
+//! méritent trois réponses, et la promesse dit laquelle : `appointments.outcome`
+//! porte ce que `loops::initiative` a fait du réveil, et le tour laisse ses
+//! traces (`messages.internal_kind = 'question'`, le refus de la Gate dans
+//! `audit_log`).
+//!
+//! * **Cause transitoire — rejouer.** `no_charter` (la charte a été posée
+//!   depuis), `over_budget` ou un refus `contact_budget_exhausted` (le budget
+//!   revient à minuit UTC), `error` (`max_turns`, une panne). Rejouer, c'est
+//!   réserver une **nouvelle** promesse pour le même pas, au plus tôt quand la
+//!   cause peut avoir disparu : le lendemain à minuit UTC — plus l'heure du
+//!   flux s'il y en a un, pour que les mails ne partent pas la nuit — pour un
+//!   budget ; tout de suite pour une panne ; dès que la charte existe pour
+//!   `no_charter`, et pas avant, parce qu'un rejeu à l'aveugle brûlerait ses
+//!   deux chances en deux minutes sur la même absence.
+//! * **Décision du siège — ne pas rejouer.** Le réveil a produit une question
+//!   au fondateur et pas d'envoi : le siège a lu le brief, le contact, le fil,
+//!   et jugé qu'il ne fallait pas écrire — c'est exactement ce qu'on lui
+//!   demande, et le rejouer serait lui demander de se déjuger. Le run s'arrête
+//!   **tout de suite** en `stopped`/`declined` (`0112`) au lieu d'attendre un
+//!   jour pour dire `not_sent`, qui est un autre mot pour une autre chose. Ce
+//!   n'est pas une panne : rien n'est cassé, quelqu'un a choisi.
+//! * **Inconnu.** Un tour (`turn`) sans envoi, sans question, sans refus : le
+//!   modèle n'a pas écrit et on ne sait pas pourquoi. Une seule reprise, tout
+//!   de suite, puis `not_sent`. Les autres issues (`clarify`, `no_work`,
+//!   `no_model`, `unreadable_charter`, `cancelled`) ne se lèvent pas toutes
+//!   seules et le run s'arrête `not_sent` sans attendre : une promesse consommée
+//!   ne sonnera plus, attendre n'apprend rien.
+//!
+//! Deux bornes, dans cet ordre. Au plus [`MAX_REPLAYS`] rejeux par pas : le
+//! premier couvre la cause ordinaire (le budget revenu, la charte posée), le
+//! second couvre le rejeu qui retombe sur un mauvais jour (le fondateur a écrit
+//! cinq inconnus à la main ce matin-là) ; un troisième serait un run qui attend
+//! une condition que personne ne répare, et le fondateur doit le voir en
+//! `not_sent` plutôt que le croire en cours. Et jamais au-delà de
+//! [`SEND_DEADLINE`] compté depuis le **premier** réveil : un rejeu qui ne
+//! peut pas sonner dans ce délai n'est pas réservé. Un flux à 8 h UTC rejoue
+//! donc son refus de budget à 8 h le lendemain, à la limite exacte ; un run
+//! réveillé à 7 h avec ce même flux ne le peut pas et meurt `not_sent`, ce qui
+//! se lit et se réinscrit.
+//!
+//! **Comment le run apprend l'issue.** Rien ne le réveille : `record` écrit
+//! `outcome` dans sa propre transaction, après le tour, et ce module n'en est
+//! pas averti. Un run dont la promesse est posée revient donc dans [`advance`]
+//! toutes les [`WAKE_POLL`] — pas [`SEND_DEADLINE`] — et relit ses promesses :
+//! pas sonné, on attend encore ; sonné sans issue, le tour est en cours ; sonné
+//! avec une issue, on décide. Cinq minutes est la latence maximale d'un
+//! `declined`, et une transaction de locataire par run posé par cinq minutes
+//! est un coût qu'aucune liste de 1300 ne fait sentir. La boucle
+//! `loops::sequence` ne change pas : elle lit `next_at`, et `next_at` est
+//! maintenant court.
 //!
 //! # A/B : on compare des runs, pas des mails
 //!
@@ -128,6 +188,7 @@ use agentos_domain::action::EmailAddress;
 use agentos_domain::ids::{
     AppointmentId, ConversationId, EmployeeId, SequenceId, SequenceRunId, TenantId,
 };
+use agentos_domain::policy::DenyReason;
 use agentos_store::calendar;
 use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::policy::{self, PolicyLoadError};
@@ -148,11 +209,21 @@ pub const MAX_STEPS: usize = 12;
 /// Une attente est entre une heure et trente jours.
 pub const MAX_WAIT_HOURS: u32 = 24 * 30;
 
-/// Combien de temps un pas `Email` attend son envoi après avoir réservé la
-/// promesse. Passé ce délai sans [`sent`], le siège a été réveillé et rien
-/// n'est parti — la Gate a refusé, ou le modèle n'a pas écrit — et le run
-/// s'arrête en `not_sent` plutôt que de réveiller encore.
+/// Combien de temps un pas `Email` attend son envoi après le premier réveil.
+/// Passé ce délai sans [`sent`], le siège a été réveillé — et rejoué, peut-être
+/// — et rien n'est parti : le run s'arrête en `not_sent` plutôt que de
+/// réveiller encore. Aucun rejeu n'est réservé au-delà.
 pub const SEND_DEADLINE: TimeDelta = TimeDelta::hours(24);
+
+/// Au plus tant de rejeux d'un même pas après un réveil sans envoi. Deux :
+/// l'argument est en tête de module, « Rejouer, ou pas ».
+pub const MAX_REPLAYS: usize = 2;
+
+/// La cadence à laquelle un run dont la promesse est posée relit ce qu'elle
+/// est devenue. Cinq minutes : la latence maximale d'un `declined`, et une
+/// transaction par run posé par cinq minutes (« Comment le run apprend
+/// l'issue », en tête).
+pub const WAKE_POLL: TimeDelta = TimeDelta::minutes(5);
 
 /// L'heure UTC à partir de laquelle un flux nourrit, quand la pose n'en dit
 /// pas : 8 h, la fin de la nuit partout en Europe. L'argument est en tête de
@@ -847,18 +918,100 @@ pub async fn variants(
     Ok(out)
 }
 
-/// La promesse réservée pour le pas courant, s'il y en a une : posée après le
-/// dernier envoi du run (`at > received_at`), ou après le départ quand rien
-/// n'est parti. `rang_at IS NULL` tant qu'elle n'a pas sonné.
+/// Les promesses réservées pour le pas courant, dans l'ordre où elles l'ont
+/// été : posées après le dernier envoi du run (`at > received_at`), ou après le
+/// départ quand rien n'est parti. La première qui a sonné est le premier
+/// réveil ; la dernière est celle qui compte. `rang_at IS NULL` tant qu'elle
+/// n'a pas sonné, `outcome` ce que `loops::initiative` en a fait (`0072`),
+/// `NULL` tant que le tour n'est pas fini.
 ///
-/// `$1` est le run, `$2` son `last_message_id`. Les deux moitiés de ce
-/// fragment sont des constantes de ce module ; aucune valeur d'appelant n'y
-/// entre, tout passe en paramètre — l'audit que `AssertSqlSafe` demande.
-const PENDING_PROMISE: &str = "SELECT a.rang_at IS NULL FROM appointments a \
+/// `$1` est le run, `$2` son `last_message_id`.
+const STEP_PROMISES: &str = "SELECT a.at, a.rang_at, a.outcome FROM appointments a \
      WHERE a.sequence_run_id = $1 \
        AND a.at > coalesce((SELECT m.received_at FROM messages m WHERE m.id = $2), \
                            '-infinity'::timestamptz) \
-     ORDER BY a.at DESC LIMIT 1";
+     ORDER BY a.at";
+
+/// Une ligne de [`STEP_PROMISES`] : `at`, `rang_at`, `outcome`.
+type Wake = (DateTime<Utc>, Option<DateTime<Utc>>, Option<String>);
+
+/// Le siège a posé une question au fondateur depuis `since` — le réveil dont
+/// on juge l'issue. Par le `sender`, qui est son slug sur le canal interne.
+///
+/// ponytail: le siège, pas le contact — une question n'a pas de fil quand le
+/// pas est le premier. Un siège qui interroge le fondateur pendant le réveil
+/// d'une séquence a décliné d'écrire, sur quoi que ce soit.
+async fn asked_founder(
+    tx: &mut TenantTx<'_>,
+    employee: EmployeeId,
+    since: DateTime<Utc>,
+) -> Result<bool, StoreError> {
+    let asked: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM messages m JOIN employees e ON e.slug = m.sender \
+          WHERE e.id = $1 AND m.channel = 'internal' AND m.internal_kind = 'question' \
+            AND m.received_at >= $2)",
+    )
+    .bind(employee.as_uuid())
+    .bind(since)
+    .fetch_one(&mut ***tx)
+    .await?;
+    Ok(asked)
+}
+
+/// La Gate a refusé un inconnu à ce siège depuis `since` : la ligne d'audit
+/// que `refusals_get` lit, avec son code.
+async fn budget_refused(
+    tx: &mut TenantTx<'_>,
+    employee: EmployeeId,
+    since: DateTime<Utc>,
+) -> Result<bool, StoreError> {
+    let refused: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM audit_log a \
+          WHERE a.employee_id = $1 AND a.decision = 'deny' AND a.deny_reason_code = $2 \
+            AND a.occurred_at >= $3)",
+    )
+    .bind(employee.as_uuid())
+    .bind(DenyReason::ContactBudgetExhausted.code())
+    .bind(since)
+    .fetch_one(&mut ***tx)
+    .await?;
+    Ok(refused)
+}
+
+/// Le lendemain de `now`, à `hour` UTC : quand un budget du jour est neuf.
+fn tomorrow(now: DateTime<Utc>, hour: u32) -> DateTime<Utc> {
+    (now.date_naive() + TimeDelta::days(1))
+        .and_hms_opt(hour, 0, 0)
+        .expect("an hour of the day")
+        .and_utc()
+}
+
+/// Réserver la promesse d'un pas `email` à `at`, portant le run.
+async fn book(
+    tx: &mut TenantTx<'_>,
+    run: SequenceRunId,
+    employee: EmployeeId,
+    at: DateTime<Utc>,
+    email: &str,
+    conversation: Option<ConversationId>,
+) -> Result<(), StoreError> {
+    let booked = calendar::book_on(
+        tx,
+        AppointmentId::new_v7(at),
+        employee,
+        at,
+        ZONE,
+        &subject(email),
+        conversation,
+    )
+    .await?;
+    sqlx::query("UPDATE appointments SET sequence_run_id = $2 WHERE id = $1")
+        .bind(booked.id.as_uuid())
+        .bind(run.as_uuid())
+        .execute(&mut ***tx)
+        .await?;
+    Ok(())
+}
 
 async fn stop(
     tx: &mut TenantTx<'_>,
@@ -911,7 +1064,7 @@ pub async fn advance(
     now: DateTime<Utc>,
 ) -> Result<(), StoreError> {
     let Some(row) = sqlx::query(
-        "SELECT r.step, r.employee_id, r.conversation_id, r.last_message_id, s.steps, \
+        "SELECT r.step, r.employee_id, r.conversation_id, r.last_message_id, s.steps, s.feed, \
                 c.email, c.active, revenue_suppression_of(c.email, null::text) IS NOT NULL AS suppressed \
            FROM sequence_runs r \
            JOIN sequences s ON s.id = r.sequence_id \
@@ -970,41 +1123,68 @@ pub async fn advance(
                     return stop(tx, run, "stopped", Some("max_touches"), now).await;
                 }
             }
-            let pending: Option<bool> = sqlx::query_scalar(PENDING_PROMISE)
+            let wakes: Vec<Wake> = sqlx::query_as(STEP_PROMISES)
                 .bind(run.as_uuid())
                 .bind(last_message)
-                .fetch_optional(&mut ***tx)
+                .fetch_all(&mut ***tx)
                 .await?;
-            match pending {
-                // Le siège a été réveillé et rien n'est parti dans le délai.
-                Some(false) => stop(tx, run, "stopped", Some("not_sent"), now).await,
+            let (rang, outcome) = match wakes.last() {
+                None => {
+                    book(tx, run, employee, now, &email, conversation).await?;
+                    return goto(tx, run, step, now + WAKE_POLL).await;
+                }
                 // Réservée, pas encore sonné : la boucle initiative est en
                 // retard, on attend encore.
                 //
                 // ponytail: un siège qui n'est plus `active` ne sonne jamais
                 // (`claim_due` filtre le cycle de vie), et ce run se renouvelle
-                // alors tous les `SEND_DEADLINE` sans fin. Le jour où ça gêne,
+                // alors tous les `WAKE_POLL` sans fin. Le jour où ça gêne,
                 // `stop(…, "seat_gone")` quand `employees.lifecycle` a changé.
-                Some(true) => goto(tx, run, step, now + SEND_DEADLINE).await,
-                None => {
-                    let booked = calendar::book_on(
-                        tx,
-                        AppointmentId::new_v7(now),
-                        employee,
-                        now,
-                        ZONE,
-                        &subject(&email),
-                        conversation,
-                    )
-                    .await?;
-                    sqlx::query("UPDATE appointments SET sequence_run_id = $2 WHERE id = $1")
-                        .bind(booked.id.as_uuid())
-                        .bind(run.as_uuid())
-                        .execute(&mut ***tx)
-                        .await?;
-                    goto(tx, run, step, now + SEND_DEADLINE).await
-                }
+                Some((_, None, _)) => return goto(tx, run, step, now + WAKE_POLL).await,
+                Some((_, Some(rang), outcome)) => (*rang, outcome.as_deref()),
+            };
+            // « Rejouer, ou pas », en tête de module.
+            let first_wake = wakes.iter().find_map(|(_, r, _)| *r).unwrap_or(rang);
+            let deadline = first_wake + SEND_DEADLINE;
+            if now >= deadline {
+                return stop(tx, run, "stopped", Some("not_sent"), now).await;
             }
+            let Some(outcome) = outcome else {
+                // Sonné, pas d'issue : le tour est en cours.
+                return goto(tx, run, step, (now + WAKE_POLL).min(deadline)).await;
+            };
+            if asked_founder(tx, employee, rang).await? {
+                return stop(tx, run, "stopped", Some("declined"), now).await;
+            }
+            let replays = wakes.len() - 1;
+            let hour = row
+                .get::<Option<serde_json::Value>, _>("feed")
+                .and_then(|v| serde_json::from_value::<Feed>(v).ok())
+                .map_or(0, |f| u32::from(f.hour));
+            let again = match outcome {
+                "over_budget" => tomorrow(now, hour),
+                "turn" if budget_refused(tx, employee, rang).await? => tomorrow(now, hour),
+                "turn" if replays == 0 => now,
+                "error" => now,
+                "no_charter" => {
+                    let chartered: bool = sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM employee_charters WHERE employee_id = $1)",
+                    )
+                    .bind(employee.as_uuid())
+                    .fetch_one(&mut ***tx)
+                    .await?;
+                    if !chartered {
+                        return goto(tx, run, step, (now + WAKE_POLL).min(deadline)).await;
+                    }
+                    now
+                }
+                _ => return stop(tx, run, "stopped", Some("not_sent"), now).await,
+            };
+            if replays >= MAX_REPLAYS || again > deadline {
+                return stop(tx, run, "stopped", Some("not_sent"), now).await;
+            }
+            book(tx, run, employee, again, &email, conversation).await?;
+            goto(tx, run, step, again + WAKE_POLL).await
         }
     }
 }
@@ -1650,7 +1830,7 @@ mod tests {
         // Step 0, email: a promise now, carrying the run; the run waits.
         let r = tick(&f, run, t0).await;
         assert_eq!((r.step, r.state.as_str()), (0, "active"));
-        assert_eq!(r.next_at, Some(t0 + SEND_DEADLINE));
+        assert_eq!(r.next_at, Some(t0 + WAKE_POLL));
         let booked = promises(&f, run).await;
         assert_eq!(booked.len(), 1);
         assert!(!booked[0].1, "not rung yet");
@@ -1770,13 +1950,19 @@ mod tests {
             "replied"
         );
 
-        // A wake that sends nothing: after SEND_DEADLINE the run is stopped.
+        // A wake that sends nothing and whose outcome is never written: the
+        // run polls, and SEND_DEADLINE after the wake it is stopped.
         let seq = defined(&f, &[email("hello")]).await;
         let t2 = t1 + TimeDelta::days(3);
         let run = enrolled(&f, seq, t2).await;
         tick(&f, run, t2).await;
         rung(&f, run, t2 + TimeDelta::minutes(1)).await;
-        let r = tick(&f, run, t2 + SEND_DEADLINE).await;
+        let r = tick(&f, run, t2 + TimeDelta::minutes(2)).await;
+        assert_eq!(
+            (r.state.as_str(), r.next_at),
+            ("active", Some(t2 + TimeDelta::minutes(2) + WAKE_POLL))
+        );
+        let r = tick(&f, run, t2 + TimeDelta::minutes(1) + SEND_DEADLINE).await;
         assert_eq!(
             (r.state.as_str(), r.stop_reason.as_deref()),
             ("stopped", Some("not_sent"))
@@ -1813,6 +1999,327 @@ mod tests {
             promises(&f, run).await.is_empty(),
             "nothing was booked for it"
         );
+    }
+
+    /// A database of this test's own. A replay reads the seat's questions and
+    /// refusals *since the wake*, and the shared base carries every
+    /// neighbour's; same mechanism as `gate::tests::private_db`.
+    async fn fixture_alone(suffix: &str) -> Option<Fixture> {
+        use sqlx::Connection as _;
+
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("SKIP: DATABASE_URL is unset; a replay needs a database");
+            return None;
+        };
+        let (host_part, tail) = url.rsplit_once('/').expect("DATABASE_URL names a database");
+        let (base, options) = tail.split_once('?').map_or((tail, ""), |(b, o)| (b, o));
+        let name = format!("{base}_{suffix}");
+        let mine = if options.is_empty() {
+            format!("{host_part}/{name}")
+        } else {
+            format!("{host_part}/{name}?{options}")
+        };
+        let db = match Db::connect(&mine).await {
+            Ok(db) => db,
+            Err(_) => {
+                let mut admin = sqlx::PgConnection::connect(&url).await.expect("connect");
+                let _ = sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
+                    .execute(&mut admin)
+                    .await;
+                admin.close().await.expect("close");
+                Db::connect(&mine).await.expect("connect")
+            }
+        };
+        db.migrate().await.expect("migrate");
+        let (tenant, lena, contact) = seed(&db).await;
+        let (other, _, _) = seed(&db).await;
+        Some(Fixture {
+            db,
+            tenant,
+            lena,
+            contact,
+            other,
+        })
+    }
+
+    /// The promise rang at `at` and `loops::initiative` wrote `code` on it.
+    async fn woken(f: &Fixture, run: SequenceRunId, at: DateTime<Utc>, code: &str) {
+        rung(f, run, at).await;
+        woken_outcome(f, run, code).await;
+    }
+
+    async fn chartered(f: &Fixture) {
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        sqlx::query(
+            "INSERT INTO employee_charters (employee_id, tenant_id, role, objective) \
+             VALUES ($1, $2, 'sales-development', '{}'::jsonb)",
+        )
+        .bind(f.lena.as_uuid())
+        .bind(f.tenant.as_uuid())
+        .execute(&mut **tx)
+        .await
+        .expect("charter");
+        tx.commit().await.expect("commit");
+    }
+
+    /// Lena asks the founder something, as `inbound::send` writes it.
+    async fn asked(f: &Fixture, now: DateTime<Utc>) {
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        let thread =
+            inbound::conversation_for(&mut tx, f.lena, Channel::Internal, "founder", None, now)
+                .await
+                .expect("thread");
+        sqlx::query(
+            "INSERT INTO messages (id, tenant_id, conversation_id, employee_id, channel, \
+                                   direction, sender, body, idempotency_key, internal_kind, \
+                                   received_at) \
+             VALUES ($1, $2, $3, $4, 'internal', 'inbound', 'lena', 'should I write to them?', \
+                     $5, 'question', $6)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(f.tenant.as_uuid())
+        .bind(thread.as_uuid())
+        .bind(f.lena.as_uuid())
+        .bind(Uuid::now_v7().to_string())
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .expect("question");
+        tx.commit().await.expect("commit");
+    }
+
+    /// The Gate refused lena a stranger, as the trail records it.
+    async fn refused(f: &Fixture, now: DateTime<Utc>) {
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        sqlx::query(
+            "INSERT INTO audit_log (id, tenant_id, employee_id, decision_id, actor, \
+                                    action_kind, decision, deny_reason_code, occurred_at) \
+             VALUES ($1, $2, $3, $4, 'system', 'send_email', 'deny', $5, $6)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(f.tenant.as_uuid())
+        .bind(f.lena.as_uuid())
+        .bind(Uuid::now_v7())
+        .bind(DenyReason::ContactBudgetExhausted.code())
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .expect("refusal");
+        tx.commit().await.expect("commit");
+    }
+
+    /// **No charter: the run waits, and is replayed the moment one exists.**
+    /// Not before — a blind replay would spend both chances on the same
+    /// absence — and the replayed wake sends and the run finishes.
+    #[tokio::test]
+    async fn no_charter_is_replayed_once_the_charter_is_there() {
+        let Some(f) = fixture_alone("rejeu_charte").await else {
+            return;
+        };
+        let t0 = Utc::now().trunc_subsecs(6);
+        let seq = defined(&f, &[email("hello")]).await;
+        let run = enrolled(&f, seq, t0).await;
+        tick(&f, run, t0).await;
+        woken(&f, run, t0 + TimeDelta::minutes(1), "no_charter").await;
+
+        let t1 = t0 + TimeDelta::minutes(2);
+        let r = tick(&f, run, t1).await;
+        assert_eq!((r.state.as_str(), r.step), ("active", 0));
+        assert_eq!(r.next_at, Some(t1 + WAKE_POLL), "polling, not replaying");
+        assert_eq!(promises(&f, run).await.len(), 1);
+
+        chartered(&f).await;
+        let t2 = t1 + WAKE_POLL;
+        let r = tick(&f, run, t2).await;
+        assert_eq!(r.state, "active");
+        let booked = promises(&f, run).await;
+        assert_eq!(booked.len(), 2, "a new promise for the same step");
+        assert!(!booked[1].1, "not rung yet");
+        assert_eq!(r.next_at, Some(t2 + WAKE_POLL));
+
+        rung(&f, run, t2 + TimeDelta::minutes(1)).await;
+        let t3 = t2 + TimeDelta::minutes(2);
+        assert_eq!(sent_by_lena(&f, "msg-1", t3).await, Some(run));
+        assert_eq!(tick(&f, run, t3).await.state, "done");
+    }
+
+    /// **A spent budget is replayed after midnight UTC, at the feed's hour,
+    /// and never past `SEND_DEADLINE` from the first wake.** The first wake is
+    /// `over_budget`; the replay rings at 8 h the next day and the Gate refuses
+    /// the stranger; the next possible replay is beyond the deadline, so the
+    /// run stops `not_sent` — the reading the founder acts on.
+    #[tokio::test]
+    async fn an_exhausted_budget_is_replayed_after_midnight_and_not_past_the_deadline() {
+        use agentos_domain::policy::PolicyLimits;
+
+        let Some(f) = fixture_alone("rejeu_budget").await else {
+            return;
+        };
+        policy::install(
+            &f.db,
+            f.tenant,
+            policy::Scope::Tenant,
+            &PolicyLimits {
+                max_new_contacts_per_day: 5,
+                ..PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("install the policy");
+        let today = Utc::now().date_naive();
+        let at = |days: i64, h: u32, m: u32| {
+            (today + TimeDelta::days(days))
+                .and_hms_opt(h, m, 0)
+                .expect("time")
+                .and_utc()
+        };
+        let seq = defined(&f, &[email("hello")]).await;
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        set_feed(
+            &mut tx,
+            seq,
+            &Feed {
+                employee_id: f.lena,
+                per_day: 1,
+                hour: 8,
+                segment: "airline".to_owned(),
+                countries: Vec::new(),
+                source: None,
+            },
+            today,
+        )
+        .await
+        .expect("feed");
+        tx.commit().await.expect("commit");
+
+        let t0 = at(0, 10, 0);
+        let run = enrolled(&f, seq, t0).await;
+        tick(&f, run, t0).await;
+        woken(&f, run, at(0, 10, 1), "over_budget").await;
+        let r = tick(&f, run, at(0, 10, 2)).await;
+        assert_eq!(r.state, "active");
+        assert_eq!(
+            r.next_at,
+            Some(at(1, 8, 0) + WAKE_POLL),
+            "tomorrow, at the feed's hour"
+        );
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        let ats: Vec<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT at FROM appointments WHERE sequence_run_id = $1 ORDER BY at",
+        )
+        .bind(run.as_uuid())
+        .fetch_all(&mut **tx)
+        .await
+        .expect("promises");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(ats, [t0, at(1, 8, 0)]);
+        // Before it rings, ticks change nothing.
+        tick(&f, run, at(0, 23, 0)).await;
+        assert_eq!(promises(&f, run).await.len(), 2);
+
+        // It rings, the turn runs, the Gate refuses the sixth stranger.
+        rung(&f, run, at(1, 8, 1)).await;
+        refused(&f, at(1, 8, 1)).await;
+        woken_outcome(&f, run, "turn").await;
+        let r = tick(&f, run, at(1, 8, 2)).await;
+        assert_eq!(
+            (r.state.as_str(), r.stop_reason.as_deref()),
+            ("stopped", Some("not_sent")),
+            "the day after is past SEND_DEADLINE from the first wake"
+        );
+        assert_eq!(promises(&f, run).await.len(), 2, "nothing more was booked");
+    }
+
+    /// Only the outcome, on a promise that already rang.
+    async fn woken_outcome(f: &Fixture, run: SequenceRunId, code: &str) {
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        let n = sqlx::query(
+            "UPDATE appointments SET outcome = $2 \
+              WHERE sequence_run_id = $1 AND rang_at IS NOT NULL AND outcome IS NULL",
+        )
+        .bind(run.as_uuid())
+        .bind(code)
+        .execute(&mut **tx)
+        .await
+        .expect("outcome")
+        .rows_affected();
+        tx.commit().await.expect("commit");
+        assert_eq!(n, 1);
+    }
+
+    /// **A question to the founder is a decision, not a fault.** The run stops
+    /// `declined` on the next poll, and the reading says so.
+    #[tokio::test]
+    async fn a_question_to_the_founder_stops_the_run_at_once_as_declined() {
+        let Some(f) = fixture_alone("rejeu_question").await else {
+            return;
+        };
+        let t0 = Utc::now().trunc_subsecs(6);
+        let seq = defined(&f, &[email("hello"), wait(24), email("again")]).await;
+        let run = enrolled(&f, seq, t0).await;
+        tick(&f, run, t0).await;
+        rung(&f, run, t0 + TimeDelta::minutes(1)).await;
+        asked(&f, t0 + TimeDelta::minutes(2)).await;
+        woken_outcome(&f, run, "turn").await;
+        let r = tick(&f, run, t0 + TimeDelta::minutes(3)).await;
+        assert_eq!(
+            (r.state.as_str(), r.stop_reason.as_deref(), r.step),
+            ("stopped", Some("declined"), 0)
+        );
+        assert!(r.ended_at.is_some());
+        assert_eq!(promises(&f, run).await.len(), 1, "not replayed");
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        let listed = runs(&mut tx, seq).await.expect("runs");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(listed[0].stop_reason.as_deref(), Some("declined"));
+    }
+
+    /// **Two replays at most, and an unknown turn gets one.** Three `error`
+    /// wakes in a row end `not_sent`; a `turn` that neither sent nor asked is
+    /// tried once more, then `not_sent`.
+    #[tokio::test]
+    async fn an_error_is_replayed_twice_at_most_and_an_unknown_turn_once() {
+        let Some(f) = fixture_alone("rejeu_borne").await else {
+            return;
+        };
+        let t0 = Utc::now().trunc_subsecs(6);
+        let seq = defined(&f, &[email("hello")]).await;
+        let run = enrolled(&f, seq, t0).await;
+        tick(&f, run, t0).await;
+        let mut t = t0;
+        for replay in 1..=MAX_REPLAYS {
+            woken(&f, run, t + TimeDelta::minutes(1), "error").await;
+            t += TimeDelta::minutes(2);
+            let r = tick(&f, run, t).await;
+            assert_eq!(r.state, "active", "replay {replay}");
+            assert_eq!(promises(&f, run).await.len(), replay + 1);
+            assert_eq!(r.next_at, Some(t + WAKE_POLL), "replayed at once");
+        }
+        woken(&f, run, t + TimeDelta::minutes(1), "error").await;
+        let r = tick(&f, run, t + TimeDelta::minutes(2)).await;
+        assert_eq!(
+            (r.state.as_str(), r.stop_reason.as_deref()),
+            ("stopped", Some("not_sent"))
+        );
+        assert_eq!(promises(&f, run).await.len(), MAX_REPLAYS + 1);
+
+        let seq = defined(&f, &[email("hello")]).await;
+        let t1 = t + TimeDelta::hours(1);
+        let run = enrolled(&f, seq, t1).await;
+        tick(&f, run, t1).await;
+        woken(&f, run, t1 + TimeDelta::minutes(1), "turn").await;
+        assert_eq!(
+            tick(&f, run, t1 + TimeDelta::minutes(2)).await.state,
+            "active"
+        );
+        assert_eq!(promises(&f, run).await.len(), 2, "one more try");
+        woken(&f, run, t1 + TimeDelta::minutes(3), "turn").await;
+        let r = tick(&f, run, t1 + TimeDelta::minutes(4)).await;
+        assert_eq!(
+            (r.state.as_str(), r.stop_reason.as_deref()),
+            ("stopped", Some("not_sent"))
+        );
+        assert_eq!(promises(&f, run).await.len(), 2);
     }
 
     /// **A run keeps its arm, the wake carries that arm's brief, and the

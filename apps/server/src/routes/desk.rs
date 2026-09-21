@@ -548,6 +548,13 @@ impl From<Refusal> for ApiError {
                 "recipient_policy_unusable",
                 "that employee's policy cannot be read, so nothing can be sent to it",
             ),
+            // One open question per colleague per day, for a chair as for a
+            // seat: the rule lives in `inbound::send` and this is its status.
+            InternalError::StillPending => Self::conflict(
+                "question_still_pending",
+                "this seat's previous question to that colleague is still unanswered",
+            )
+            .with_detail(err.to_string()),
             // Not reachable: `handover` is not in `Kind`, so neither refusal
             // about one can be produced from here. Mapped rather than asserted,
             // because a refusal that escaped should be a status and not a panic.
@@ -817,6 +824,21 @@ mod tests {
         // m.id` with `a.answers_message_id IS NOT NULL` survived the whole file
         // green. Two questions and one answer is the smallest shape that can
         // tell the two apart.
+        //
+        // Aged a day first: since 2026-09-21 `inbound::send` refuses a seat's
+        // second question to the same colleague while the first is unanswered
+        // and younger than `QUESTION_PATIENCE` — the twenty-five identical
+        // status checks of one night. Two open questions is still the shape
+        // this test needs, so the first one is made old enough to ask again.
+        let mut tx = db.tenant_tx(h.a).await.expect("tx");
+        sqlx::query(
+            "UPDATE messages SET created_at = created_at - interval '25 hours' WHERE id = $1",
+        )
+        .bind(asked)
+        .execute(&mut **tx)
+        .await
+        .expect("age the first question");
+        tx.commit().await.expect("commit");
         let also_asked = escalate(&h, sdr, "founder", STILL_OPEN).await;
 
         // Before this endpoint the founder's only view of this was a *count*

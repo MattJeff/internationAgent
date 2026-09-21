@@ -332,6 +332,19 @@ pub struct Config {
     /// was open". Set it and the scrape works; the operator learns which it is
     /// from one `warn` at boot.
     pub metrics_key: Option<String>,
+    /// `AGENTOS_APPROVAL_NOTIFY` — l'adresse du fondateur, à qui la
+    /// plate-forme écrit quand une approbation entre dans la file avec son
+    /// brouillon (`agentos_app::effects::notify_approver`).
+    ///
+    /// **Absente = pas d'envoi, et une ligne INFO au démarrage qui le dit.**
+    /// Pas un refus de démarrage : une file que seul `approvals_list` montre
+    /// est l'état d'hier, elle marche, elle est seulement lente à mourir. Une
+    /// variable serveur et pas une colonne par locataire, parce que le seul
+    /// déploiement qui existe a un fondateur ; le jour où deux locataires
+    /// veulent deux boîtes, c'est une migration et pas un second nom de
+    /// variable. Une valeur qui n'est pas une adresse est un refus de
+    /// démarrage nommant la variable, jamais la valeur.
+    pub approval_notify: Option<String>,
     /// `CAPTCHA_API_KEY=<fournisseur>:<clé>` — le solveur de captcha, quand le
     /// client en paie un.
     ///
@@ -562,6 +575,20 @@ impl Config {
                 ),
             });
         }
+
+        // Le fondateur. Validée ici comme une adresse, parce qu'une faute de
+        // frappe découverte à la première approbation retenue est une lettre
+        // que personne ne reçoit pendant 24 h.
+        let approval_notify = get("AGENTOS_APPROVAL_NOTIFY")
+            .map(|raw| {
+                agentos_domain::action::EmailAddress::parse(&raw)
+                    .map(|address| address.to_string())
+                    .map_err(|err| ConfigError::Invalid {
+                        var: "AGENTOS_APPROVAL_NOTIFY",
+                        detail: format!("not an email address: {err}"),
+                    })
+            })
+            .transpose()?;
 
         // The model, before the mock guard: a typo'd backend name is a more
         // useful message than "the llm would run as a mock".
@@ -830,6 +857,7 @@ impl Config {
             api_keys,
             platform_keys,
             metrics_key,
+            approval_notify,
             captcha,
             mock_adapters,
             credentials,
@@ -936,6 +964,21 @@ impl Config {
                  with POST /v1/platform/webhooks, which is the other half of this and is not \
                  visible from here."
             );
+        }
+        // INFO et pas WARN : une file que seul `approvals_list` montre est
+        // l'état d'hier, elle marche. Mais dite, parce qu'une approbation qui
+        // meurt sans que personne ne l'ait vue ne laisse aucune trace ailleurs.
+        match &self.approval_notify {
+            Some(address) => tracing::info!(
+                to = %address,
+                "AGENTOS_APPROVAL_NOTIFY is set: every approval that enters the queue with a \
+                 draft is mailed to this address"
+            ),
+            None => tracing::info!(
+                "AGENTOS_APPROVAL_NOTIFY is unset: no mail leaves when an approval enters the \
+                 queue; it waits on approvals_list for up to 24 h. Set it to the founder's \
+                 address to be written to."
+            ),
         }
     }
 }
@@ -1357,6 +1400,38 @@ mod tests {
         assert!(
             !format!("{config:?}").contains(SECRET),
             "Debug printed the metrics key"
+        );
+    }
+
+    /// Absente = personne n'est écrit, et ce n'est pas un refus ; une valeur
+    /// qui n'est pas une adresse est refusée par le nom de la variable, pas
+    /// à la première approbation retenue.
+    #[test]
+    fn the_approval_notify_address_is_absent_by_default_and_refuses_a_non_address() {
+        let mut env = complete();
+        assert!(parse(&env).expect("valid").approval_notify.is_none());
+
+        env.insert("AGENTOS_APPROVAL_NOTIFY", "pas une adresse".to_owned());
+        let err = parse(&env).expect_err("a non-address must not start");
+        assert!(
+            matches!(
+                err,
+                ConfigError::Invalid {
+                    var: "AGENTOS_APPROVAL_NOTIFY",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+
+        env.insert(
+            "AGENTOS_APPROVAL_NOTIFY",
+            "Fondateur@Acme.example".to_owned(),
+        );
+        assert_eq!(
+            parse(&env).expect("valid").approval_notify.as_deref(),
+            Some("fondateur@acme.example"),
+            "stored normalised, the way every other address is"
         );
     }
 

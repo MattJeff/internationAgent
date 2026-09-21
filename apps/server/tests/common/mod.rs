@@ -29,6 +29,9 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// The whole server harness `end_to_end.rs` used to own — see its own header.
+pub mod harness;
+
 /// A private database's name: **this run's own database, then a tag, then who
 /// and which**.
 ///

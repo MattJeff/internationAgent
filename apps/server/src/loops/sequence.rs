@@ -10,6 +10,12 @@
 //! ce qui coûte de l'argent ou touche un inconnu est ailleurs, derrière la
 //! Gate.
 //!
+//! Elle ne lit pas non plus l'issue d'un réveil. Un run dont la promesse est
+//! posée revient ici toutes les `sequence::WAKE_POLL` par son `next_at`, et
+//! c'est `advance` qui relit `appointments.outcome` et décide — rejouer,
+//! `declined`, `not_sent` (« Rejouer, ou pas », en tête de
+//! `agentos_app::sequence`). Rien à joindre ici, rien à savoir.
+//!
 //! # Comment elle traverse les locataires
 //!
 //! Le même geste que `provisioning` : une lecture sous

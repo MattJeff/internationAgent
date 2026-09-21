@@ -2630,10 +2630,19 @@ impl Turn {
                 // `to` vient de la décision, pas du modèle — la même valeur que
                 // `send_email` lira sur le jeton — donc l'adresse montrée est
                 // l'adresse servie.
+                //
+                // Et le fil : `in_reply_to` est celui que `reply_target` vient
+                // de trouver, ici, dans le tour qui sait sur quel message il
+                // s'est réveillé. Sans lui, la lettre que le fondateur valide
+                // part en message neuf — le prospect voit un inconnu qui écrit
+                // deux fois, pas une réponse (`reponse_validee.rs` l'a mesuré).
+                // Une chaîne comme les autres : la route qui l'envoie ne
+                // reconstruit rien, elle lit la ligne.
                 let draft = json!({
                     "to": to.to_string(),
                     "subject": body.subject,
                     "body": body.body_text,
+                    "in_reply_to": body.in_reply_to.as_ref().map(|id| id.as_str()),
                 });
                 let sent = gated!(
                     self,

@@ -47,6 +47,7 @@
 use std::sync::Arc;
 
 use agentos_domain::action::{Action, Domain, E164, EmailAddress, McpTool};
+use agentos_domain::employee::Employee;
 use agentos_domain::ids::{
     AppointmentId, ApprovalId, DecisionId, IdempotencyKey, InvoiceId, Slug, WorkItemId,
 };
@@ -68,6 +69,7 @@ use agentos_store::audit::{self, AuditEvent, AuditKind};
 use agentos_store::db::{Db, StoreError, TenantTx};
 use agentos_store::invoices;
 use agentos_store::org;
+use agentos_store::outbox::{self, NewEvent};
 use agentos_store::provisioning;
 use agentos_store::quotes;
 use agentos_store::revenue::RevenueError;
@@ -151,6 +153,24 @@ pub const READ_TOKEN: &str = "read_token";
 /// the caller learns that from a coded refusal rather than from a keystroke that
 /// went somewhere nobody can name.
 pub const NO_LOCATION: &str = "no_location";
+
+/// What [`Effects::read_page`] answers once this employee's reads of a host have
+/// failed `unresolvable` twice today.
+///
+/// Measured the night of 2026-09-20: a `customer-success` seat tried its own
+/// company's apex domain — a sending domain with no A record, not a site — on
+/// every tick, twenty times, and each failure became a message to the founder.
+/// DNS does not change between ticks. Two identical answers in a day is the
+/// host saying it is not there; the third attempt is refused here, without a
+/// browser, and the code tells the model to stop rather than rephrase the URL.
+/// Per host and per day: it lifts at UTC midnight by itself, and a different
+/// host is a different question.
+pub const SITE_UNRESOLVABLE_TODAY: &str = "site_unresolvable_today";
+
+/// How many `unresolvable` answers from one host in a day
+/// [`SITE_UNRESOLVABLE_TODAY`] waits for. Two and not one: a resolver can drop
+/// a single lookup.
+const UNRESOLVABLE_STRIKES: i64 = 2;
 
 /// What [`Effects::discover_prospects`] answers when this employee's policy
 /// cannot be loaded at all.
@@ -1149,11 +1169,11 @@ pub enum EffectError {
     /// `add_work_item` in `turn::catalogue` — has produced one all along.
     ///
     /// *Facts about the recipient.* [`Effects::send_internal`] maps every
-    /// [`InternalError`] but `Store`, which is **six** and not four: no such
+    /// [`InternalError`] but `Store`, which is **seven** and not four: no such
     /// colleague on this employee's team, an answer to a question nobody asked
     /// it, somebody else's thread, a handover to a seat that owns nothing, a
-    /// recipient whose policy will not load, and a colleague with no turns left
-    /// in its day. [`Effects::post_work`] maps the same enum, from
+    /// recipient whose policy will not load, a colleague with no turns left
+    /// in its day, and a question put again while the last one is unanswered. [`Effects::post_work`] maps the same enum, from
     /// `inbound::may_assign`, and can only ever reach `unreachable_colleague`
     /// through it — `may_assign` calls two functions that fail with
     /// `StoreError` and returns `Unreachable` itself, so that is its whole
@@ -1428,10 +1448,34 @@ impl Effects {
     /// named where it bites: `routes::approvals::approve` refuses to send an
     /// approval that carries no draft, so the worst case is a row an approver
     /// cannot act on rather than a letter nobody read going out.
+    ///
+    /// # Et l'événement qui fait sortir la ligne de la file
+    ///
+    /// `approvals_list` montre la ligne à qui la consulte, et personne ne la
+    /// consulte : un jeton dure 24 h et une réponse chaude peut mourir dans
+    /// une file que personne ne regarde. Alors la transaction qui pose le
+    /// brouillon dépose aussi [`APPROVAL_REQUESTED_EVENT`] dans l'outbox — ici
+    /// et pas dans `gate::request_approval`, parce que c'est ici que les mots
+    /// existent : un gestionnaire réveillé sur la ligne de la Gate pourrait
+    /// lire la ligne avant que le brouillon y soit, et une approbation de
+    /// paiement n'a jamais de brouillon à montrer. Une transaction, deux
+    /// lignes : un brouillon sans événement serait une lettre que le fondateur
+    /// ne voit pas, un événement sans brouillon une lettre qu'il ne peut pas
+    /// lire. `dedupe_key` sur l'`id` : le rejeu d'une transaction ne double
+    /// pas le courrier.
     pub async fn attach_email_draft(&self, id: ApprovalId, draft: &Value) -> bool {
         let attached = async {
             let mut tx = self.db.tenant_tx(self.principal.tenant_id).await.ok()?;
             let done = approvals::attach_draft(&mut tx, id, draft).await.ok()?;
+            if done {
+                let mut event = NewEvent::new("approval", id.as_uuid(), APPROVAL_REQUESTED_EVENT);
+                event.dedupe_key = Some(format!("{APPROVAL_REQUESTED_EVENT}:{}", id.as_uuid()));
+                event.payload = json!({
+                    "employee_id": self.principal.employee_id.as_uuid(),
+                    "draft": draft,
+                });
+                outbox::enqueue(&mut tx, &event, Utc::now()).await.ok()?;
+            }
             tx.commit().await.ok()?;
             Some(done)
         }
@@ -2746,6 +2790,9 @@ impl Effects {
         if !within(url.host_str(), allowed) {
             return Err(EffectError::OutOfScope(allowed.clone()));
         }
+        if self.unresolvable_today(allowed).await? >= UNRESOLVABLE_STRIKES {
+            return Err(EffectError::Refused(SITE_UNRESOLVABLE_TODAY));
+        }
         let session = self.browser_session().await?;
         match self
             .ports
@@ -2791,6 +2838,39 @@ impl Effects {
             // Only a broken adapter answers a text read with something else.
             _ => Err(EffectError::Refused("not_text")),
         }
+    }
+
+    /// How many of this employee's reads on `domain` failed `unresolvable`
+    /// since UTC midnight — read off the audit trail, which is where
+    /// [`Effects::record`] wrote them. See [`SITE_UNRESOLVABLE_TODAY`].
+    async fn unresolvable_today(&self, domain: &Domain) -> Result<i64, EffectError> {
+        let day_start = Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap_or_default()
+            .and_utc();
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+        let strikes: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log \
+              WHERE employee_id = $1 \
+                AND action_kind = 'provider_call_attempted' \
+                AND occurred_at >= $2 \
+                AND payload->>'effect' = 'browser_read' \
+                AND payload->>'error' = 'unresolvable' \
+                AND payload->'detail'->>'domain' = $3",
+        )
+        .bind(self.principal.employee_id.as_uuid())
+        .bind(day_start)
+        .bind(domain.as_str())
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|err| EffectError::Unavailable(err.into()))?;
+        let _ = tx.rollback().await;
+        Ok(strikes)
     }
 
     /// File a document a navigation brought back, and tell the model about it
@@ -3627,10 +3707,11 @@ impl Effects {
                     InternalError::Store(err) => EffectError::Unavailable(err),
                     // Unreachable colleague, unanswerable question, somebody
                     // else's thread, not the owner, a colleague out of turns, a
-                    // recipient whose policy will not load. **Six**, not the
-                    // four this comment used to name — the arm catches every
-                    // `InternalError` but `Store`, and two were missing. All six
-                    // are the world saying no to something the policy allows.
+                    // recipient whose policy will not load, a question still
+                    // pending. **Seven**, not the four this comment used to
+                    // name — the arm catches every `InternalError` but `Store`.
+                    // All seven are the world saying no to something the
+                    // policy allows.
                     refused => EffectError::Refused(refused.code()),
                 })
             }
@@ -4388,6 +4469,76 @@ fn message_detail(sent: &Result<ProviderMessageId, EffectError>) -> Option<Value
     sent.as_ref()
         .ok()
         .map(|id| json!({ "provider_message_id": id.as_str() }))
+}
+
+// ---------------------------------------------------------------------------
+// La plate-forme écrit au fondateur
+// ---------------------------------------------------------------------------
+
+/// Type d'événement outbox déposé par [`Effects::attach_email_draft`] : une
+/// approbation porte maintenant un brouillon qu'un humain peut lire.
+pub const APPROVAL_REQUESTED_EVENT: &str = "approval.requested";
+
+/// Écrire au fondateur qu'une lettre attend son accord.
+///
+/// **Pas un effet, et pas de jeton** : la Gate juge ce qu'un siège fait à un
+/// inconnu — une adresse qu'un modèle a choisie, un budget de démarchage, une
+/// teinte. Ici c'est la plate-forme qui écrit à l'opérateur, à une adresse
+/// qu'il a posée lui-même dans la configuration (`AGENTOS_APPROVAL_NOTIFY`)
+/// et qu'aucun modèle n'a vue ; il n'y a rien à statuer, et une politique
+/// qui exigerait une relecture pour prévenir le relecteur ne finirait jamais.
+/// Ni ligne `provider_intents`, ni jeton de désinscription, ni contrôle de
+/// délivrabilité : les trois sont pour le courrier vers des tiers, et le
+/// fondateur n'en est pas un.
+///
+/// L'expéditeur est l'adresse du siège demandeur sur la primaire vérifiée du
+/// locataire — la même que ses propres lettres portent. Idempotent par
+/// approbation : la clé est dérivée de l'`id`, et le port promet qu'une même
+/// clé ne part pas deux fois (l'outbox rejoue ; le mock et Resend tiennent la
+/// promesse).
+///
+/// Le corps porte le brouillon **intégral** — à qui, objet, texte — et les
+/// deux gestes tels que le fondateur les tape, parce que c'est la seule chose
+/// qu'il aura sous les yeux.
+pub async fn notify_approver(
+    ports: &Ports,
+    notify: &str,
+    seat: &Employee,
+    approval: Uuid,
+    draft: &Value,
+) -> Result<ProviderMessageId, ProviderError> {
+    let text = |key: &str| draft.get(key).and_then(Value::as_str).unwrap_or("?");
+    let (to, subject, body) = (text("to"), text("subject"), text("body"));
+    let slug = seat.slug();
+    let email = OutboundEmail {
+        from: seat.address().to_string(),
+        to: vec![notify.to_owned()],
+        subject: format!("[approbation] {slug} veut écrire à {to} : {subject}"),
+        body_text: format!(
+            "Le siège {slug} a rédigé un e-mail que la politique retient pour relecture.\n\
+             Approbation : {approval}\n\
+             Elle expire 24 h après son dépôt ; passé ce délai, seule approvals_deny la \
+             retire de la file.\n\
+             \n\
+             À : {to}\n\
+             Objet : {subject}\n\
+             \n\
+             {body}\n\
+             \n\
+             --\n\
+             Pour l'envoyer tel quel, avec votre clé d'approbateur (pas celle du siège : \
+             un demandeur ne peut pas approuver sa propre demande) :\n\
+             approvals_approve id=\"{approval}\" \
+             action={{\"action\":\"email_send\",\"to\":\"{to}\"}}\n\
+             Pour le refuser :\n\
+             approvals_deny id=\"{approval}\"\n"
+        ),
+        in_reply_to: None,
+        unsubscribe_token: None,
+        attachments: Vec::new(),
+    };
+    let key = IdempotencyKey::for_step(seat.id(), &format!("approval-notify:{approval}"));
+    ports.email.send(&key, &email).await
 }
 
 // ---------------------------------------------------------------------------
@@ -7459,6 +7610,111 @@ mod tests {
         }
     }
 
+    /// A host that does not resolve, counting how often it was asked.
+    struct DeadHostBrowser(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl BrowserProvider for DeadHostBrowser {
+        async fn ensure_context(
+            &self,
+            _ctx: &agentos_providers::EnsureCtx,
+        ) -> Result<agentos_providers::Provisioned, ProviderError> {
+            Ok(agentos_providers::Provisioned::new("mock-browser", "ctx-1"))
+        }
+
+        async fn act(
+            &self,
+            _session: &BrowserSession,
+            _step: BrowserStep<'_>,
+        ) -> Result<BrowserOutcome, ProviderError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ProviderError::Terminal {
+                code: "unresolvable",
+            })
+        }
+
+        async fn release(&self, _binding: &ProviderBinding) -> Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
+    /// **Un hôte qui ne résout pas deux fois dans la journée n'est plus tenté
+    /// une troisième.** Le 2026-09-20 un siège `customer-success` a lu
+    /// `getorizn.com` — un domaine d'envoi sans enregistrement A — à chaque
+    /// réveil, vingt fois. Le troisième essai est refusé ici sans navigateur,
+    /// avec un code fermé, et la ligne d'audit le porte.
+    #[tokio::test]
+    async fn un_hote_introuvable_deux_fois_nest_plus_tente_dans_la_journee() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let browser = Arc::new(DeadHostBrowser(std::sync::atomic::AtomicUsize::new(0)));
+        let effects = Effects::new(
+            db.clone(),
+            ports_browsing(browser.clone()),
+            principal.clone(),
+        );
+        provision_browser(&db, &principal).await;
+        let reading = || BrowserRead {
+            domain: Domain::parse("portal.example.com").expect("domain"),
+        };
+        let url = Url::parse("https://portal.example.com/").expect("url");
+
+        for strike in 1..=2 {
+            let token = gate(&db)
+                .authorize(&principal, reading())
+                .await
+                .expect("ok");
+            let err = effects
+                .read_page(token, &url, "body")
+                .await
+                .expect_err("the host does not resolve");
+            assert_eq!(err.code(), "unresolvable", "strike {strike}");
+        }
+        let token = gate(&db)
+            .authorize(&principal, reading())
+            .await
+            .expect("ok");
+        let err = effects
+            .read_page(token, &url, "body")
+            .await
+            .expect_err("the third read is refused before the browser");
+        assert_eq!(err.code(), SITE_UNRESOLVABLE_TODAY);
+        assert_eq!(
+            browser.0.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the browser must not be asked a third time"
+        );
+
+        // Another host is another question.
+        let token = gate(&db)
+            .authorize(
+                &principal,
+                BrowserRead {
+                    domain: Domain::parse("other.example.com").expect("domain"),
+                },
+            )
+            .await
+            .expect("ok");
+        let err = effects
+            .read_page(
+                token,
+                &Url::parse("https://other.example.com/").expect("url"),
+                "body",
+            )
+            .await
+            .expect_err("still dead, but this host has not been tried");
+        assert_eq!(err.code(), "unresolvable");
+
+        let rows = effect_rows(&db, &principal).await;
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows[2].1["error"],
+            json!(SITE_UNRESOLVABLE_TODAY),
+            "{}",
+            rows[2].1
+        );
+    }
+
     /// **A tariff is a PDF, and until 2026-09-10 that read answered
     /// `navigation_failed`.** Now the bytes go to the classeur and the model
     /// gets a sentence made of three things we measured — a type, a length,
@@ -8358,5 +8614,128 @@ mod tests {
             1,
             "no intent row was opened for a send that did not happen"
         );
+    }
+
+    // -- la plate-forme écrit au fondateur ----------------------------------
+
+    /// **Poser le brouillon dépose l'événement, dans la même transaction, une
+    /// fois.** Sans lui la ligne n'existe que pour `approvals_list`, que
+    /// personne ne lit ; avec lui deux fois, le fondateur reçoit deux lettres.
+    #[tokio::test]
+    async fn poser_un_brouillon_depose_un_evenement_approval_requested_une_fois() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let now = Utc::now();
+
+        let action = Action::EmailSend {
+            to: EmailAddress::parse("claire@example.com").expect("address"),
+        };
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let requested = approvals::create(
+            &mut tx,
+            &approvals::NewApproval {
+                employee_id: Some(principal.employee_id),
+                action: &action,
+                requested_by: "lena",
+                required_role: "approver",
+                reason: None,
+                expires_at: now + TimeDelta::hours(1),
+            },
+            now,
+        )
+        .await
+        .expect("file the approval");
+        tx.commit().await.expect("commit");
+        let id = requested.id();
+
+        let effects = Effects::new(
+            db.clone(),
+            ports(MockEmailProvider::new(), MockPayments::healthy()),
+            principal.clone(),
+        );
+        let draft = json!({ "to": "claire@example.com", "subject": "Re", "body": "Bonjour" });
+        assert!(effects.attach_email_draft(id, &draft).await);
+        // La seconde pose est refusée par `attach_draft`, et ne dépose rien.
+        assert!(!effects.attach_email_draft(id, &draft).await);
+
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let events: Vec<(String, Value)> =
+            sqlx::query_as("SELECT event_type, payload FROM outbox_events WHERE aggregate_id = $1")
+                .bind(id.as_uuid())
+                .fetch_all(&mut **tx)
+                .await
+                .expect("read the outbox");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].0, APPROVAL_REQUESTED_EVENT);
+        assert_eq!(events[0].1["draft"], draft);
+        assert_eq!(
+            events[0].1["employee_id"],
+            json!(principal.employee_id.as_uuid())
+        );
+    }
+
+    /// **Le fondateur reçoit l'`id`, le brouillon intégral et les deux gestes ;
+    /// un rejeu n'envoie pas deux fois.**
+    #[tokio::test]
+    async fn le_fondateur_recoit_le_brouillon_et_les_deux_gestes_une_fois() {
+        let email = Arc::new(MockEmailProvider::new());
+        let ports = Ports {
+            email: email.clone(),
+            ..crate::mocks::ports()
+        };
+        let now = Utc::now();
+        let seat = Employee::new(
+            EmployeeId::new_v7(now),
+            TenantId::new_v7(now),
+            slug("lena"),
+            Domain::parse("acme.example.com").expect("domain"),
+            now,
+        );
+        let approval = Uuid::now_v7();
+        let draft = json!({
+            "to": "claire@example.com",
+            "subject": "Re : votre demande",
+            "body": "Bonjour Claire,\n\nOui, jeudi 10 h convient.",
+        });
+
+        for _ in 0..2 {
+            notify_approver(
+                &ports,
+                "fondateur@acme.example.com",
+                &seat,
+                approval,
+                &draft,
+            )
+            .await
+            .expect("notify");
+        }
+        assert_eq!(
+            email.sent_count(),
+            1,
+            "un rejeu de l'outbox n'écrit pas deux fois"
+        );
+
+        let sent = email.sent_emails();
+        let mail = &sent[0];
+        assert_eq!(mail.to, vec!["fondateur@acme.example.com".to_owned()]);
+        assert_eq!(mail.from, "lena@acme.example.com");
+        assert!(mail.subject.contains("lena") && mail.subject.contains("claire@example.com"));
+        for needle in [
+            &approval.to_string(),
+            "À : claire@example.com",
+            "Objet : Re : votre demande",
+            "Oui, jeudi 10 h convient.",
+            "approvals_approve id=",
+            "approvals_deny id=",
+            "clé d'approbateur",
+            r#"{"action":"email_send","to":"claire@example.com"}"#,
+        ] {
+            assert!(
+                mail.body_text.contains(needle),
+                "{needle:?} absent de :\n{}",
+                mail.body_text
+            );
+        }
     }
 }
