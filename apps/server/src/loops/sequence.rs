@@ -236,6 +236,7 @@ mod tests {
                     variants: Vec::new(),
                 },
             ],
+            None,
         )
         .await
         .expect("define");
@@ -353,6 +354,7 @@ mod tests {
                 brief: Some("hello".to_owned()),
                 variants: Vec::new(),
             }],
+            None,
         )
         .await
         .expect("define");

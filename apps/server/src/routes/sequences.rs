@@ -42,6 +42,9 @@ pub fn router(db: Db) -> Router {
 struct NewSequence {
     name: String,
     steps: Vec<Step>,
+    /// Le palier Stripe que cette séquence accueille (`0114`) ; absent, ce
+    /// n'est pas un parcours d'accueil.
+    welcomes_tier: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -71,16 +74,21 @@ async fn define(
         return Err(ApiError::bad_request("`name` is 1 to 200 characters"));
     }
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
-    let id = sequence::define(&mut tx, &body.name, &body.steps)
-        .await
-        .map_err(|err| match err {
-            DefineError::Invalid(why) => ApiError::bad_request(why.to_string()),
-            DefineError::NameTaken => ApiError::conflict(
-                "name_taken",
-                "a live sequence of this company already has this name",
-            ),
-            DefineError::Store(err) => ApiError::from(err),
-        })?;
+    let id = sequence::define(
+        &mut tx,
+        &body.name,
+        &body.steps,
+        body.welcomes_tier.as_deref(),
+    )
+    .await
+    .map_err(|err| match err {
+        DefineError::Invalid(why) => ApiError::bad_request(why.to_string()),
+        DefineError::NameTaken => ApiError::conflict(
+            "name_taken",
+            "a live sequence of this company already has this name",
+        ),
+        DefineError::Store(err) => ApiError::from(err),
+    })?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(json!({ "id": id.as_uuid() }))).into_response())
 }

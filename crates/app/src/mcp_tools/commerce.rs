@@ -405,7 +405,7 @@ pub fn tools() -> Vec<ToolDef> {
             title: "Les séquences de l'entreprise",
             description: "Rend toutes les séquences définies, les vivantes d'abord puis les \
                  archivées, avec leurs pas, leur flux (`feed`, ce que `sequences_feed_set` a \
-                 posé — siège, `per_day`, `hour`, segment, pays, liste — ou null) et `fed_on`, le dernier jour UTC où le flux a inscrit quelqu'un. \
+                 posé — siège, `per_day`, `hour`, segment, pays, liste — ou null), `fed_on`, le dernier jour UTC où le flux a inscrit quelqu'un, et `welcomes_tier` (le palier Stripe qu'elle accueille, ou null). \
                  À appeler avant d'enrôler quelqu'un : c'est là que se lisent l'identifiant \
                  d'une séquence et le nombre de mails qu'elle promet. C'est la source de l'`id` \
                  de `sequences_enroll`, `sequences_feed_set`, `sequences_runs_list` et \
@@ -428,7 +428,14 @@ pub fn tools() -> Vec<ToolDef> {
                  la liste est refusée en 400 si elle est vide, dépasse 12 pas, n'a aucun pas \
                  `email`, saute hors de la liste ou boucle sans `wait` (elle tournerait à chaque \
                  tick), et en 409 `name_taken` si une séquence vivante porte déjà ce nom. Ce que \
-                 chaque variante a donné se lit sur `sequences_variants_measure`.",
+                 chaque variante a donné se lit sur `sequences_variants_measure`. **Avec \
+                 `welcomes_tier`, c'est un parcours d'accueil** : quand un abonnement Stripe de \
+                 ce palier arrive (webhook `customer.subscription.created`), le client est créé \
+                 comme contact et inscrit dessus par le siège `customer-success`, sans dépenser \
+                 un inconnu du jour — un client n'en est pas un. Le palier se nomme comme chez \
+                 Stripe (`price.nickname` en minuscules : `starter`, `gratuit`…) ; `upgrade`, \
+                 `downgrade` et `churned` accueillent un changement de palier et une \
+                 résiliation. Sans séquence pour un palier, rien ne part.",
             method: Method::Post,
             path: "/v1/sequences",
             schema: schema(
@@ -438,6 +445,11 @@ pub fn tools() -> Vec<ToolDef> {
                         "minLength": 1,
                         "maxLength": 200,
                         "description": "Unique parmi les séquences vivantes de l'entreprise."
+                    },
+                    "welcomes_tier": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Le palier Stripe que cette séquence accueille (`price.nickname` en minuscules, ou `lookup_key`, ou l'id du prix), ou `upgrade` / `downgrade` / `churned`. Absent : une séquence de prospection ordinaire."
                     },
                     "steps": {
                         "type": "array",
