@@ -1031,6 +1031,20 @@ pub trait EmailProvider: Send + Sync {
         email: &OutboundEmail,
     ) -> Result<ProviderMessageId, ProviderError>;
 
+    /// The RFC-5322 `Message-ID` of a message [`EmailProvider::send`] sent,
+    /// chevrons included — what a follow-up puts in `In-Reply-To` so it lands
+    /// in the thread of our own first mail. The [`ProviderMessageId`] is the
+    /// provider's handle, not the header; Resend only knows the header after
+    /// the fact. `Ok(None)` when the adapter cannot say: the follow-up leaves
+    /// as a new message, which is what it did before.
+    async fn message_id_of(
+        &self,
+        sent: &ProviderMessageId,
+    ) -> Result<Option<String>, ProviderError> {
+        let _ = sent;
+        Ok(None)
+    }
+
     /// Where the refusals arrive for the mail [`EmailProvider::send`] sends.
     ///
     /// **Required, with no default, no `Option` and no value meaning "not
@@ -1377,6 +1391,13 @@ impl EmailProvider for MockEmailProvider {
 
         self.fault.check_after()?;
         Ok(id)
+    }
+
+    async fn message_id_of(
+        &self,
+        sent: &ProviderMessageId,
+    ) -> Result<Option<String>, ProviderError> {
+        Ok(Some(format!("<{}@mock.example>", sent.as_str())))
     }
 
     fn opt_outs(&self) -> OptOuts {
