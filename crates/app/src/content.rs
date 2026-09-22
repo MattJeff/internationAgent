@@ -483,6 +483,93 @@ fn squeeze(text: &str) -> String {
         .collect()
 }
 
+/// L'autocomplétion de DuckDuckGo : `["graine", ["suggestion", …]]`.
+const SUGGEST_BASE: &str = "https://duckduckgo.com/ac/";
+
+/// Alimenter `search_suggest` : pour chaque question `founder` (la graine),
+/// lire l'autocomplétion du moteur et ajouter ce qui n'existe pas encore —
+/// poids 2, locale de la graine, `cap` nouvelles questions par appel. Rend
+/// combien ont été ajoutées. Un corps qui n'est pas ce JSON vaut zéro
+/// suggestion ; une Gate qui refuse arrête la passe sans erreur.
+///
+/// ponytail: « existe déjà » est [`squeeze`] sur le texte — insensible à la
+/// casse et aux blancs, locale ignorée : la même question dans deux locales
+/// est une ligne de trop, pas deux.
+pub async fn suggest_questions(
+    db: &Db,
+    effects: &Effects,
+    gate: &PolicyGate,
+    cap: usize,
+) -> Result<usize, StoreError> {
+    let base = Url::parse(SUGGEST_BASE).expect("une base constante");
+    suggest_questions_at(db, effects, gate, cap, &base).await
+}
+
+/// [`suggest_questions`], la base déjà construite — pour le faux moteur d'un
+/// test, comme [`measure_page`] pour [`measure`].
+async fn suggest_questions_at(
+    db: &Db,
+    effects: &Effects,
+    gate: &PolicyGate,
+    cap: usize,
+    base: &Url,
+) -> Result<usize, StoreError> {
+    let Some(domain) = base.host_str().and_then(|h| Domain::parse(h).ok()) else {
+        return Ok(0);
+    };
+    let tenant = effects.principal().tenant_id;
+    let mut tx = db.tenant_tx(tenant).await?;
+    let existing = questions::list(&mut tx).await?;
+    tx.commit().await?;
+    let mut known: BTreeSet<String> = existing.iter().map(|q| squeeze(&q.question)).collect();
+
+    let mut added = 0;
+    for seed in existing
+        .iter()
+        .filter(|q| q.source == Source::Founder.as_str())
+    {
+        if added >= cap {
+            break;
+        }
+        let Ok(token) = gate
+            .authorize(
+                effects.principal(),
+                BrowserRead {
+                    domain: domain.clone(),
+                },
+            )
+            .await
+        else {
+            break;
+        };
+        let mut url = base.clone();
+        url.query_pairs_mut()
+            .append_pair("q", &seed.question)
+            .append_pair("type", "list");
+        let Ok(page) = effects.read_page(token, &url, WHOLE_PAGE).await else {
+            continue;
+        };
+        let suggestions =
+            serde_json::from_str::<(String, Vec<String>)>(&page.into_inner_for_rendering())
+                .map(|(_, s)| s)
+                .unwrap_or_default();
+        for suggestion in suggestions {
+            if added >= cap {
+                break;
+            }
+            let text = suggestion.trim();
+            if text.is_empty() || !known.insert(squeeze(text)) {
+                continue;
+            }
+            let mut tx = db.tenant_tx(tenant).await?;
+            questions::add(&mut tx, text, &seed.locale, Source::SearchSuggest, 2).await?;
+            tx.commit().await?;
+            added += 1;
+        }
+    }
+    Ok(added)
+}
+
 pub async fn our_domains(tx: &mut TenantTx<'_>) -> Result<Vec<String>, StoreError> {
     let rows: Vec<(String,)> =
         sqlx::query_as("SELECT DISTINCT site FROM content_repos WHERE site IS NOT NULL")
@@ -2738,6 +2825,67 @@ mod tests {
         .await
         .expect("count");
         assert_eq!(fired, 1, "constater, c'est publier : l'événement part");
+    }
+
+    /// L'autocomplétion alimente `search_suggest` : la graine `founder` est
+    /// lue, chaque suggestion nouvelle devient une question au poids 2 dans la
+    /// locale de la graine ; la graine elle-même et un doublon ne sont pas
+    /// ajoutés ; `cap` borne la passe ; rejouer n'ajoute rien.
+    #[tokio::test]
+    async fn lautocompletion_alimente_les_questions_sans_doublon_et_sous_le_plafond() {
+        let Some(db) = db().await else { return };
+        let (principal, _domain) = seed(&db).await;
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        questions::add(&mut tx, "visa api", "fr", Source::Founder, 5)
+            .await
+            .expect("seed question");
+        tx.commit().await.expect("commit");
+
+        let site = static_site(
+            r#"["visa api", ["visa api free", "visa api python", "visa api free"]]"#.to_owned(),
+        )
+        .await;
+        let effects = Effects::new(
+            db.clone(),
+            ports_reading_host("duckduckgo.com", site),
+            principal.clone(),
+        );
+        let gate = PolicyGate::new(db.clone());
+        let base = Url::parse(&format!("http://duckduckgo.com:{}/ac/", site.port())).expect("url");
+
+        // Plafond à 1 : une seule des deux nouvelles.
+        let added = suggest_questions_at(&db, &effects, &gate, 1, &base)
+            .await
+            .expect("suggest");
+        assert_eq!(added, 1, "cap respecté");
+        // Sans plafond : l'autre, et seulement elle.
+        let added = suggest_questions_at(&db, &effects, &gate, 5, &base)
+            .await
+            .expect("suggest");
+        assert_eq!(added, 1);
+
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tenant tx");
+        let all = questions::list(&mut tx).await.expect("list");
+        tx.commit().await.expect("commit");
+        let suggested: Vec<&questions::Question> = all
+            .iter()
+            .filter(|q| q.source == Source::SearchSuggest.as_str())
+            .collect();
+        assert_eq!(all.len(), 3, "{all:?}");
+        assert_eq!(suggested.len(), 2);
+        let mut texts: Vec<&str> = suggested.iter().map(|q| q.question.as_str()).collect();
+        texts.sort_unstable();
+        assert_eq!(texts, ["visa api free", "visa api python"]);
+        for q in &suggested {
+            assert_eq!(q.locale, "fr", "la locale de la graine");
+            assert_eq!(q.weight, 2);
+        }
+
+        // Rejouer : tout existe déjà.
+        let added = suggest_questions_at(&db, &effects, &gate, 5, &base)
+            .await
+            .expect("suggest");
+        assert_eq!(added, 0);
     }
 
     fn fake_results(site: SocketAddr, question: &str) -> Url {

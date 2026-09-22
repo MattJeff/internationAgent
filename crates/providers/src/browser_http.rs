@@ -295,8 +295,13 @@ impl HttpBrowser {
     }
 }
 
-/// `text/*` and XHTML. A missing header is not a page: a server that cannot
-/// say what it sent is not one to parse on faith.
+/// `text/*`, XHTML — and JSON, under the two names a search engine's
+/// autocompletion answers with: `duckduckgo.com/ac/` says
+/// `application/javascript` (measured 2026-09-22), others say
+/// `application/json`. Read as a page, the body is the JSON text itself,
+/// which is what `content::suggest_questions` parses. A missing header is
+/// still not a page: a server that cannot say what it sent is not one to
+/// parse on faith. PDFs and binaries stay refused by name (`NOT_HTML`).
 fn is_page(content_type: Option<&str>) -> bool {
     content_type
         .map(|value| {
@@ -307,7 +312,13 @@ fn is_page(content_type: Option<&str>) -> bool {
                 .trim()
                 .to_ascii_lowercase()
         })
-        .is_some_and(|mime| mime.starts_with("text/") || mime == "application/xhtml+xml")
+        .is_some_and(|mime| {
+            mime.starts_with("text/")
+                || matches!(
+                    mime.as_str(),
+                    "application/xhtml+xml" | "application/json" | "application/javascript"
+                )
+        })
 }
 
 /// The body, refused by the header when it announces its size and by the
@@ -939,7 +950,11 @@ mod tests {
         assert_eq!(text.chars().count(), MAX_TEXT);
         assert!(is_page(Some("Text/HTML; charset=iso-8859-1")));
         assert!(is_page(Some("application/xhtml+xml")));
-        assert!(!is_page(Some("application/json")));
+        // L'autocomplétion de DuckDuckGo se dit `application/javascript`.
+        assert!(is_page(Some("application/javascript")));
+        assert!(is_page(Some("application/json; charset=utf-8")));
+        assert!(!is_page(Some("application/pdf")));
+        assert!(!is_page(Some("application/octet-stream")));
         assert!(!is_page(None));
     }
 }
