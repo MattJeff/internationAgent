@@ -398,6 +398,91 @@ async fn measure_page(
 /// Vide quand aucun dépôt ne déclare son site : [`measure`] rend alors
 /// [`MeasureError::NoDomainOfOurs`], un refus lisible plutôt qu'une mesure
 /// fausse.
+/// **Constater seul qu'un article proposé est en ligne.** Une pull request
+/// fusionnée puis déployée ne prévient personne : jusqu'au 2026-09-22 c'est
+/// une personne qui écrivait l'URL (`PUT /v1/content/drafts/{id}`), et c'est
+/// ce geste-là qui déclenche le post LinkedIn. Ici la boucle de citation
+/// essaie, pour chaque brouillon `proposed`, les deux adresses où un
+/// générateur de site range un article — `/blog/<stem>` puis `/<stem>`,
+/// `<stem>` étant le nom de fichier de la pull request — et tient la page
+/// pour l'article si elle porte le titre. Alors l'URL est constatée par le
+/// même chemin que la main : `drafts::update`, donc `content.published`.
+///
+/// ponytail: deux chemins devinés, pas de champ « préfixe public » sur le
+/// dépôt (ce serait une migration et un schéma d'outil de plus). Le jour où
+/// un site range ailleurs, la main garde le dernier mot.
+pub async fn observe_proposed(
+    db: &Db,
+    effects: &Effects,
+    gate: &PolicyGate,
+    base: &str,
+) -> Result<usize, StoreError> {
+    let Ok(base) = Url::parse(base) else {
+        return Ok(0);
+    };
+    let Some(host) = base.host_str() else {
+        return Ok(0);
+    };
+    let Ok(domain) = Domain::parse(host) else {
+        return Ok(0);
+    };
+    let mut tx = db.tenant_tx(effects.principal().tenant_id).await?;
+    let proposed: Vec<drafts::Draft> = drafts::list(&mut tx)
+        .await?
+        .into_iter()
+        .filter(|d| d.state == "proposed")
+        .collect();
+    tx.commit().await?;
+
+    let mut observed = 0;
+    for draft in proposed {
+        let stem = file_stem(&draft.title, draft.id);
+        let wanted = squeeze(&draft.title);
+        for path in [format!("blog/{stem}"), stem.clone()] {
+            let Ok(url) = base.join(&path) else { continue };
+            let Ok(token) = gate
+                .authorize(
+                    effects.principal(),
+                    BrowserRead {
+                        domain: domain.clone(),
+                    },
+                )
+                .await
+            else {
+                break;
+            };
+            let Ok(page) = effects.read_page(token, &url, WHOLE_PAGE).await else {
+                continue;
+            };
+            if !squeeze(&page.into_inner_for_rendering()).contains(&wanted) {
+                continue;
+            }
+            let mut tx = db.tenant_tx(effects.principal().tenant_id).await?;
+            drafts::update(
+                &mut tx,
+                draft.id,
+                &drafts::Revision {
+                    title: &draft.title,
+                    body: &draft.body,
+                    url: Some(url.as_str()),
+                },
+            )
+            .await?;
+            tx.commit().await?;
+            observed += 1;
+            break;
+        }
+    }
+    Ok(observed)
+}
+
+/// Minuscules, blancs repliés — pour retrouver un titre dans une page.
+fn squeeze(text: &str) -> String {
+    text.split_whitespace()
+        .flat_map(|w| w.chars().flat_map(char::to_lowercase))
+        .collect()
+}
+
 pub async fn our_domains(tx: &mut TenantTx<'_>) -> Result<Vec<String>, StoreError> {
     let rows: Vec<(String,)> =
         sqlx::query_as("SELECT DISTINCT site FROM content_repos WHERE site IS NOT NULL")
@@ -2543,6 +2628,84 @@ mod tests {
     }
 
     /// L'URL du faux moteur : son hôte, le port que le système a donné.
+    fn ports_reading_host(host: &str, site: SocketAddr) -> Arc<Ports> {
+        let browser: Arc<dyn BrowserProvider> =
+            Arc::new(HttpBrowser::new(Arc::new(PinnedHost::new(host, site.ip()))));
+        Arc::new(Ports {
+            browser,
+            ..crate::mocks::ports()
+        })
+    }
+
+    /// Une pull request fusionnée et déployée est constatée sans main : la
+    /// page `/blog/<stem>` porte le titre → `published`, URL écrite,
+    /// `content.published` émis. Une page qui ne porte pas le titre (un 404
+    /// poli, une autre page) ne constate rien.
+    #[tokio::test]
+    async fn a_proposed_article_is_observed_online_by_its_title_and_only_then() {
+        let Some(db) = db().await else { return };
+        let (principal, _) = seed(&db).await;
+        let title = "Vérifier un visa par API";
+        let site = static_site(format!(
+            "<html><body><h1>{title}</h1><p>Le corps.</p></body></html>"
+        ))
+        .await;
+        declare_site(&db, &principal, "acme.example").await;
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let question = questions::add(&mut tx, "q", "fr", Source::Founder, 1)
+            .await
+            .expect("add");
+        let draft = drafts::create(&mut tx, question.id, title, "Le corps.")
+            .await
+            .expect("draft");
+        drafts::propose(&mut tx, draft.id, "https://github.com/acme/site/pull/1")
+            .await
+            .expect("propose")
+            .expect("existe");
+        let other = drafts::create(&mut tx, question.id, "Un autre titre", "Corps.")
+            .await
+            .expect("draft");
+        drafts::propose(&mut tx, other.id, "https://github.com/acme/site/pull/2")
+            .await
+            .expect("propose")
+            .expect("existe");
+        tx.commit().await.expect("commit");
+
+        let effects = Effects::new(
+            db.clone(),
+            ports_reading_host("acme.example", site),
+            principal.clone(),
+        );
+        let base = format!("http://acme.example:{}/", site.port());
+        let observed = observe_proposed(&db, &effects, &PolicyGate::new(db.clone()), &base)
+            .await
+            .expect("observe");
+        assert_eq!(observed, 1, "une page qui porte le titre, et une seule");
+
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let all = drafts::list(&mut tx).await.expect("list");
+        let seen = all.iter().find(|d| d.id == draft.id).expect("le brouillon");
+        assert_eq!(seen.state, "published");
+        let expected = Url::parse(&base)
+            .expect("base")
+            .join(&format!("blog/{}", file_stem(title, draft.id)))
+            .expect("url");
+        assert_eq!(seen.url.as_deref(), Some(expected.as_str()));
+
+        let missed = all.iter().find(|d| d.id == other.id).expect("l'autre");
+        assert_eq!(missed.state, "proposed", "un titre absent ne constate rien");
+        assert!(missed.url.is_none());
+        let fired: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = $2",
+        )
+        .bind(draft.id)
+        .bind(crate::social_post::CONTENT_PUBLISHED_EVENT)
+        .fetch_one(&mut **tx)
+        .await
+        .expect("count");
+        assert_eq!(fired, 1, "constater, c'est publier : l'événement part");
+    }
+
     fn fake_results(site: SocketAddr, question: &str) -> Url {
         let mut url = Engine::DuckDuckGoLite.results_url(question);
         url.set_scheme("http").expect("http");
