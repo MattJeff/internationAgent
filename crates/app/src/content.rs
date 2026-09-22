@@ -2096,8 +2096,12 @@ fn article_branch(draft: Uuid) -> String {
 /// table de translittération ici et rien d'autre à changer.
 fn file_stem(title: &str, draft: Uuid) -> String {
     let mut stem = String::new();
-    for ch in title.chars().flat_map(char::to_lowercase) {
-        if ch.is_alphanumeric() {
+    for ch in title
+        .chars()
+        .flat_map(char::to_lowercase)
+        .flat_map(unaccent)
+    {
+        if ch.is_ascii_alphanumeric() {
             stem.push(ch);
         } else if !stem.ends_with('-') && !stem.is_empty() {
             stem.push('-');
@@ -2109,6 +2113,36 @@ fn file_stem(title: &str, draft: Uuid) -> String {
         return draft.simple().to_string();
     }
     trimmed.to_owned()
+}
+
+/// Le stem est ASCII : « conditions-d-entree-a-l-etranger », pas
+/// « conditions-d-entrée-à-l-étranger ». Mesuré le 2026-09-22 : le fichier
+/// accentué était bien dans le dépôt et listé sur `/blog`, et sa page
+/// répondait 404 — un générateur de site, un navigateur et un CDN ne
+/// s'accordent pas sur l'encodage d'un « é » dans un chemin, et le blog du
+/// client n'a que des slugs ASCII. Les lettres latines accentuées perdent
+/// leur accent ; ce qui n'est pas latin tombe, et un titre sans rien de
+/// latin garde le repli sur l'identifiant.
+fn unaccent(ch: char) -> impl Iterator<Item = char> {
+    let s: &str = match ch {
+        'à' | 'á' | 'â' | 'ä' | 'ã' | 'å' => "a",
+        'ç' => "c",
+        'è' | 'é' | 'ê' | 'ë' => "e",
+        'ì' | 'í' | 'î' | 'ï' => "i",
+        'ñ' => "n",
+        'ò' | 'ó' | 'ô' | 'ö' | 'õ' | 'ø' => "o",
+        'ù' | 'ú' | 'û' | 'ü' => "u",
+        'ý' | 'ÿ' => "y",
+        'æ' => "ae",
+        'œ' => "oe",
+        'ß' => "ss",
+        _ => "",
+    };
+    if s.is_empty() {
+        vec![ch].into_iter()
+    } else {
+        s.chars().collect::<Vec<_>>().into_iter()
+    }
 }
 
 /// De quoi lire le titre dans le nom du fichier, et de quoi tenir dans les 255
@@ -3337,7 +3371,7 @@ mod tests {
         let draft = Uuid::now_v7();
         assert_eq!(
             file_stem("Vérifier un visa par API : le guide", draft),
-            "vérifier-un-visa-par-api-le-guide"
+            "verifier-un-visa-par-api-le-guide"
         );
         // Les tirets ne se suivent pas, et il n'y en a ni au début ni à la fin.
         assert_eq!(file_stem("  ---  A !!! B  ", draft), "a-b");
@@ -3453,7 +3487,7 @@ mod tests {
         );
 
         let branch = format!("article/{}", draft.id.simple());
-        let path = "content/blog/vérifier-un-visa-par-api.md";
+        let path = "content/blog/verifier-un-visa-par-api.md";
 
         // La lecture regarde le chemin de l'article sur la branche qui sert le
         // site — la seule où un article fusionné peut être.
@@ -3733,7 +3767,7 @@ mod tests {
             ]
         );
         // Le même chemin qu'avant, et le `sha` de ce qui est là.
-        assert_eq!(proposal.path, "content/blog/vérifier-un-visa-par-api.md");
+        assert_eq!(proposal.path, "content/blog/verifier-un-visa-par-api.md");
         assert_eq!(github.args(0)["path"], json!(proposal.path));
         assert_eq!(github.args(2)["sha"], json!(HELD_SHA));
         assert_eq!(proposal.review_url, "https://github.com/acme/site/pull/9");
