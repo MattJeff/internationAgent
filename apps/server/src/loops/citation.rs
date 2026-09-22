@@ -127,6 +127,35 @@ pub async fn tick(db: &Db, ports: &Arc<Ports>, now: DateTime<Utc>) -> Result<usi
             }
         }
     }
+    // Et à chaque tour, pas une fois par semaine : les articles proposés dont
+    // la pull request a été fusionnée et déployée se constatent seuls
+    // (`content::observe_proposed`) — c'est ce qui déclenche le post.
+    let mut admin = db.admin_tx_bypassing_rls().await?;
+    let sites = sqlx::query(concat!(
+        "SELECT DISTINCT ON (r.tenant_id) r.tenant_id, r.employee_id, r.site \
+           FROM content_repos r \
+          WHERE r.site IS NOT NULL AND ",
+        agentos_store::not_stopped!("r.tenant_id", "$1::timestamptz"),
+        " ORDER BY r.tenant_id, r.created_at, r.employee_id",
+    ))
+    .bind(now)
+    .fetch_all(&mut *admin)
+    .await?;
+    admin.commit().await?;
+    for row in &sites {
+        let tenant = TenantId::from_uuid(row.get("tenant_id"));
+        let employee: Uuid = row.get("employee_id");
+        let site: String = row.get("site");
+        let base = format!("https://{site}/");
+        let principal = Principal::employee(tenant, EmployeeId::from_uuid(employee));
+        let gate = PolicyGate::new(db.clone());
+        let effects = Effects::new(db.clone(), ports.clone(), principal);
+        match content::observe_proposed(db, &effects, &gate, &base).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(tenant = %tenant, observed = n, "articles observed online"),
+            Err(err) => tracing::warn!(tenant = %tenant, error = %err, "articles not observed"),
+        }
+    }
     Ok(measured)
 }
 
