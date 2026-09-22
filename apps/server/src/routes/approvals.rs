@@ -1458,8 +1458,37 @@ async fn link(
             },
         )
         .into_response(),
-        Err(err) => err.into_response(),
+        // Un navigateur, pas un client d'API : une erreur est une page, jamais
+        // du JSON. Le cas qui revient est le second clic sur un mail déjà
+        // traité — « déjà décidée » n'est pas une panne, c'est une réponse.
+        Err(err) => {
+            let (title, body): (&str, String) = match err.code() {
+                "approval_already_decided" => (
+                    "Déjà décidée",
+                    "Cette approbation a déjà été traitée — rien à refaire. Vous pouvez fermer cet onglet.".to_owned(),
+                ),
+                "approval_expired" => (
+                    "Expirée",
+                    "Cette approbation a dépassé son délai. Le siège proposera de nouveau, ou décidez depuis la console.".to_owned(),
+                ),
+                _ => (
+                    err.title(),
+                    format!(
+                        "{} ({}). Rien n'est parti. Décidez depuis la console, ou réessayez plus tard.",
+                        err.detail().unwrap_or("le serveur a refusé"),
+                        err.code()
+                    ),
+                ),
+            };
+            (err.status(), page(title, &escape(&body))).into_response()
+        }
     }
+}
+
+fn escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// L'action qu'un clic « approuver » rachète : exactement celle que le mail
@@ -2860,8 +2889,11 @@ mod tests {
         assert_eq!(state_of(&db, tenant, id).await, "redeemed");
 
         // Rejoué : rien de plus ne part, et le lien « refuser » ne défait rien.
-        let (status, _) = get(path(&approve_url)).await;
+        // Et la réponse est une page qui le dit, pas du JSON.
+        let (status, page) = get(path(&approve_url)).await;
         assert_ne!(status, StatusCode::OK, "a replayed link was accepted");
+        assert!(page.contains("Déjà décidée"), "{page}");
+        assert!(page.starts_with("<!doctype html>"), "{page}");
         let (status, _) = get(path(&deny_url)).await;
         assert_ne!(status, StatusCode::OK, "a deny link undid an approval");
         assert_eq!(email_port.sent_count(), 1);
