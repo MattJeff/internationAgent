@@ -2691,13 +2691,16 @@ impl Turn {
                 // ensuite à Bob n'attache pas le fil d'Alice à la lettre de
                 // Bob. Une base absente ne fait pas échouer le mail : elle le
                 // fait partir hors fil, ce qu'il faisait déjà hier.
-                if let Some(thread) = self.thread {
-                    body.in_reply_to = self
-                        .effects
-                        .reply_target(thread.message_id, &to)
-                        .await
-                        .unwrap_or_default();
+                //
+                // **Une relance relance.** Sans fil entrant — un pas de
+                // séquence, 72 h après notre premier mail — le fil est le
+                // nôtre : le `Message-ID` de notre dernier envoi à cette
+                // adresse, ou rien pour un premier mail.
+                body.in_reply_to = match self.thread {
+                    Some(thread) => self.effects.reply_target(thread.message_id, &to).await,
+                    None => self.effects.follow_up_target(&self.from, &to).await,
                 }
+                .unwrap_or_default();
                 // **Le brouillon, relevé avant que la macro ne consomme le
                 // corps.** Un tour teinté sur une politique qui demande une
                 // relecture rend `PendingApproval` : la Gate a déposé une ligne
@@ -4738,6 +4741,59 @@ mod tests {
         assert_eq!(finished.trust, TrustLabel::Trusted);
         assert_eq!(h.email.sent_count(), 1);
         assert_eq!(h.payments.calls(), vec!["5000000 to account-X".to_owned()]);
+    }
+
+    /// **Une relance part dans le fil du premier mail.** Un tour sans fil
+    /// entrant — un pas de séquence — qui écrit à quelqu'un à qui ce siège a
+    /// déjà écrit porte en `In-Reply-To` le `Message-ID` de ce premier envoi ;
+    /// à quelqu'un de nouveau, rien, comme avant.
+    #[tokio::test]
+    async fn a_follow_up_without_an_inbound_thread_replies_to_our_own_first_mail() {
+        let Some(db) = db().await else { return };
+        let llm = Arc::new(ScriptedLlm::responses(vec![
+            email_call("toolu_1", "marie@prospect.example"),
+            email_call("toolu_2", "bob@elsewhere.example"),
+            done(),
+        ]));
+        let h = harness(&db, llm, "{}").await;
+
+        // Notre premier mail à Marie, tel que `send_email` l'enregistre.
+        let mut tx = db.tenant_tx(h.principal.tenant_id).await.expect("tx");
+        crate::follow_up::sent(
+            &mut tx,
+            h.principal.employee_id,
+            &"marie@prospect.example".parse().expect("address"),
+            Some("quote"),
+            "first mail",
+            "lena@fabrikam.example",
+            "msg_first",
+            Utc::now() - chrono::Duration::hours(72),
+        )
+        .await
+        .expect("record the first send");
+        tx.commit().await.expect("commit");
+
+        h.turn
+            .run(
+                Context::new().with_task("chase the quote"),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("a trusted run");
+
+        let sent = h.email.sent_emails();
+        assert_eq!(sent.len(), 2, "both letters left");
+        assert_eq!(sent[0].to, vec!["marie@prospect.example".to_owned()]);
+        assert_eq!(
+            sent[0].in_reply_to,
+            Some(ProviderMessageId::new("<msg_first@mock.example>")),
+            "the follow-up threads onto our own first mail"
+        );
+        assert_eq!(sent[1].to, vec!["bob@elsewhere.example".to_owned()]);
+        assert_eq!(
+            sent[1].in_reply_to, None,
+            "a first mail to someone new has no thread to ride"
+        );
     }
 
     /// **The front door, and it is the first thing the guard in [`Turn::propose`]

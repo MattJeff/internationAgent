@@ -1606,6 +1606,33 @@ pub async fn reply_target(
     Ok(found.flatten().map(ProviderRef::new))
 }
 
+/// Le `provider_message_id` du dernier mail que `sender` a envoyé à `to` —
+/// ce sur quoi une relance s'enfile quand aucun message entrant ne l'a
+/// réveillée. [`reply_target`] ne regarde que l'entrant, et un pas de
+/// séquence n'a pas de fil : sans cette lecture la relance partait en message
+/// neuf chez le prospect. `Ok(None)` pour un premier mail, et rien ne change.
+pub async fn last_outbound_to(
+    tx: &mut TenantTx<'_>,
+    sender: &str,
+    to: &EmailAddress,
+) -> Result<Option<ProviderRef>, StoreError> {
+    let found: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT provider_message_id \
+           FROM messages \
+          WHERE direction = 'outbound' \
+            AND channel = 'email' \
+            AND sender = $1 \
+            AND recipients @> jsonb_build_array($2::text) \
+          ORDER BY received_at DESC \
+          LIMIT 1",
+    )
+    .bind(sender)
+    .bind(to.to_string())
+    .fetch_optional(&mut ***tx)
+    .await?;
+    Ok(found.flatten().map(ProviderRef::new))
+}
+
 /// Un clic sur `List-Unsubscribe` devient une ligne de `suppressions`.
 ///
 /// Rend `false` quand le jeton ne désigne personne — jeton inconnu, expiré avec
@@ -6325,6 +6352,59 @@ mod tests {
             reply_target(&mut tx, message_id, &bob).await.expect("read"),
             None,
             "Alice's thread must not ride on a letter to Bob"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// **Une relance s'enfile sur notre dernier envoi à cette adresse**, et
+    /// pas sur celui fait à quelqu'un d'autre.
+    #[tokio::test]
+    async fn a_follow_up_finds_the_last_outbound_to_that_address_and_no_other() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db).await;
+        let now = Utc::now();
+        let marie: EmailAddress = "marie@prospect.example".parse().expect("address");
+        let bob: EmailAddress = "bob@elsewhere.example".parse().expect("address");
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+
+        for (id, at) in [
+            ("msg_first", now - Duration::hours(72)),
+            ("msg_second", now),
+        ] {
+            crate::follow_up::sent(
+                &mut tx,
+                employee,
+                &marie,
+                Some("hello"),
+                "…",
+                "lena@fabrikam.example",
+                id,
+                at,
+            )
+            .await
+            .expect("record the send");
+        }
+
+        assert_eq!(
+            last_outbound_to(&mut tx, "lena@fabrikam.example", &marie)
+                .await
+                .expect("read"),
+            Some(ProviderRef::new("msg_second")),
+            "the newest send to her, not the first"
+        );
+        assert_eq!(
+            last_outbound_to(&mut tx, "lena@fabrikam.example", &bob)
+                .await
+                .expect("read"),
+            None,
+            "nothing was ever sent to Bob"
+        );
+        assert_eq!(
+            last_outbound_to(&mut tx, "other@fabrikam.example", &marie)
+                .await
+                .expect("read"),
+            None,
+            "another seat's letter is not this seat's thread"
         );
         tx.rollback().await.expect("rollback");
     }

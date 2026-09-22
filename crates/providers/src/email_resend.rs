@@ -446,6 +446,9 @@ struct RetrievedEmail {
     attachments: Vec<RetrievedAttachment>,
     #[serde(default)]
     headers: Vec<Header>,
+    /// The RFC-5322 `Message-ID`, chevrons included — only on a sent email,
+    /// and only once Resend has handed it to SES.
+    message_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -580,7 +583,15 @@ impl EmailProvider for ResendEmailProvider {
         let mut headers = serde_json::Map::new();
         if let Some(parent) = &email.in_reply_to {
             // Threading lives in the RFC-5322 headers, not in a Resend field.
-            let reference = serde_json::json!(format!("<{}>", parent.as_str()));
+            // A bare provider id gets its chevrons here; a `Message-ID` read
+            // back through `message_id_of` already carries its own, and
+            // `<<…>>` is a header no client threads on.
+            let parent = parent.as_str();
+            let reference = if parent.starts_with('<') {
+                serde_json::json!(parent)
+            } else {
+                serde_json::json!(format!("<{parent}>"))
+            };
             headers.insert("In-Reply-To".to_owned(), reference.clone());
             headers.insert("References".to_owned(), reference);
         }
@@ -651,6 +662,16 @@ impl EmailProvider for ResendEmailProvider {
 
     fn opt_outs(&self) -> OptOuts {
         Self::OPT_OUTS
+    }
+
+    async fn message_id_of(
+        &self,
+        sent: &ProviderMessageId,
+    ) -> Result<Option<String>, ProviderError> {
+        let email: RetrievedEmail = self
+            .call_json(self.get(&format!("/emails/{}", sent.as_str())))
+            .await?;
+        Ok(email.message_id.filter(|id| !id.is_empty()))
     }
 
     fn verify_webhook(&self, raw_body: &[u8], headers: &WebhookHeaders) -> Result<(), SigError> {
@@ -968,6 +989,13 @@ mod tests {
                 };
                 json(json!({ "id": id }))
             }
+            "GET /emails/email_sent_1" => json(json!({
+                "object": "email",
+                "id": "email_sent_1",
+                "from": "lena@agents.example.com",
+                "to": ["ap@supplier.example"],
+                "message_id": "<0106019a@ap-northeast-1.amazonses.com>",
+            })),
             "GET /emails/email_2" => json(json!({
                 "object": "email",
                 "id": "email_2",
@@ -1518,6 +1546,27 @@ mod tests {
 
     // -- status mapping ----------------------------------------------------
 
+    /// Le `Message-ID` RFC d'un envoi se relit sur `GET /emails/{id}` ; un
+    /// message entrant, qui n'en porte pas, rend `None`.
+    #[tokio::test]
+    async fn the_rfc_message_id_of_a_sent_email_is_read_back_with_its_chevrons() {
+        let fake = FakeResend::start().await;
+        assert_eq!(
+            fake.provider()
+                .message_id_of(&ProviderMessageId::new("email_sent_1"))
+                .await
+                .expect("read"),
+            Some("<0106019a@ap-northeast-1.amazonses.com>".to_owned())
+        );
+        assert_eq!(
+            fake.provider()
+                .message_id_of(&ProviderMessageId::new("email_2"))
+                .await
+                .expect("read"),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn a_429_is_rate_limited_and_a_422_is_terminal() {
         let throttled = FakeResend::with_status(Some(429)).await;
@@ -1665,6 +1714,36 @@ mod tests {
         assert!(
             fake.last_sent().expect("a body").get("headers").is_none(),
             "no thread and no way out means no headers field at all"
+        );
+
+        // Un `Message-ID` relu chez Resend porte déjà ses chevrons : il part
+        // tel quel, pas entre deux paires.
+        fake.provider()
+            .send(
+                &IdempotencyKey::for_step(EmployeeId::new_v7(Utc::now()), "send:cold-3"),
+                &OutboundEmail {
+                    from: "lena@agents.example.com".to_owned(),
+                    to: vec!["ap@supplier.example".to_owned()],
+                    subject: "hello".to_owned(),
+                    body_text: "…".to_owned(),
+                    in_reply_to: Some(ProviderMessageId::new(
+                        "<0106019a@ap-northeast-1.amazonses.com>",
+                    )),
+                    unsubscribe_token: None,
+                    body_html: None,
+                    attachments: Vec::new(),
+                },
+            )
+            .await
+            .expect("send");
+        let body = fake.last_sent().expect("a body");
+        assert_eq!(
+            body["headers"]["In-Reply-To"], "<0106019a@ap-northeast-1.amazonses.com>",
+            "an id that already carries its chevrons is not given a second pair"
+        );
+        assert_eq!(
+            body["headers"]["References"],
+            body["headers"]["In-Reply-To"]
         );
     }
 

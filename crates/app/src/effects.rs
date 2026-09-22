@@ -1879,6 +1879,35 @@ impl Effects {
         Ok(found)
     }
 
+    /// Le `Message-ID` RFC de notre dernier mail à `to`, pour qu'une relance
+    /// sans fil entrant parte dans le fil du premier. Deux lectures : la ligne
+    /// sortante ([`crate::inbound::last_outbound_to`]), puis le fournisseur,
+    /// parce que l'identifiant en base est son handle et pas l'en-tête.
+    /// `None` pour un premier mail, ou quand l'adaptateur ne sait pas.
+    pub async fn follow_up_target(
+        &self,
+        from: &str,
+        to: &EmailAddress,
+    ) -> Result<Option<ProviderMessageId>, EffectError> {
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+        let sent = crate::inbound::last_outbound_to(&mut tx, from, to)
+            .await
+            .map_err(EffectError::Unavailable)?;
+        let _ = tx.rollback().await;
+        let Some(sent) = sent else { return Ok(None) };
+        let message_id = self
+            .ports
+            .email
+            .message_id_of(&sent)
+            .await
+            .map_err(EffectError::Provider)?;
+        Ok(message_id.map(ProviderMessageId::new))
+    }
+
     /// Le jeton de désinscription du destinataire **réglé par la décision**.
     ///
     /// Pris sur le token comme `to` l'est, et pour la même raison exactement :
