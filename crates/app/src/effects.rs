@@ -4584,13 +4584,14 @@ pub async fn notify_approver(
     seat: &Employee,
     approval: Uuid,
     draft: &Value,
+    links: Option<&(String, String)>,
 ) -> Result<ProviderMessageId, ProviderError> {
     let text = |key: &str| draft.get(key).and_then(Value::as_str).unwrap_or("?");
     let (to, subject, body) = (text("to"), text("subject"), text("body"));
     let slug = seat.slug();
     // Un article, un post LinkedIn, ou une lettre : le même mail, le même
     // événement, les deux mêmes gestes — seuls l'objet et le corps changent.
-    let (subject, body_text) = if draft.get(crate::content::CONTENT_DRAFT_KEY).is_some() {
+    let (subject, mut body_text) = if draft.get(crate::content::CONTENT_DRAFT_KEY).is_some() {
         crate::content::approval_mail(slug.as_str(), approval, draft)
     } else if let Some(post) = crate::social_post::letter(slug, approval, draft) {
         post
@@ -4618,6 +4619,14 @@ pub async fn notify_approver(
             ),
         )
     };
+    // Les deux liens d'un clic, quand le déploiement en signe
+    // (`crate::approval_link`) : la même décision que la ligne
+    // `approvals_approve` au-dessus, pour cette approbation seule.
+    if let Some((approve, deny)) = links {
+        body_text.push_str(&format!(
+            "\n=== D'un clic ===\nAPPROUVER : {approve}\nREFUSER   : {deny}\n"
+        ));
+    }
     let email = OutboundEmail {
         from: seat.address().to_string(),
         to: vec![notify.to_owned()],
@@ -8796,6 +8805,7 @@ mod tests {
                 &seat,
                 approval,
                 &draft,
+                None,
             )
             .await
             .expect("notify");
