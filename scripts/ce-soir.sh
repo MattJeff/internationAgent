@@ -421,7 +421,10 @@ export AGENTOS_MASTER_KEY="$MASTER_KEY"
 export APP_BIND="127.0.0.1:$PORT"
 export AGENTOS_ALLOW_MOCKS=1
 export AGENTOS_LLM=cli
-export AGENTOS_API_KEYS="ops:$TENANT_ID:$CLE_OPS,approbateur:$TENANT_ID:$CLE_APPROBATEUR"
+# L'étiquette de la clé EST le rôle que la Gate compare (`gate::APPROVER_ROLE`
+# = "approver", `held_role` lit l'étiquette telle quelle) : « approbateur »
+# rendait 403 role_required à chaque approbation — mesuré le 2026-09-22.
+export AGENTOS_API_KEYS="ops:$TENANT_ID:$CLE_OPS,approver:$TENANT_ID:$CLE_APPROBATEUR"
 export RUST_LOG="${RUST_LOG:-info,agentos_server=debug}"
 if [ -n "$CHROME_URL" ]; then export BROWSER_CDP_URL="$CHROME_URL"; fi
 [ "$REEL" = 1 ] || unset EMAIL_API_KEY EMAIL_API_BASE
