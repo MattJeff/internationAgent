@@ -451,6 +451,10 @@ async fn one(
 /// agent that asked for the approval.
 #[derive(sqlx::FromRow)]
 struct Decidable {
+    /// `pending`, `redeemed`, `denied`, `expired` — lu avant tout geste, parce
+    /// qu'un second clic sur un mail déjà traité doit répondre « déjà
+    /// décidée » avant de toucher au moindre prestataire.
+    state: String,
     employee_id: Option<Uuid>,
     /// Empty when the envelope has no such key — which never equals a caller's
     /// label, so an approval nobody can be shown to have requested is one
@@ -493,6 +497,7 @@ async fn decidable(tx: &mut TenantTx<'_>, id: Uuid) -> Result<Option<Decidable>,
                 coalesce(action->>'required_role', '') AS required_role, \
                 coalesce(action->>'nonce', '')         AS nonce, \
                 coalesce(reason, '')                  AS summary, \
+                state, \
                 action->'draft'                        AS draft \
            FROM approvals WHERE id = $1",
     )
@@ -1416,6 +1421,16 @@ async fn link(
                 Err(err) => return ApiError::from(err).into_response(),
             };
             let row = match decidable(&mut tx, q.a).await {
+                Ok(Some(row)) if row.state != "pending" => {
+                    return (
+                        StatusCode::CONFLICT,
+                        page(
+                            "Déjà décidée",
+                            "Cette approbation a déjà été traitée — rien à refaire. Vous pouvez fermer cet onglet.",
+                        ),
+                    )
+                        .into_response();
+                }
                 Ok(Some(row)) => row,
                 Ok(None) => {
                     return (
