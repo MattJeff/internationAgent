@@ -9,7 +9,36 @@
     "orizn.app"
   ],
   "denied_domains": [],
-  "allowed_mcp_tools": [],
+  "allowed_mcp_tools": [
+    {
+      "server": "github",
+      "name": "get-file-contents"
+    },
+    {
+      "server": "github",
+      "name": "create-branch"
+    },
+    {
+      "server": "github",
+      "name": "create-or-update-file"
+    },
+    {
+      "server": "github",
+      "name": "create-pull-request"
+    },
+    {
+      "server": "social",
+      "name": "account-connect-url"
+    },
+    {
+      "server": "social",
+      "name": "post-preview"
+    },
+    {
+      "server": "social",
+      "name": "post-publish"
+    }
+  ],
   "allowed_a2a_peers": [],
   "allowed_models": [
     "claude-haiku-4-5",
