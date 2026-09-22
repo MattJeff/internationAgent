@@ -457,8 +457,11 @@ fi
 
 # Le plafond. Hors de portée d'un terminal MCP — aucune route ne l'écrit — donc
 # c'est ici et nulle part ailleurs. Sans lui la grille est fermée et CHAQUE
-# action est refusée en `no_platform_policy`.
-dit "$("$BIN" policy install | head -1)"
+# action est refusée en `no_platform_policy`. LE FICHIER, pas le défaut nu :
+# `policy install` sans argument pose un plafond à zéro outil MCP, et chaque
+# relance effaçait les sept outils du fondateur — mesuré le 2026-09-22 : un
+# article approuvé d'un clic, refusé `no_rule` sur `create-branch`.
+dit "$("$BIN" policy install "$RACINE/docs/orizn-ceiling.json" | head -1)"
 
 attendre "http://127.0.0.1:$PORT/readyz" 30 "/readyz"
 dit "prêt."
