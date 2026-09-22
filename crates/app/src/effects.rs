@@ -1629,6 +1629,7 @@ impl Effects {
             // Rempli par `dispatch_email`, la seule route sortante, pour que
             // les deux appelants ne puissent pas en oublier un.
             unsubscribe_token: None,
+            body_html: None,
             attachments: Vec::new(),
         };
         // `from` on the audit row too: the one place an operator can ask which
@@ -1790,6 +1791,7 @@ impl Effects {
             ),
             in_reply_to: None,
             unsubscribe_token: None,
+            body_html: None,
             attachments: vec![OutboundAttachment {
                 filename: name,
                 content_type: held.content_type,
@@ -1834,6 +1836,14 @@ impl Effects {
         // réservation ouverte pour un envoi qui n'a pas eu lieu.
         let mut email = email;
         email.unsubscribe_token = self.unsubscribe_token_for(&ok).await?;
+        // Le pied d'identité : qui écrit, d'où — les mentions que l'émetteur
+        // a écrites pour ses factures, et rien tant qu'il ne les a pas
+        // écrites. Pas de lien : la sortie est l'en-tête List-Unsubscribe
+        // (un clic dans Gmail), et le compte de liens du corps reste celui
+        // que `deliverability` a mesuré.
+        if let Some(footer) = self.identity_footer().await? {
+            email.body_text.push_str(&footer);
+        }
 
         // `?`, and no audit row on this arm: the only way this fails is the
         // database being unreachable, at which point `record` cannot write one
@@ -1874,6 +1884,36 @@ impl Effects {
     /// Pris sur le token comme `to` l'est, et pour la même raison exactement :
     /// un lien minté pour une adresse que le rendu a choisie serait un lien qui
     /// désabonne quelqu'un d'autre que celui à qui le mail part.
+    /// `\n\n--\n<nom> (<forme>) · <adresse>` quand l'adresse postale de
+    /// l'émetteur est écrite (`invoices_issuer_set`) ; `None` sinon — un pied
+    /// qui dit « siglair » sans adresse n'identifie personne.
+    async fn identity_footer(&self) -> Result<Option<String>, EffectError> {
+        let mut tx = self
+            .db
+            .tenant_tx(self.principal.tenant_id)
+            .await
+            .map_err(EffectError::Unavailable)?;
+        let issuer = match invoices::issuer(&mut tx).await {
+            Ok(issuer) => issuer,
+            Err(StoreError::NotFound) => return Ok(None),
+            Err(err) => return Err(EffectError::Unavailable(err)),
+        };
+        tx.commit().await.map_err(EffectError::Unavailable)?;
+        let Some(address) = issuer.address.filter(|a| !a.trim().is_empty()) else {
+            return Ok(None);
+        };
+        let form = issuer
+            .legal_form
+            .filter(|f| !f.trim().is_empty())
+            .map(|f| format!(" ({f})"))
+            .unwrap_or_default();
+        Ok(Some(format!(
+            "\n\n--\n{}{form} · {}",
+            issuer.name.trim(),
+            address.trim()
+        )))
+    }
+
     async fn unsubscribe_token_for<A: Subject<Of = EmailSend>>(
         &self,
         ok: &Authorized<A>,
@@ -4622,16 +4662,19 @@ pub async fn notify_approver(
     // Les deux liens d'un clic, quand le déploiement en signe
     // (`crate::approval_link`) : la même décision que la ligne
     // `approvals_approve` au-dessus, pour cette approbation seule.
+    let mut body_html = None;
     if let Some((approve, deny)) = links {
         body_text.push_str(&format!(
             "\n=== D'un clic ===\nAPPROUVER : {approve}\nREFUSER   : {deny}\n"
         ));
+        body_html = Some(approval_html(&body_text, approve, deny));
     }
     let email = OutboundEmail {
         from: seat.address().to_string(),
         to: vec![notify.to_owned()],
         subject,
         body_text,
+        body_html,
         in_reply_to: None,
         unsubscribe_token: None,
         attachments: Vec::new(),
@@ -4643,6 +4686,48 @@ pub async fn notify_approver(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Le mail d'approbation en HTML : le texte tel quel, et deux boutons qui
+/// sont les deux liens signés. Rien d'autre à cliquer ; rien qui ne soit
+/// aussi dans le texte.
+fn approval_html(text: &str, approve: &str, deny: &str) -> String {
+    let button = |href: &str, label: &str, bg: &str| {
+        format!(
+            "<a href=\"{}\" style=\"display:inline-block;padding:12px 22px;margin:0 12px 0 0;\
+             background:{bg};color:#fff;text-decoration:none;border-radius:6px;\
+             font:600 15px system-ui,sans-serif\">{label}</a>",
+            escape_html(href)
+        )
+    };
+    format!(
+        "<!doctype html><html><body style=\"margin:0;padding:24px;background:#f6f6f4\">\
+         <div style=\"max-width:680px;margin:0 auto;background:#fff;padding:24px;\
+         border-radius:8px;font:15px/1.5 system-ui,sans-serif;color:#1d1d1b\">\
+         <p style=\"margin:0 0 18px\">{}{}</p>\
+         <pre style=\"white-space:pre-wrap;font:14px/1.5 ui-monospace,Menlo,monospace;\
+         margin:0 0 24px;padding:16px;background:#f6f6f4;border-radius:6px\">{}</pre>\
+         <p style=\"margin:0\">{}{}</p></div></body></html>",
+        button(approve, "Approuver ✔", "#1f7a4d"),
+        button(deny, "Refuser ✘", "#6b6b66"),
+        escape_html(text),
+        button(approve, "Approuver ✔", "#1f7a4d"),
+        button(deny, "Refuser ✘", "#6b6b66"),
+    )
+}
+
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
 
 #[cfg(test)]
 mod tests {
@@ -8522,6 +8607,93 @@ mod tests {
     /// corps.** Exactement `MAX_LINKS` liens dans le texte, et le jeton de
     /// `0085` minté en plus : le mail part, le mock porte le jeton en en-tête,
     /// et le corps qu'il a reçu est celui du modèle, à trois liens.
+    /// Le pied d'identité : rien tant que l'émetteur n'a pas écrit son
+    /// adresse ; puis nom, forme et adresse sous `--`, et toujours sans lien.
+    #[tokio::test]
+    async fn the_identity_footer_appears_once_the_issuer_has_an_address() {
+        let Some(db) = db().await else { return };
+        let principal = seed(&db).await;
+        let email = Arc::new(MockEmailProvider::new());
+        let effects = Effects::new(
+            db.clone(),
+            Arc::new(Ports {
+                email: email.clone(),
+                telephony: Arc::new(MockTelephony::new(Utc::now(), "token")),
+                browser: Arc::new(MockBrowser::new()),
+                mcp: Arc::new(StubMcp),
+                payments: MockPayments::healthy(),
+                leads: Arc::new(MockLeadSink::new()),
+                mail_domains: Arc::new(MockMailDomains::silent()),
+            }),
+            principal.clone(),
+        );
+        let mut tx = db.tenant_tx(principal.tenant_id).await.expect("tx");
+        let mut issuer = invoices::issuer(&mut tx)
+            .await
+            .expect("the tenant is its issuer");
+        issuer.legal_form = Some("SAS".to_owned());
+        issuer.address = Some("12 rue des Voyageurs, 75011 Paris".to_owned());
+        invoices::set_issuer(&mut tx, &issuer)
+            .await
+            .expect("mentions");
+        tx.commit().await.expect("commit");
+
+        let ok = gate(&db)
+            .authorize(&principal, to("marie@prospect.example"))
+            .await
+            .expect("the policy opens email");
+        let body = "Bonjour Marie, une ligne.\n\nCordialement,\nLéna";
+        effects
+            .send_email(
+                ok,
+                RenderedEmail {
+                    from: "lena@acme.example".to_owned(),
+                    subject: "Vos visas".to_owned(),
+                    body_text: body.to_owned(),
+                    in_reply_to: None,
+                },
+            )
+            .await
+            .expect("sent");
+        let sent = email.sent_emails();
+        assert_eq!(sent.len(), 1);
+        let expected = format!(
+            "{body}\n\n--\n{} (SAS) · 12 rue des Voyageurs, 75011 Paris",
+            issuer.name.trim()
+        );
+        assert_eq!(
+            sent[0].body_text, expected,
+            "the footer is the issuer's mentions, nothing else"
+        );
+        assert!(
+            !sent[0].body_text.contains("https://"),
+            "the footer carries no link"
+        );
+        assert!(sent[0].body_html.is_none(), "a prospect letter stays text");
+    }
+
+    #[test]
+    fn the_html_approval_mail_carries_both_links_and_escapes_the_text() {
+        let html = approval_html(
+            "À : <claire@x.example>\nObjet : Prix & délais",
+            "https://api.example/v1/approvals/link?d=approve&s=a",
+            "https://api.example/v1/approvals/link?d=deny&s=b",
+        );
+        assert_eq!(
+            html.matches("href=\"https://api.example/v1/approvals/link?d=approve&amp;s=a\"")
+                .count(),
+            2
+        );
+        assert_eq!(
+            html.matches("href=\"https://api.example/v1/approvals/link?d=deny&amp;s=b\"")
+                .count(),
+            2
+        );
+        assert!(html.contains("&lt;claire@x.example&gt;"));
+        assert!(html.contains("Prix &amp; délais"));
+        assert!(!html.contains("<claire@x.example>"));
+    }
+
     #[tokio::test]
     async fn the_unsubscribe_link_we_add_does_not_count_against_max_links() {
         let Some(db) = db().await else { return };
@@ -8563,10 +8735,13 @@ mod tests {
             sent[0].unsubscribe_token.is_some(),
             "the way out was minted for a stranger"
         );
-        assert_eq!(
-            sent[0].body_text, body,
+        // Le corps du modèle, intact ; le seul ajout est le pied d'identité
+        // de l'émetteur (la fixture en écrit un), et il ne porte aucun lien.
+        assert!(
+            sent[0].body_text.starts_with(&body),
             "the body is the model's, untouched"
         );
+        assert!(sent[0].body_text[body.len()..].starts_with("\n\n--\n"));
         assert_eq!(sent[0].body_text.matches("https://").count(), 3);
     }
     /// **L'expéditeur est choisi à l'envoi, pour l'extérieur seulement.** Le

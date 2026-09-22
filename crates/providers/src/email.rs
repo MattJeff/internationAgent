@@ -83,6 +83,10 @@ pub struct OutboundEmail {
     pub subject: String,
     /// Plain-text body.
     pub body_text: String,
+    /// La même lettre en HTML, quand un rendu le vaut (le mail d'approbation
+    /// et ses deux boutons). `None` : texte seul, ce que sont les lettres aux
+    /// prospects — un texte nu passe mieux et ne mesure rien.
+    pub body_html: Option<String>,
     /// The message we are replying to, for threading.
     pub in_reply_to: Option<ProviderMessageId>,
     /// This recipient's own unsubscribe token, or `None` for a send that
@@ -1546,6 +1550,7 @@ pub async fn contract_suite<P: EmailProvider + ?Sized>(p: &P, scope: IdentitySco
         body_text: "Attached.".to_owned(),
         in_reply_to: None,
         unsubscribe_token: None,
+        body_html: None,
         attachments: vec![OutboundAttachment {
             filename: "po-4471.pdf".to_owned(),
             content_type: "application/pdf".to_owned(),
@@ -2013,6 +2018,7 @@ mod tests {
             body_text: "hi".to_owned(),
             in_reply_to: None,
             unsubscribe_token: None,
+            body_html: None,
             attachments: Vec::new(),
         };
         for _ in 0..5 {

@@ -574,6 +574,9 @@ impl EmailProvider for ResendEmailProvider {
         // two assignments to `body["headers"]`, because the second assignment
         // silently ate the first: an email that both replied to somebody and
         // offered an unsubscribe would have lost whichever branch ran earlier.
+        if let Some(html) = &email.body_html {
+            body["html"] = serde_json::json!(html);
+        }
         let mut headers = serde_json::Map::new();
         if let Some(parent) = &email.in_reply_to {
             // Threading lives in the RFC-5322 headers, not in a Resend field.
@@ -1525,6 +1528,7 @@ mod tests {
             body_text: "Attached.".to_owned(),
             in_reply_to: Some(ProviderMessageId::new("email_1")),
             unsubscribe_token: None,
+            body_html: None,
             attachments: Vec::new(),
         };
         let key = IdempotencyKey::for_step(EmployeeId::new_v7(Utc::now()), "send:po-4471");
@@ -1573,6 +1577,7 @@ mod tests {
                     body_text: "hi".to_owned(),
                     in_reply_to: None,
                     unsubscribe_token: None,
+                    body_html: None,
                     attachments: Vec::new(),
                 },
             )
@@ -1617,6 +1622,7 @@ mod tests {
                     body_text: "…".to_owned(),
                     in_reply_to: Some(ProviderMessageId::new("email_parent")),
                     unsubscribe_token: Some("unsub_AAAABBBBCCCCDDDD".to_owned()),
+                    body_html: None,
                     attachments: Vec::new(),
                 },
             )
@@ -1650,6 +1656,7 @@ mod tests {
                     body_text: "…".to_owned(),
                     in_reply_to: None,
                     unsubscribe_token: None,
+                    body_html: None,
                     attachments: Vec::new(),
                 },
             )
@@ -1677,6 +1684,7 @@ mod tests {
                     body_text: "…".to_owned(),
                     in_reply_to: None,
                     unsubscribe_token: Some("unsub_ZZZZ".to_owned()),
+                    body_html: None,
                     attachments: Vec::new(),
                 },
             )
@@ -1704,6 +1712,7 @@ mod tests {
                     body_text: "…".to_owned(),
                     in_reply_to: None,
                     unsubscribe_token: Some("unsub_ZZZZ".to_owned()),
+                    body_html: None,
                     attachments: Vec::new(),
                 },
             )
@@ -1732,6 +1741,7 @@ mod tests {
                     body_text: "Attached.".to_owned(),
                     in_reply_to: None,
                     unsubscribe_token: None,
+                    body_html: None,
                     attachments: vec![OutboundAttachment {
                         filename: "invoice-7.pdf".to_owned(),
                         content_type: "application/pdf".to_owned(),
