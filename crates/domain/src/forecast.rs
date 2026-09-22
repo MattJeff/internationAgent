@@ -192,18 +192,18 @@ impl Sample {
 pub const RECORDED: &[Sample] = &[
     Sample {
         calls_per_turn: 8.33,
-        input_tokens_per_call: 7663.7,
-        output_tokens_per_call: 416.8,
-    },
-    Sample {
-        calls_per_turn: 7.67,
-        input_tokens_per_call: 7723.7,
-        output_tokens_per_call: 414.7,
+        input_tokens_per_call: 7948.5,
+        output_tokens_per_call: 519.5,
     },
     Sample {
         calls_per_turn: 8.00,
-        input_tokens_per_call: 7668.0,
-        output_tokens_per_call: 441.5,
+        input_tokens_per_call: 7574.3,
+        output_tokens_per_call: 355.6,
+    },
+    Sample {
+        calls_per_turn: 8.00,
+        input_tokens_per_call: 7669.2,
+        output_tokens_per_call: 404.5,
     },
 ];
 

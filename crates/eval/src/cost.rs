@@ -370,7 +370,7 @@ pub fn by_model(sample: Sample, calls_per_turn: f64) -> Vec<(ModelId, usize, f64
 /// jetons par appel en entrée, ~420 en sortie — dans le ±20 % des figures du
 /// 09-05 (8,00 / 7,33 / 8,00 ; 7,4–7,5 k). `RECORDED` et la phrase de
 /// `docs/ORIZN.md` sont ceux de ces trois runs.
-pub const DIGEST: &str = "8f5754566640141c";
+pub const DIGEST: &str = "6e0f245665ab0c50";
 
 // ---------------------------------------------------------------------------
 // The company, as the operator wrote it down

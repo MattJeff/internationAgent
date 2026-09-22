@@ -301,7 +301,14 @@ fi
 # `127.0.0.1`, le lien de désabonnement est mort chez le destinataire, et
 # Gmail le lit.
 PUBLIC="http://127.0.0.1:$PORT"
-if [ "$RECEVOIR" = 1 ]; then
+# Un tunnel NOMMÉ, déjà ouvert ailleurs (cloudflared tunnel run, sur un hôte à
+# nous) : l'adresse ne change plus, donc rien ici ne l'ouvre ni ne la lit —
+# on la prend telle quelle. ponytail: PUBLIC_HOST_FIXE=https://api.… et le
+# bloc du tunnel rapide est sauté ; le tunnel nommé se surveille tout seul.
+if [ "$RECEVOIR" = 1 ] && [ -n "${PUBLIC_HOST_FIXE:-}" ]; then
+  PUBLIC="$PUBLIC_HOST_FIXE"
+  dit "adresse publique fixe : $PUBLIC (tunnel nommé, ouvert hors de ce script)."
+elif [ "$RECEVOIR" = 1 ]; then
   # Celui d'avant, s'il tourne encore : une nouvelle exécution a de toute façon
   # une nouvelle adresse, et écraser le fichier de pid laisserait l'ancien
   # tunnel ouvert sans que rien ne sache plus l'arrêter.
