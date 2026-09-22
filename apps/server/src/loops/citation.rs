@@ -126,6 +126,10 @@ pub async fn tick(db: &Db, ports: &Arc<Ports>, now: DateTime<Utc>) -> Result<usi
                 ),
             }
         }
+        // Puis les graines font des suggestions : la semaine est celle de
+        // `claim_measure`, une passe bornée par locataire.
+        let suggested = content::suggest_questions(db, &effects, &gate, 5).await?;
+        tracing::info!(tenant = %tenant, suggested, "questions suggested");
     }
     // Et à chaque tour, pas une fois par semaine : les articles proposés dont
     // la pull request a été fusionnée et déployée se constatent seuls
