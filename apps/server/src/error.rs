@@ -71,6 +71,18 @@ impl ApiError {
     /// not in a 4xx blaming the founder for it. Rule 1 is unaffected: this
     /// reads back what a handler put in, and nothing ever puts a server-side
     /// error in.
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    pub fn title(&self) -> &'static str {
+        self.title
+    }
+
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
     pub fn detail(&self) -> Option<&str> {
         self.detail.as_deref()
     }
