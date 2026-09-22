@@ -232,6 +232,10 @@ mod tests {
                 "/v1/mcp/oauth",
                 "moitié publique d'un passage OAuth, un navigateur y arrive",
             ),
+            (
+                "/v1/approvals/link",
+                "le clic du mail d'approbation : un navigateur, une signature, pas de clé",
+            ),
         ];
 
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../apps/server/src/routes");

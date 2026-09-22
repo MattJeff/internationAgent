@@ -680,7 +680,7 @@ async fn approve_with(
     let Some(row) = row else {
         return Err(ApiError::not_found());
     };
-    may_decide(&principal, &row, true)?;
+    may_decide(principal, &row, true)?;
 
     // `employee_id` is nullable in the schema, and every approval this
     // workspace files names one. A row that does not cannot be attributed, and
@@ -710,10 +710,10 @@ async fn approve_with(
     // must keep.
     let Action::PaymentCreate { amount, payee } = body.action else {
         if let Action::ContractSign { title } = body.action {
-            return sign(&state, &gate_principal, approval_id, &row, title, id).await;
+            return sign(state, &gate_principal, approval_id, &row, title, id).await;
         }
         if let Action::EmailSend { to } = body.action {
-            return letter(&state, &gate_principal, approval_id, &row, to, id).await;
+            return letter(state, &gate_principal, approval_id, &row, to, id).await;
         }
         // Un `McpCall` sur `social/post-publish` dont la ligne porte un post :
         // le texte publié est celui de la ligne, jamais celui de la requête —
@@ -722,14 +722,14 @@ async fn approve_with(
             && *tool == social_post::tool()
             && let Some(post) = row.draft.as_ref().and_then(social_post::post_draft)
         {
-            return publish_post(&state, &gate_principal, approval_id, &row, &post, id).await;
+            return publish_post(state, &gate_principal, approval_id, &row, &post, id).await;
         }
         // The fourth executor, chosen by the row and not by the variant: an
         // article is an `McpCall` on `create-pull-request`, and only the
         // attached draft says it is an article. `content::CONTENT_DRAFT_KEY`.
         if let Some(draft) = content_draft_of(&row) {
             return publish(
-                &state,
+                state,
                 &gate_principal,
                 approval_id,
                 &row,
@@ -1518,7 +1518,7 @@ async fn deny_with(
     let Some(row) = decidable(&mut tx, id).await? else {
         return Err(ApiError::not_found());
     };
-    may_decide(&principal, &row, false)?;
+    may_decide(principal, &row, false)?;
 
     let decided_by = principal.actor.label();
     let refused: Option<(Uuid,)> = sqlx::query_as(
