@@ -725,6 +725,15 @@ fn app(
     // client registrations and the same fleet registry. Two states built side by
     // side is a flow started under one and completed under another, which fails
     // as `secret_decrypt_failed` on a verifier that was sealed correctly.
+    // L'état du lien d'un clic, cloné avant que `fleets` ne parte dans
+    // `routes::social::router`.
+    let approval_link_state = routes::approvals::link_state(
+        db.clone(),
+        gate.clone(),
+        ports.clone(),
+        fleets.clone(),
+        approval_link_signer(config),
+    );
     let mcp_state = McpState::new(
         db.clone(),
         // Cloné, pas déplacé : `routes::social` lit le MÊME registre. Deux
@@ -820,6 +829,7 @@ fn app(
                 // Approuver une signature l'envoie, chez le prestataire de ce
                 // locataire-là — voir `approvals::sign`.
                 fleets.clone(),
+                approval_link_signer(config),
             ))
             // À côté des approbations, parce que c'est là que la décision
             // tombe : cette unité-ci prépare le pli et constate l'exemplaire
@@ -1032,6 +1042,9 @@ fn app(
     // stands in for the credential is the `state` parameter, and
     // `routes::mcp::public_router` is where that argument lives.
     .merge(routes::mcp::public_router(mcp_state))
+    // Le clic du mail d'approbation : un navigateur, donc pas de clé — la
+    // signature du lien en tient lieu (`agentos_app::approval_link`).
+    .merge(routes::approvals::public_router(approval_link_state))
     // Le serveur MCP, et pas derrière `with_api_stack` : un client MCP appelle
     // `initialize` avant d'avoir présenté quoi que ce soit, et un 401 sur cette
     // sonde est un serveur qui ne s'affiche jamais dans le terminal. Il
@@ -1154,6 +1167,18 @@ fn webhooks(config: &Config) -> Webhooks {
 /// easy to miss: forgetting a row is a side effect that silently never
 /// happens, *and* a permanently unpublished row, which `/readyz` eventually
 /// reports as lag. If you add an `enqueue` anywhere, add a line here.
+/// Le signataire des liens d'un clic — `None` quand aucun mail d'approbation
+/// ne part (`AGENTOS_APPROVAL_NOTIFY` vide), et alors la route du lien répond
+/// 404 à tout le monde. Dérivé de la clé maître : un déploiement, une clé.
+fn approval_link_signer(config: &Config) -> Option<Arc<agentos_app::approval_link::ApprovalLink>> {
+    config.approval_notify.as_ref().map(|_| {
+        Arc::new(agentos_app::approval_link::ApprovalLink::new(
+            &config.master_key,
+            &config.public_host,
+        ))
+    })
+}
+
 fn handlers(config: &Config, agent: Agent, engine: ProvisioningEngine) -> Handlers {
     // Cloned before `agent` is moved into the turn handler below. The telephony
     // ingest needs exactly one of the ports — the adapter that normalises a
@@ -1164,7 +1189,8 @@ fn handlers(config: &Config, agent: Agent, engine: ProvisioningEngine) -> Handle
     // with no handler is eight retries and a dead letter, and the app emits
     // this one on every escalated letter. Absent address = the handler says
     // so and returns `Ok`.
-    let notify = (ports.clone(), config.approval_notify.clone());
+    let approval_link = approval_link_signer(config);
+    let notify = (ports.clone(), config.approval_notify.clone(), approval_link);
     let mut handlers = Handlers::default()
         .on(routes::employees::CREATED_EVENT, Arc::new(on_created))
         .on(
@@ -1192,7 +1218,13 @@ fn handlers(config: &Config, agent: Agent, engine: ProvisioningEngine) -> Handle
         .on(
             agentos_app::effects::APPROVAL_REQUESTED_EVENT,
             Arc::new(move |event, tx| {
-                on_approval_requested(notify.0.clone(), notify.1.clone(), event, tx)
+                on_approval_requested(
+                    notify.0.clone(),
+                    notify.1.clone(),
+                    notify.2.clone(),
+                    event,
+                    tx,
+                )
             }),
         )
         .on(
@@ -1655,6 +1687,7 @@ fn field<'a>(event: &'a OutboxEvent, key: &str) -> &'a str {
 fn on_approval_requested<'a>(
     ports: Arc<Ports>,
     notify: Option<String>,
+    link: Option<Arc<agentos_app::approval_link::ApprovalLink>>,
     event: &'a OutboxEvent,
     tx: &'a mut TenantTx<'_>,
 ) -> Handled<'a> {
@@ -1678,9 +1711,17 @@ fn on_approval_requested<'a>(
             .await
             .map_err(|err| format!("could not load the seat that asked: {err}"))?;
         let draft = event.payload.get("draft").cloned().unwrap_or(Value::Null);
-        agentos_app::effects::notify_approver(&ports, &notify, &stored.employee, approval, &draft)
-            .await
-            .map_err(|err| format!("the founder could not be written to: {err}"))?;
+        let links = link.map(|l| l.urls(event.tenant_id.as_uuid(), approval, chrono::Utc::now()));
+        agentos_app::effects::notify_approver(
+            &ports,
+            &notify,
+            &stored.employee,
+            approval,
+            &draft,
+            links.as_ref(),
+        )
+        .await
+        .map_err(|err| format!("the founder could not be written to: {err}"))?;
         tracing::info!(
             approval = %approval,
             employee_id = %employee_id.as_uuid(),
@@ -5987,9 +6028,15 @@ mod tests {
         let founder = Some("fondateur@acme.example.com".to_owned());
         for _ in 0..2 {
             let mut tx = db.tenant_tx(tenant).await.expect("tx");
-            on_approval_requested(ports.clone(), founder.clone(), &event(approval), &mut tx)
-                .await
-                .expect("notify");
+            on_approval_requested(
+                ports.clone(),
+                founder.clone(),
+                None,
+                &event(approval),
+                &mut tx,
+            )
+            .await
+            .expect("notify");
             tx.commit().await.expect("commit");
         }
         assert_eq!(
@@ -6015,7 +6062,7 @@ mod tests {
 
         // Sans adresse : un autre événement, rien de plus dans la boîte.
         let mut tx = db.tenant_tx(tenant).await.expect("tx");
-        on_approval_requested(ports.clone(), None, &event(Uuid::now_v7()), &mut tx)
+        on_approval_requested(ports.clone(), None, None, &event(Uuid::now_v7()), &mut tx)
             .await
             .expect("unset is not a failure");
         tx.commit().await.expect("commit");

@@ -8,6 +8,7 @@
 
 pub mod a2a; // U28
 pub mod api_keys; // wave J: step zero — a key a customer can be given and can lose
+pub mod approval_link; // le lien d'un clic dans le mail d'approbation
 pub mod backlog; // le carnet: the port a work board is reached through, ours or the customer's
 pub mod brief; // the operator's own words that open a turn — reachable, so a pin can hash them
 pub mod browser_journal; // le journal des tâches de navigateur et la vue en direct : le lecteur de BrowserObserver

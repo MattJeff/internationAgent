@@ -1610,7 +1610,7 @@ const CREATE_BRANCH: &str = "create-branch";
 /// Voir [`GET_FILE_CONTENTS`].
 const CREATE_OR_UPDATE_FILE: &str = "create-or-update-file";
 /// Voir [`GET_FILE_CONTENTS`].
-const CREATE_PULL_REQUEST: &str = "create-pull-request";
+pub const CREATE_PULL_REQUEST: &str = "create-pull-request";
 
 /// Ce qu'une proposition a produit chez le client.
 #[derive(Debug, Clone, Serialize)]
@@ -3736,6 +3736,7 @@ mod tests {
             &seat,
             approval,
             draft,
+            None,
         )
         .await
         .expect("notify");

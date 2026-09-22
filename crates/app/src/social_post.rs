@@ -768,6 +768,7 @@ mod tests {
             &seat,
             id.as_uuid(),
             &payload["draft"],
+            None,
         )
         .await
         .expect("notify");

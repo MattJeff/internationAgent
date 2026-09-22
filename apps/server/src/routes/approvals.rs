@@ -169,6 +169,7 @@
 
 use std::sync::Arc;
 
+use agentos_app::approval_link::{ApprovalLink, Decision};
 use agentos_app::effects::{
     AppointmentBook, ContractSign, Effects, EmailSend, McpCaller, PaymentCreate, Ports,
     RenderedEmail,
@@ -238,6 +239,9 @@ pub struct Approvals {
     db: Db,
     gate: PolicyGate,
     ports: Arc<Ports>,
+    /// Signe les liens d'un clic ; `None` quand le déploiement n'en met pas
+    /// dans ses mails, et alors `GET /v1/approvals/link` n'existe pas pour lui.
+    link: Option<Arc<ApprovalLink>>,
     /// Les branchements MCP, par locataire. Un pli de signature part chez le
     /// prestataire de **ce** client, comme une pull request est ouverte dans le
     /// GitHub de ce client — `routes::content` porte le même champ pour la même
@@ -247,7 +251,13 @@ pub struct Approvals {
 }
 
 /// Mount the approval routes.
-pub fn router(db: Db, gate: PolicyGate, ports: Arc<Ports>, fleets: Fleets) -> Router {
+pub fn router(
+    db: Db,
+    gate: PolicyGate,
+    ports: Arc<Ports>,
+    fleets: Fleets,
+    link: Option<Arc<ApprovalLink>>,
+) -> Router {
     Router::new()
         .route("/v1/approvals", get(list))
         .route("/v1/approvals/{id}", get(one))
@@ -260,7 +270,35 @@ pub fn router(db: Db, gate: PolicyGate, ports: Arc<Ports>, fleets: Fleets) -> Ro
             gate,
             ports,
             fleets,
+            link,
         })
+}
+
+/// Le lien d'un clic du mail d'approbation, **hors** de `with_api_stack` : un
+/// navigateur qui suit un lien ne présente aucune clé. Ce qui tient lieu de
+/// clé est la signature (`agentos_app::approval_link`), qui couvre le
+/// locataire, l'approbation, la décision et l'échéance — et la décision
+/// exécutée est celle que le brouillon porte, jamais celle de l'URL.
+pub fn link_state(
+    db: Db,
+    gate: PolicyGate,
+    ports: Arc<Ports>,
+    fleets: Fleets,
+    link: Option<Arc<ApprovalLink>>,
+) -> Approvals {
+    Approvals {
+        db,
+        gate,
+        ports,
+        fleets,
+        link,
+    }
+}
+
+pub fn public_router(state: Approvals) -> Router {
+    Router::new()
+        .route("/v1/approvals/link", get(link))
+        .with_state(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +660,18 @@ async fn approve(
     Path(id): Path<Uuid>,
     crate::error::JsonBody(body): crate::error::JsonBody<Approve>,
 ) -> Result<Json<Value>, ApiError> {
+    approve_with(&state, &principal, id, body.action).await
+}
+
+/// Le corps d'une approbation, partagé entre la route à clé et le lien d'un
+/// clic : mêmes contrôles, mêmes quatre exécuteurs, même rachat unique.
+async fn approve_with(
+    state: &Approvals,
+    principal: &Principal,
+    id: Uuid,
+    action: Action,
+) -> Result<Json<Value>, ApiError> {
+    let body = Approve { action };
     let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
     let row = decidable(&mut tx, id).await?;
     // The gate opens its own transaction; this one has nothing left to hold.
@@ -1309,6 +1359,136 @@ async fn publish(
 // ---------------------------------------------------------------------------
 
 /// Why it was refused. Optional, and worth writing.
+/// `GET /v1/approvals/link?t=&a=&d=&e=&s=` — le clic du mail.
+#[derive(Debug, Deserialize)]
+struct LinkQuery {
+    t: Uuid,
+    a: Uuid,
+    d: String,
+    e: i64,
+    s: String,
+}
+
+async fn link(
+    State(state): State<Approvals>,
+    axum::extract::Query(q): axum::extract::Query<LinkQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let page = |title: &str, body: &str| {
+        axum::response::Html(format!(
+            "<!doctype html><meta charset=utf-8><title>{title}</title>\
+             <body style=\"font:16px/1.5 system-ui;max-width:40em;margin:4em auto;padding:0 1em\">\
+             <h1 style=\"font-size:1.4em\">{title}</h1><p>{body}</p></body>"
+        ))
+    };
+    let Some(signer) = state.link.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            page(
+                "Pas de lien ici",
+                "Ce déploiement ne signe pas de lien d'approbation.",
+            ),
+        )
+            .into_response();
+    };
+    let Some(decision) = Decision::parse(&q.d) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            page("Lien incomplet", "Ce lien ne dit ni approuver ni refuser."),
+        )
+            .into_response();
+    };
+    if !signer.verify(q.t, q.a, decision, q.e, &q.s, Utc::now()) {
+        return (StatusCode::FORBIDDEN, page("Lien invalide ou expiré", "Ce lien a été modifié ou a dépassé son échéance. Décidez depuis la console, avec la clé d'approbateur.")).into_response();
+    }
+    // Le lien vaut la clé d'approbateur pour cette seule approbation : le même
+    // rôle — `held_role` lit l'étiquette telle quelle, donc c'est elle, sans
+    // suffixe — et les mêmes contrôles (`may_decide`, quatre-yeux compris).
+    let principal = Principal {
+        tenant_id: agentos_domain::ids::TenantId::from_uuid(q.t),
+        actor: AuditActor::Operator(agentos_app::gate::APPROVER_ROLE.to_owned()),
+    };
+    let outcome = match decision {
+        Decision::Approve => {
+            // L'action est celle que le brouillon porte — jamais l'URL.
+            let mut tx = match state.db.tenant_tx(principal.tenant_id).await {
+                Ok(tx) => tx,
+                Err(err) => return ApiError::from(err).into_response(),
+            };
+            let row = match decidable(&mut tx, q.a).await {
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        page(
+                            "Introuvable",
+                            "Cette approbation n'existe pas ou n'est plus en attente.",
+                        ),
+                    )
+                        .into_response();
+                }
+                Err(err) => return err.into_response(),
+            };
+            let Some(action) = action_of(&row) else {
+                return (StatusCode::CONFLICT, page("Pas d'un clic", "Cette approbation ne porte pas de brouillon qu'un clic sache exécuter ; décidez-la depuis la console.")).into_response();
+            };
+            approve_with(&state, &principal, q.a, action).await
+        }
+        Decision::Deny => {
+            deny_with(
+                &state,
+                &principal,
+                q.a,
+                Some("refusé d'un clic, depuis le mail".to_owned()),
+            )
+            .await
+        }
+    };
+    match outcome {
+        Ok(_) => page(
+            if decision == Decision::Approve {
+                "Approuvé ✔"
+            } else {
+                "Refusé ✘"
+            },
+            if decision == Decision::Approve {
+                "C'est parti : le siège exécute. Vous pouvez fermer cet onglet."
+            } else {
+                "Le siège en est informé. Vous pouvez fermer cet onglet."
+            },
+        )
+        .into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+/// L'action qu'un clic « approuver » rachète : exactement celle que le mail
+/// imprime pour ce brouillon — un article part en pull request, un post se
+/// publie, une lettre s'envoie. Rien d'autre n'est approuvable d'un clic : un
+/// paiement ou une signature se décident depuis la console, avec l'action
+/// écrite en toutes lettres.
+fn action_of(row: &Decidable) -> Option<Action> {
+    let draft = row.draft.as_ref()?;
+    if content_draft_of(row).is_some() {
+        let server = draft.get("server")?.as_str()?;
+        return Some(Action::McpCall {
+            tool: agentos_domain::action::McpTool::new(
+                agentos_domain::ids::Slug::parse(server).ok()?,
+                agentos_domain::ids::Slug::parse(agentos_app::content::CREATE_PULL_REQUEST).ok()?,
+            ),
+        });
+    }
+    if social_post::post_draft(draft).is_some() {
+        return Some(Action::McpCall {
+            tool: social_post::tool(),
+        });
+    }
+    let to = draft.get("to")?.as_str()?;
+    Some(Action::EmailSend {
+        to: EmailAddress::parse(to).ok()?,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct Deny {
     #[serde(default)]
@@ -1322,6 +1502,16 @@ async fn deny(
     Path(id): Path<Uuid>,
     crate::error::JsonBody(body): crate::error::JsonBody<Deny>,
 ) -> Result<Json<Value>, ApiError> {
+    deny_with(&state, &principal, id, body.note).await
+}
+
+async fn deny_with(
+    state: &Approvals,
+    principal: &Principal,
+    id: Uuid,
+    note: Option<String>,
+) -> Result<Json<Value>, ApiError> {
+    let body = Deny { note };
     let now = Utc::now();
     let mut tx = state.db.tenant_tx(principal.tenant_id).await?;
 
@@ -1839,6 +2029,7 @@ mod tests {
             gate.clone(),
             Arc::new(ports),
             crate::routes::mcp::Fleets::new().0,
+            None,
         )
         .layer(from_fn_with_state(
             crate::auth::Keyring::new(keys, db.clone(), crate::auth::TEST_MASTER_KEY),
@@ -2575,6 +2766,107 @@ mod tests {
     }
 
     // -- deny --------------------------------------------------------------
+
+    /// Le clic du mail : la même lettre part, sans clé, sur la seule foi de la
+    /// signature ; un lien altéré est 403 et ne fait rien ; un second clic
+    /// trouve l'approbation déjà décidée et n'envoie rien de plus ; le lien
+    /// « refuser » d'une approbation déjà approuvée ne défait rien.
+    #[tokio::test]
+    async fn the_mail_link_approves_once_and_a_tampered_link_does_nothing() {
+        let Some(db) = db().await else { return };
+        let (tenant, employee) = seed(&db).await;
+        agentos_app::sending_domain::adopt_for_tests(&db, tenant).await;
+
+        let to = "claire@voyages-lambda.example";
+        let action = Action::EmailSend {
+            to: to.parse().expect("an address"),
+        };
+        let now = Utc::now();
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let filed = agentos_store::approvals::create(
+            &mut tx,
+            &agentos_store::approvals::NewApproval {
+                employee_id: Some(employee),
+                action: &action,
+                requested_by: "seat",
+                required_role: "approver",
+                reason: Some("email"),
+                expires_at: now + chrono::Duration::hours(24),
+            },
+            now,
+        )
+        .await
+        .expect("file");
+        let id = filed.id();
+        agentos_store::approvals::attach_draft(
+            &mut tx,
+            id,
+            &json!({ "to": to, "subject": "Objet", "body": "Corps." }),
+        )
+        .await
+        .expect("attach the draft");
+        tx.commit().await.expect("commit");
+
+        let email_port = Arc::new(agentos_app::mocks::MockEmailProvider::new());
+        let ports = Ports {
+            email: email_port.clone(),
+            ..agentos_app::mocks::ports()
+        };
+        let signer = Arc::new(ApprovalLink::new("clé-maître-de-test", "https://api.test"));
+        let app = public_router(link_state(
+            db.clone(),
+            PolicyGate::new(db.clone()),
+            Arc::new(ports),
+            crate::routes::mcp::Fleets::new().0,
+            Some(signer.clone()),
+        ));
+        let (approve_url, deny_url) = signer.urls(tenant.as_uuid(), id.as_uuid(), now);
+        let path = |url: &str| url.trim_start_matches("https://api.test").to_owned();
+        let get = |uri: String| {
+            let app = app.clone();
+            async move {
+                let req = HttpRequest::builder()
+                    .uri(uri)
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request");
+                let response = app.oneshot(req).await.expect("service");
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                (status, String::from_utf8_lossy(&bytes).into_owned())
+            }
+        };
+
+        // Un lien altéré : la décision changée sous la même signature.
+        let tampered = path(&approve_url).replace("d=approve", "d=deny");
+        let (status, page) = get(tampered).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{page}");
+        assert_eq!(
+            email_port.sent_count(),
+            0,
+            "a tampered link sent the letter"
+        );
+        assert_eq!(state_of(&db, tenant, id).await, "pending");
+
+        // Le vrai clic : la lettre part, une fois.
+        let (status, page) = get(path(&approve_url)).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert!(page.contains("Approuvé"), "{page}");
+        let sent = email_port.sent_emails();
+        assert_eq!(sent.len(), 1, "one click, one letter");
+        assert_eq!(sent[0].to, vec![to.to_owned()]);
+        assert_eq!(state_of(&db, tenant, id).await, "redeemed");
+
+        // Rejoué : rien de plus ne part, et le lien « refuser » ne défait rien.
+        let (status, _) = get(path(&approve_url)).await;
+        assert_ne!(status, StatusCode::OK, "a replayed link was accepted");
+        let (status, _) = get(path(&deny_url)).await;
+        assert_ne!(status, StatusCode::OK, "a deny link undid an approval");
+        assert_eq!(email_port.sent_count(), 1);
+        assert_eq!(state_of(&db, tenant, id).await, "redeemed");
+    }
 
     #[tokio::test]
     async fn a_deny_is_recorded_and_the_action_never_executes() {
