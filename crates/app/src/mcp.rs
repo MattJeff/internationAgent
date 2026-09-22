@@ -325,13 +325,25 @@ impl RiskClass {
     /// Only ever used to *raise* a declared class — see [`classify`]. The
     /// defaults follow the MCP schema: a tool that says nothing about itself
     /// is assumed destructive.
-    fn from_hints(hints: &ToolAnnotations) -> Self {
+    /// What a server *says*, and only what it says. `readOnlyHint: true` is a
+    /// claim of innocence, `destructiveHint: true` an admission, `false` a
+    /// claim of mere writing. An annotation that says **neither** — GitHub's
+    /// own server ships `{readOnlyHint: false, idempotentHint: false}` on
+    /// `create_branch` and every other write, measured 2026-09-22 — is not a
+    /// confession, and reading the spec's "assume true" into it turned every
+    /// declared `write` into a `destructive` that needed a human per call: an
+    /// approved article could never open its pull request. The operator's
+    /// declaration, pinned to the digest, is the ruling; a hint only raises it
+    /// when the server actually admits to damage.
+    fn from_hints(hints: &ToolAnnotations) -> Option<Self> {
         if hints.read_only_hint == Some(true) {
-            RiskClass::Read
+            Some(RiskClass::Read)
+        } else if hints.destructive_hint == Some(true) {
+            Some(RiskClass::Destructive)
         } else if hints.destructive_hint == Some(false) {
-            RiskClass::Write
+            Some(RiskClass::Write)
         } else {
-            RiskClass::Destructive
+            None
         }
     }
 }
@@ -362,7 +374,7 @@ fn classify(declared: Option<RiskClass>, hints: Option<&ToolAnnotations>) -> Ris
     let Some(declared) = declared else {
         return RiskClass::Destructive;
     };
-    match hints.map(RiskClass::from_hints) {
+    match hints.and_then(RiskClass::from_hints) {
         Some(hinted) => declared.max(hinted),
         None => declared,
     }
@@ -2569,6 +2581,23 @@ mod tests {
             classify(Some(RiskClass::Destructive), Some(&claims_harmless)),
             RiskClass::Destructive,
             "a server claiming innocence is not"
+        );
+        // GitHub's shape: annotations present, silent on destructiveness.
+        let says_nothing = ToolAnnotations::new().read_only(false);
+        assert_eq!(
+            classify(Some(RiskClass::Write), Some(&says_nothing)),
+            RiskClass::Write,
+            "a server that does not admit to damage cannot raise a vetted write"
+        );
+        assert_eq!(
+            classify(Some(RiskClass::Read), Some(&says_nothing)),
+            RiskClass::Read,
+            "nor a vetted read"
+        );
+        assert_eq!(
+            classify(None, Some(&says_nothing)),
+            RiskClass::Destructive,
+            "undeclared stays destructive whatever the server leaves unsaid"
         );
     }
 
