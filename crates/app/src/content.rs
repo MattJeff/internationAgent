@@ -1125,7 +1125,7 @@ pub mod drafts {
         id: Uuid,
         revision: &Revision<'_>,
     ) -> Result<Option<Draft>, StoreError> {
-        let row = sqlx::query_as(
+        let row: Option<Draft> = sqlx::query_as(
             "UPDATE content_drafts \
                 SET title = $2, \
                     body = $3, \
@@ -1147,6 +1147,18 @@ pub mod drafts {
         .bind(Utc::now())
         .fetch_optional(&mut ***tx)
         .await?;
+        // Une URL constatée, c'est l'article en ligne : c'est ici, et nulle
+        // part ailleurs, que `content.published` part — le seul événement qui
+        // réveille le post LinkedIn (`social_post::on_content_published`).
+        // Jusqu'au 2026-09-22 personne ne l'émettait : la brique était câblée
+        // du côté qui écoute, pas du côté qui parle. La clé de dédoublonnage
+        // fait qu'une correction ultérieure ne repropose pas.
+        if let Some(draft) = row.as_ref().filter(|d| d.state == "published") {
+            let kind = crate::social_post::CONTENT_PUBLISHED_EVENT;
+            let mut event = agentos_store::outbox::NewEvent::new("content_draft", draft.id, kind);
+            event.dedupe_key = Some(format!("{kind}:{}", draft.id));
+            agentos_store::outbox::enqueue(tx, &event, Utc::now()).await?;
+        }
         Ok(row)
     }
 
@@ -2866,6 +2878,18 @@ mod tests {
         .expect("le brouillon existe");
         assert_eq!(published.state, "published");
         let first = published.published_at.expect("publié porte sa date");
+        let fired = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = $2",
+        )
+        .bind(draft.id)
+        .bind(crate::social_post::CONTENT_PUBLISHED_EVENT)
+        .fetch_one(&mut **tx)
+        .await
+        .expect("count");
+        assert_eq!(
+            fired, 1,
+            "une URL constatée doit émettre content.published, une fois"
+        );
 
         let corrected = drafts::update(
             &mut tx,
