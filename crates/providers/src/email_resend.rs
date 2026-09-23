@@ -444,7 +444,7 @@ struct RetrievedEmail {
     created_at: Option<DateTime<Utc>>,
     #[serde(default)]
     attachments: Vec<RetrievedAttachment>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "headers_either_shape")]
     headers: Vec<Header>,
     /// The RFC-5322 `Message-ID`, chevrons included — only on a sent email,
     /// and only once Resend has handed it to SES.
@@ -455,6 +455,31 @@ struct RetrievedEmail {
 struct Header {
     name: String,
     value: String,
+}
+
+/// Un envoi relu rend ses en-têtes en liste `[{name, value}]` ; un mail reçu
+/// (`/emails/receiving/{id}`) les rend en objet `{ "from": "…" }`, clés en
+/// minuscules. Les deux formes deviennent la même liste.
+fn headers_either_shape<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Header>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        List(Vec<Header>),
+        Map(std::collections::BTreeMap<String, serde_json::Value>),
+    }
+    Ok(match Either::deserialize(d)? {
+        Either::List(list) => list,
+        Either::Map(map) => map
+            .into_iter()
+            .map(|(name, value)| Header {
+                name,
+                value: match value {
+                    serde_json::Value::String(s) => s,
+                    other => other.to_string(),
+                },
+            })
+            .collect(),
+    })
 }
 
 #[derive(Deserialize)]
@@ -679,9 +704,23 @@ impl EmailProvider for ResendEmailProvider {
     }
 
     async fn fetch_inbound(&self, id: &ProviderMessageId) -> Result<RawInbound, ProviderError> {
-        let email: RetrievedEmail = self
-            .call_json(self.get(&format!("/emails/{}", id.as_str())))
-            .await?;
+        // Un mail REÇU vit sous `/emails/receiving/{id}` (Resend Receiving) ;
+        // `/emails/{id}` ne connaît que les envois et répond 404 — que
+        // l'ingestion lisait comme « pas encore là » et rejouait sans fin :
+        // mesuré le 2026-09-23, un test entrant jamais ingéré, donc aucune
+        // réponse de prospect ne serait jamais entrée. La lecture d'un envoi
+        // reste en repli, pour l'identifiant d'un autre âge.
+        let email: RetrievedEmail = match self
+            .call_json(self.get(&format!("/emails/receiving/{}", id.as_str())))
+            .await
+        {
+            Ok(email) => email,
+            Err(ProviderError::Terminal { code: "not_found" }) => {
+                self.call_json(self.get(&format!("/emails/{}", id.as_str())))
+                    .await?
+            }
+            Err(err) => return Err(err),
+        };
 
         // The webhook only had the bare address. The display name is here.
         let from = email
@@ -996,12 +1035,13 @@ mod tests {
                 "to": ["ap@supplier.example"],
                 "message_id": "<0106019a@ap-northeast-1.amazonses.com>",
             })),
-            "GET /emails/email_2" => json(json!({
+            "GET /emails/receiving/email_2" => json(json!({
                 "object": "email",
                 "id": "email_2",
                 // The bare address, as the webhook had it...
                 "from": "ap@supplier.example",
                 "to": ["lena@agents.example.com"],
+                "received_for": ["lena@agents.example.com"],
                 "subject": "RE: PO-4471",
                 "text": "See attached.",
                 "created_at": "2026-01-02T03:04:05Z",
@@ -1013,7 +1053,7 @@ mod tests {
                     "download_url": format!("http://{addr}/dl/att_1"),
                 }],
                 // ...and the display name, which only lives here.
-                "headers": [{ "name": "From", "value": "Accounts <ap@supplier.example>" }],
+                "headers": { "from": "Accounts <ap@supplier.example>", "return-path": "ap@supplier.example" },
             })),
             "GET /emails/email_hostile" => json(json!({
                 "id": "email_hostile",
@@ -1279,8 +1319,8 @@ mod tests {
         assert_eq!(
             fake.seen(),
             vec![
-                "GET /emails/email_2".to_owned(),
-                "GET /emails/email_2".to_owned(),
+                "GET /emails/receiving/email_2".to_owned(),
+                "GET /emails/receiving/email_2".to_owned(),
                 "GET /dl/att_1".to_owned(),
             ]
         );
@@ -1560,7 +1600,7 @@ mod tests {
         );
         assert_eq!(
             fake.provider()
-                .message_id_of(&ProviderMessageId::new("email_2"))
+                .message_id_of(&ProviderMessageId::new("email_hostile"))
                 .await
                 .expect("read"),
             None
