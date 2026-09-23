@@ -682,7 +682,8 @@ pub async fn feed(
             AND ($3::text IS NULL OR c.origin_ref = $3) \
             AND revenue_suppression_of(c.email, null::text) IS NULL \
             AND NOT EXISTS (SELECT 1 FROM sequence_runs r \
-                             WHERE r.sequence_id = $4 AND r.contact_id = c.id) \
+                             WHERE r.contact_id = c.id \
+                               AND (r.sequence_id = $4 OR r.state = 'active')) \
             AND NOT EXISTS (SELECT 1 FROM messages m \
                              WHERE m.direction = 'outbound' AND m.recipients ? c.email) \
           ORDER BY array_position($2::text[], a.country) NULLS LAST, c.created_at, c.id \
@@ -2671,6 +2672,78 @@ mod tests {
     /// the already-enrolled, the already-written and the inactive are never
     /// offered; the day it is set counts as fed; a second call the same day
     /// does nothing; zero left still stamps the day.
+    /// Deux séquences nourries du même vivier le même jour ne se partagent pas
+    /// un contact : mesuré le 2026-09-23, les jumelles `-2` avaient inscrit les
+    /// cinq mêmes personnes que les premières. Un run actif ailleurs suffit à
+    /// écarter ; un run fini (`not_sent`) dans une autre séquence n'écarte pas.
+    #[tokio::test]
+    async fn two_feeds_on_the_same_pool_never_pick_the_same_contact() {
+        use agentos_domain::policy::PolicyLimits;
+        use agentos_store::policy;
+
+        let Some(f) = fixture().await else {
+            return;
+        };
+        policy::install(
+            &f.db,
+            f.tenant,
+            policy::Scope::Tenant,
+            &PolicyLimits {
+                max_new_contacts_per_day: 5,
+                ..PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("install the policy");
+        let t0 = Utc::now().trunc_subsecs(6);
+        let day = t0.date_naive();
+        let seq_a = defined(&f, &[email("hello")]).await;
+        let seq_b = defined(&f, &[email("hello again")]).await;
+        let mut ids = Vec::new();
+        for n in 1..=3 {
+            ids.push(prospect_in(&f, "airline", "FR", None, t0 - TimeDelta::days(n)).await);
+        }
+        let plan = Feed {
+            employee_id: f.lena,
+            per_day: 2,
+            hour: DEFAULT_HOUR,
+            segment: "airline".to_owned(),
+            countries: Vec::new(),
+            source: None,
+        };
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        set_feed(&mut tx, seq_a, &plan, day).await.expect("feed a");
+        set_feed(&mut tx, seq_b, &plan, day).await.expect("feed b");
+        tx.commit().await.expect("commit");
+
+        let tomorrow = day + TimeDelta::days(1);
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        let pool: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM contacts c JOIN accounts a ON a.id = c.account_id \
+              WHERE c.active AND c.email IS NOT NULL AND a.segment = 'airline'",
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .expect("pool");
+        tx.commit().await.expect("commit");
+        assert_eq!(fed(&f, seq_a, tomorrow).await, Some(2));
+        assert_eq!(
+            fed(&f, seq_b, tomorrow).await,
+            Some(usize::try_from((pool - 2).clamp(0, 2)).expect("small")),
+            "b takes what a left, never a's people"
+        );
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        let shared: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sequence_runs a JOIN sequence_runs b \
+                 ON a.contact_id = b.contact_id AND a.sequence_id <> b.sequence_id",
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .expect("count");
+        assert_eq!(shared, 0, "a contact enrolled twice on the same morning");
+        tx.commit().await.expect("commit");
+    }
+
     #[tokio::test]
     async fn a_feed_picks_who_is_next_once_a_day_and_says_when_it_is_dry() {
         use agentos_domain::policy::PolicyLimits;
