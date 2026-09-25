@@ -974,6 +974,39 @@ async fn asked_founder(
 
 /// La Gate a refusé un inconnu à ce siège depuis `since` : la ligne d'audit
 /// que `refusals_get` lit, avec son code.
+enum LetterStatus {
+    Pending,
+    Denied,
+}
+
+/// La lettre de ce siège à ce contact, retenue pour relecture depuis `since` :
+/// en attente du clic, ou refusée. `None` : rien de retenu (envoyée, ou
+/// jamais rédigée).
+async fn letter_status(
+    tx: &mut TenantTx<'_>,
+    employee: EmployeeId,
+    to: &str,
+    since: DateTime<Utc>,
+) -> Result<Option<LetterStatus>, StoreError> {
+    let state: Option<String> = sqlx::query_scalar(
+        "SELECT state FROM approvals \
+          WHERE employee_id = $1 AND action_kind = 'email_send' \
+            AND action->'draft'->>'to' = $2 AND requested_at >= $3 \
+            AND state IN ('pending', 'denied') \
+          ORDER BY requested_at DESC LIMIT 1",
+    )
+    .bind(employee.as_uuid())
+    .bind(to)
+    .bind(since)
+    .fetch_optional(&mut ***tx)
+    .await?;
+    Ok(match state.as_deref() {
+        Some("pending") => Some(LetterStatus::Pending),
+        Some("denied") => Some(LetterStatus::Denied),
+        _ => None,
+    })
+}
+
 async fn budget_refused(
     tx: &mut TenantTx<'_>,
     employee: EmployeeId,
@@ -1231,6 +1264,20 @@ pub async fn advance(
             };
             if asked_founder(tx, employee, rang).await? {
                 return stop(tx, run, "stopped", Some("declined"), now).await;
+            }
+            // Une lettre rédigée et retenue pour relecture n'est pas une touche
+            // manquée : on attend le clic. Rejouer ici faisait écrire une
+            // seconde lettre au même contact, et le fondateur, qui approuve ce
+            // qu'on lui montre, en a approuvé deux — quatre prospects ont reçu
+            // deux mails le 2026-09-24. Un refus, lui, ferme la touche.
+            match letter_status(tx, employee, &email, rang).await? {
+                Some(LetterStatus::Pending) => {
+                    return goto(tx, run, step, (now + WAKE_POLL).min(deadline)).await;
+                }
+                Some(LetterStatus::Denied) => {
+                    return stop(tx, run, "stopped", Some("declined"), now).await;
+                }
+                None => {}
             }
             let replays = wakes.len() - 1;
             let hour = row
@@ -2381,6 +2428,79 @@ mod tests {
 
     /// **A question to the founder is a decision, not a fault.** The run stops
     /// `declined` on the next poll, and the reading says so.
+    /// Une lettre retenue pour relecture met la touche en attente du clic —
+    /// pas de rejeu, donc pas de seconde lettre ; refusée, la touche se ferme.
+    #[tokio::test]
+    async fn a_letter_awaiting_the_click_is_not_replayed_and_a_refusal_closes_the_touch() {
+        use agentos_domain::action::Action;
+        use agentos_store::approvals::{self, NewApproval};
+
+        let Some(f) = fixture_alone("attente_clic").await else {
+            return;
+        };
+        let t0 = Utc::now().trunc_subsecs(6);
+        let seq = defined(&f, &[email("hello"), wait(24), email("again")]).await;
+        let run = enrolled(&f, seq, t0).await;
+        tick(&f, run, t0).await;
+        rung(&f, run, t0 + TimeDelta::minutes(1)).await;
+        woken_outcome(&f, run, "turn").await;
+
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        let to: String = sqlx::query_scalar("SELECT email FROM contacts WHERE id = $1")
+            .bind(f.contact)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("the contact's address");
+        let action = Action::EmailSend {
+            to: to.parse().expect("an address"),
+        };
+        let filed = approvals::create(
+            &mut tx,
+            &NewApproval {
+                employee_id: Some(f.lena),
+                action: &action,
+                requested_by: "seat",
+                required_role: "approver",
+                reason: Some("email"),
+                expires_at: t0 + TimeDelta::hours(24),
+            },
+            t0 + TimeDelta::minutes(2),
+        )
+        .await
+        .expect("file");
+        approvals::attach_draft(
+            &mut tx,
+            filed.id(),
+            &serde_json::json!({ "to": to, "subject": "hello", "body": "…" }),
+        )
+        .await
+        .expect("draft");
+        tx.commit().await.expect("commit");
+
+        let r = tick(&f, run, t0 + TimeDelta::minutes(3)).await;
+        assert_eq!(
+            r.state, "active",
+            "a letter awaiting the click is not a missed touch"
+        );
+        assert_eq!(promises(&f, run).await.len(), 1, "and it is not replayed");
+
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        sqlx::query("UPDATE approvals SET state = 'denied', decided_at = $2 WHERE id = $1")
+            .bind(filed.id().as_uuid())
+            .bind(t0 + TimeDelta::minutes(4))
+            .execute(&mut **tx)
+            .await
+            .expect("deny");
+        tx.commit().await.expect("commit");
+        let r = tick(&f, run, t0 + TimeDelta::minutes(5)).await;
+        assert_eq!(
+            (r.state.as_str(), r.stop_reason.as_deref()),
+            ("stopped", Some("declined")),
+            "a refused letter closes the touch"
+        );
+        assert_eq!(promises(&f, run).await.len(), 1);
+    }
+
     #[tokio::test]
     async fn a_question_to_the_founder_stops_the_run_at_once_as_declined() {
         let Some(f) = fixture_alone("rejeu_question").await else {
