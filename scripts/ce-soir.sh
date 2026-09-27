@@ -141,8 +141,25 @@ case "$ACTION" in
     # diagnostic : la cause est à trouver dans le serveur.
     VEILLE_MINUTES="${VEILLE_MINUTES:-20}"
     dit "veille : je relance le serveur seul si $JOURNAL n'a plus bougé depuis $VEILLE_MINUTES min (Ctrl-C pour arrêter)."
+    tunnel_mort=0
     while :; do
       sleep 300
+      # Le tunnel nommé : l'adresse fixe doit répondre. 530 = « tunnel not
+      # connected », 000 = rien. Deux fois de suite (10 min), on relance
+      # cloudflared — le processus peut être vivant et ses connexions mortes.
+      if [ -n "${PUBLIC_HOST_FIXE:-}" ] && [ -f "$HOME/.cloudflared/orizn-local.token" ]; then
+        case "$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$PUBLIC_HOST_FIXE/livez")" in
+          000|530) tunnel_mort=$((tunnel_mort + 1)) ;;
+          *) tunnel_mort=0 ;;
+        esac
+        if [ "$tunnel_mort" -ge 2 ]; then
+          dit "$(date -u +%FT%TZ) : $PUBLIC_HOST_FIXE ne répond plus — je relance le tunnel nommé."
+          pkill -f "cloudflared tunnel --no-autoupdate run" 2>/dev/null || true
+          nohup cloudflared tunnel --no-autoupdate run --token "$(cat "$HOME/.cloudflared/orizn-local.token")" \
+            >> "$ETAT/tunnel-nomme.log" 2>&1 &
+          tunnel_mort=0
+        fi
+      fi
       [ -f "$JOURNAL" ] || continue
       age=$(( $(date +%s) - $(stat -f %m "$JOURNAL") ))
       if [ "$age" -gt $(( VEILLE_MINUTES * 60 )) ]; then
@@ -449,6 +466,14 @@ attendre() { # url, secondes, quoi
 }
 attendre "http://127.0.0.1:$PORT/livez" 60 "le serveur"
 dit "serveur vivant, pid $SERVEUR, journal $JOURNAL"
+# Le portable ne doit pas s'endormir tant que le serveur tourne : `sleep 1`
+# dans pmset, et le 2026-09-27 de 16:43 à 19:01 UTC le réseau est parti avec
+# l'écran — tunnel en 530, boucles au ralenti, rien ne partait. L'assertion
+# meurt avec le serveur (`-w`).
+if command -v caffeinate >/dev/null; then
+  nohup caffeinate -i -s -w "$SERVEUR" >/dev/null 2>&1 &
+  dit "caffeinate tient la machine éveillée tant que le pid $SERVEUR vit."
+fi
 
 # Le locataire. `new-tenant` crée, il n'adopte pas : une seconde exécution dit
 # « existe déjà », et c'est exactement ce qu'on veut entendre.
