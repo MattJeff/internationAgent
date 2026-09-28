@@ -12,6 +12,13 @@
 //! destinataire pour toujours. Passé un jour, la réponse est « applique ton
 //! plan », et c'est ce qu'écrit cette boucle.
 //!
+//! Seulement les questions de **un à deux jours** : passé deux jours, la
+//! question ne bloque plus rien (`still_pending` ne lit que 24 h) et la
+//! réponse réveillerait un siège pour rien — le 2026-09-28, 94 questions
+//! dormaient depuis le 19, soit 94 tours de modèle à la première passe.
+//! ponytail: borne dans la requête ; une colonne « fermée par l'horloge »
+//! le jour où il faut distinguer « répondue » de « expirée ».
+//!
 //! # Comment elle traverse les locataires
 //!
 //! Le même geste que `sequence` : une lecture sous `admin_tx_bypassing_rls`
@@ -68,6 +75,7 @@ pub async fn tick(db: &Db, now: DateTime<Utc>) -> Result<usize, StoreError> {
            JOIN employees a ON a.tenant_id = q.tenant_id AND a.slug = q.sender \
                             AND a.lifecycle = 'active' \
           WHERE q.internal_kind = 'question' AND q.created_at <= $1::timestamptz \
+            AND q.created_at > $1::timestamptz - interval '1 day' \
             AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.answers_message_id = q.id) AND ",
         agentos_store::not_stopped!("q.tenant_id", "$2::timestamptz"),
         " ORDER BY q.created_at, q.id LIMIT $3::bigint",
@@ -172,8 +180,10 @@ mod tests {
         .expect("policy");
 
         let db = &db;
-        let ask = |from, to: &'static str, when| async move {
+        let ask = |from, to: &'static str, when: chrono::DateTime<chrono::Utc>| async move {
             let mut tx = db.tenant_tx(tenant).await.expect("tx");
+            // One key per question: the same key would resume the earlier one.
+            let step = format!("internal:patience:{}", when.timestamp());
             let sent = inbound::send(
                 &mut tx,
                 from,
@@ -182,7 +192,7 @@ mod tests {
                 "Which warehouse do I quote for PO-4471?",
                 TrustLabel::Trusted,
                 None,
-                &IdempotencyKey::for_step(from, "internal:patience"),
+                &IdempotencyKey::for_step(from, &step),
                 when,
             )
             .await
@@ -190,6 +200,10 @@ mod tests {
             tx.commit().await.expect("commit");
             sent
         };
+        // Asked first: at 25 h before now it is already older than the
+        // patience window, so the stale one is not refused as a second
+        // question on the same colleague.
+        let forgotten = ask(lena, "bruno", now - TimeDelta::hours(50)).await;
         let stale = ask(lena, "bruno", now - TimeDelta::hours(25)).await;
         let fresh = ask(bruno, "lena", now - TimeDelta::hours(2)).await;
 
@@ -214,6 +228,11 @@ mod tests {
             "25 h: answered by the clock"
         );
         assert_eq!(answers(fresh.message_id).await, 0, "2 h: still waiting");
+        assert_eq!(
+            answers(forgotten.message_id).await,
+            0,
+            "50 h: blocks nothing any more, nobody is woken for it"
+        );
 
         tick(db, now).await.expect("second tick");
         assert_eq!(
