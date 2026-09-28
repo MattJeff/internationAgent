@@ -370,7 +370,20 @@ pub fn by_model(sample: Sample, calls_per_turn: f64) -> Vec<(ModelId, usize, f64
 /// jetons par appel en entrée, ~420 en sortie — dans le ±20 % des figures du
 /// 09-05 (8,00 / 7,33 / 8,00 ; 7,4–7,5 k). `RECORDED` et la phrase de
 /// `docs/ORIZN.md` sont ceux de ces trois runs.
-pub const DIGEST: &str = "86544fe861f3bf45";
+/// # Déplacé le 2026-09-28, et voici pourquoi les chiffres ne le sont pas
+///
+/// Deux choses, toutes deux du **prompt** et toutes deux sur le seul plan
+/// commercial : (1) les paliers portent le nom de la page — Commercial,
+/// Production, License — et non plus Starter, Pro, Enterprise ; un siège
+/// réel a demandé au fondateur « quel palier Starter ? » avant d'écrire, et
+/// seize lettres sont mortes derrière cette question bloquée ; (2) la charte
+/// porte la politique effective (`Charter::with_policy`) au lieu des limites
+/// par défaut du pack, donc l'étape Approach dit le budget d'inconnus que le
+/// siège a vraiment au lieu de « Cold outreach is switched off ». Aucune ligne
+/// de catalogue n'est entrée, aucun schéma d'outil n'a bougé : les appels par
+/// tour n'ont aucune raison d'avoir changé, et le précédent du 09-20 (une
+/// phrase de plan sur un siège) autorise le re-pin sans re-mesure.
+pub const DIGEST: &str = "8a10a296b9c6b62c";
 
 // ---------------------------------------------------------------------------
 // The company, as the operator wrote it down
