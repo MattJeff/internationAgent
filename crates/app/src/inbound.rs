@@ -2813,6 +2813,47 @@ fn is_probe(subject: Option<&Untrusted<String>>) -> bool {
     subject.is_some_and(|s| s.expose_for_parsing().starts_with(PROBE_SUBJECT_PREFIX))
 }
 
+/// What an auto-responder puts in a subject: out-of-office, vacation, bounce.
+/// Resend's retrieve endpoint hands back no `Auto-Submitted` header, so the
+/// subject is what there is. Lowercased, matched anywhere in the subject.
+///
+/// ponytail: a list, not a classifier; add a language when a seat answers
+/// one. The 2026-09-28 case was QQ's « 自动回复: » — the support seat wrote
+/// a warm reply to a vacation notice and the sequence took it for an answer.
+const AUTO_REPLY_MARKS: &[&str] = &[
+    "自动回复",
+    "自動回覆",
+    "automatic reply",
+    "auto-reply",
+    "autoreply",
+    "auto reply",
+    "auto:",
+    "out of office",
+    "out of the office",
+    "réponse automatique",
+    "absence du bureau",
+    "abwesenheit",
+    "automatische antwort",
+    "respuesta automática",
+    "risposta automatica",
+    "autosvar",
+    "automatisch antwoord",
+    "delivery status notification",
+    "undeliverable",
+    "mail delivery failed",
+    "delivery failure",
+];
+
+/// True for a subject an auto-responder or a mail system wrote. Such a message
+/// lands (the thread keeps it) but wakes nobody, opens no ticket, and settles
+/// neither the sequence nor the follow-up chase: the person has not written.
+pub fn is_auto_reply(subject: Option<&Untrusted<String>>) -> bool {
+    subject.is_some_and(|s| {
+        let lower = s.expose_for_parsing().to_lowercase();
+        AUTO_REPLY_MARKS.iter().any(|mark| lower.contains(mark))
+    })
+}
+
 pub async fn land(
     tx: &mut TenantTx<'_>,
     message: &CanonicalMessage,
@@ -2869,9 +2910,11 @@ pub async fn land(
         .await
         .map_err(StoreError::from)?;
 
-    // ponytail: nil = no turn queued; the probe is the only message that
-    // lands without one, and `resume` hands back the same nil on redelivery.
-    let probe = is_probe(message.subject.as_ref());
+    // ponytail: nil = no turn queued; the probe and an auto-reply are the
+    // only messages that land without one, and `resume` hands back the same
+    // nil on redelivery.
+    let auto = is_auto_reply(message.subject.as_ref());
+    let probe = is_probe(message.subject.as_ref()) || auto;
     let turn_event_id = if probe {
         Uuid::nil()
     } else {
@@ -2924,7 +2967,7 @@ pub async fn land(
     // thread by `crate::follow_up` is settled here, in the transaction that
     // lands the answer, so the employee is never woken to chase somebody who
     // has already written back. Zero rows is the ordinary case.
-    if message.direction == Direction::Inbound {
+    if message.direction == Direction::Inbound && !auto {
         calendar::cancel_for_conversation(tx, message.conversation_id, now)
             .await
             .map_err(InboundError::Store)?;
@@ -3349,7 +3392,8 @@ async fn resume(
         return Ok(None);
     };
     let conversation_id = ConversationId::from_uuid(conversation_id);
-    let turn_event_id = if subject.is_some_and(|s| s.starts_with(PROBE_SUBJECT_PREFIX)) {
+    let subject = subject.map(Untrusted::new);
+    let turn_event_id = if is_probe(subject.as_ref()) || is_auto_reply(subject.as_ref()) {
         Uuid::nil()
     } else {
         enqueue_turn(tx, employee_id, conversation_id, message_id, key, now).await?
@@ -6136,6 +6180,55 @@ mod tests {
             .expect("redelivery");
         assert!(again.duplicate);
         assert_eq!(turns(&db, tenant).await, 0);
+    }
+
+    /// **An out-of-office lands and wakes nobody.** The 2026-09-28 QQ
+    /// vacation notice woke the support seat, which answered it warmly, and
+    /// the welcome sequence took it for a reply. A subject an auto-responder
+    /// wrote is kept on the thread and nothing else happens.
+    #[tokio::test]
+    async fn an_auto_reply_lands_without_a_turn_or_a_ticket() {
+        let Some(db) = db().await else { return };
+        let (tenant, _) = seed(&db).await;
+        let now = Utc::now();
+        let email = MockEmailProvider::new();
+        let mut ooo = raw("ooo_1", now, Duration::hours(1));
+        ooo.subject = Some("自动回复: Welcome to the Orizn Visa API".to_owned());
+        ooo.attachments.clear();
+        email.seed_inbound(ooo, Vec::<(String, Vec<u8>)>::new());
+
+        let landed = deliver(&db, &email, tenant, &notice("ooo_1", now), now)
+            .await
+            .expect("it lands");
+        assert_eq!(landed.turn_event_id, Uuid::nil());
+        assert_eq!(messages(&db, tenant).await, 1, "kept on the thread");
+        assert_eq!(turns(&db, tenant).await, 0, "nobody is woken");
+        assert_eq!(
+            count(&db, tenant, "SELECT count(*) FROM work_items").await,
+            0
+        );
+    }
+
+    #[test]
+    fn an_auto_reply_is_read_off_the_subject_in_any_language() {
+        let subj = |s: &str| Some(Untrusted::new(s.to_owned()));
+        for s in [
+            "自动回复: Welcome to the Orizn Visa API",
+            "Automatic reply: Your Orizn Visa API usage",
+            "Réponse automatique : Bienvenue",
+            "Out of Office Re: entry requirements",
+            "Undeliverable: Welcome to the Orizn Visa API",
+        ] {
+            assert!(is_auto_reply(subj(s).as_ref()), "{s}");
+        }
+        for s in [
+            "Re: Your Orizn Visa API usage",
+            "Re: entry requirements per passport and destination",
+            "Question sur votre API",
+        ] {
+            assert!(!is_auto_reply(subj(s).as_ref()), "{s}");
+        }
+        assert!(!is_auto_reply(None));
     }
 
     /// The attachment window: the bytes are fetched during the ingest that

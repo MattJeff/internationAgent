@@ -186,7 +186,7 @@ case "$ACTION" in
       age=$(( $(date +%s) - $(stat -f %m "$JOURNAL") ))
       if [ "$age" -gt $(( VEILLE_MINUTES * 60 )) ]; then
         dit "$(date -u +%FT%TZ) : journal muet depuis $((age/60)) min — relance."
-        "$0" --relancer --reel --recevoir </dev/null || dit "la relance a échoué ; je réessaierai dans 5 min."
+        RELANCE_FORCEE=1 "$0" --relancer --reel --recevoir </dev/null || dit "la relance a échoué ; je réessaierai dans 5 min."
       fi
     done
     exit 0 ;;
@@ -222,7 +222,24 @@ fi
 
 mkdir -p "$ETAT"; chmod 700 "$ETAT"
 
+# Entre 08:00 et 09:00 UTC les relances J+3 partent (08:0x) et les premiers
+# nourrissages se préparent (09:00) : une relance tue les tours en vol et
+# brûle leurs rejeux. Refusée dans cette fenêtre, sauf RELANCE_FORCEE=1 (la
+# veille le pose : un serveur mort est pire qu'un tour perdu).
+if [ "$RELANCER" = 1 ] && [ "$(date -u +%H)" = "08" ] && [ "${RELANCE_FORCEE:-0}" != 1 ]; then
+  refuse "pas de relance entre 08:00 et 09:00 UTC (relances et nourrissages en vol) ; attends 09:00 ou RELANCE_FORCEE=1."
+fi
+
 if [ "$REEL" = 1 ]; then
+  # Une relance depuis un autre shell n'a pas la clé Resend ni le domaine :
+  # ils ne sont pas dans secrets.env, ils sont dans l'environnement du serveur
+  # qui tourne (le motif de deja_reel). Les reprendre là plutôt que refuser —
+  # deux relances du 2026-09-28 ont buté dessus.
+  if [ -z "${EMAIL_API_KEY:-}" ] && [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    eval "$(ps eww -p "$(cat "$PIDFILE")" -o command= 2>/dev/null | tr ' ' '\n' \
+      | grep -E '^(EMAIL_API_KEY|AGENT_EMAIL_DOMAIN|EMAIL_FROM_NAME)=' | sed 's/^/export /')"
+    [ -n "${EMAIL_API_KEY:-}" ] && dit "clé Resend et domaine repris sur le serveur vivant."
+  fi
   [ -n "${EMAIL_API_KEY:-}" ] \
     || refuse "--reel sans EMAIL_API_KEY. Exporte la clé Resend d'abord ; sans elle l'adaptateur reste faux et --reel ne veut rien dire."
   [ -n "${AGENT_EMAIL_DOMAIN:-}" ] \
