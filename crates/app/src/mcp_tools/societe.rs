@@ -271,6 +271,33 @@ pub fn tools() -> Vec<ToolDef> {
             &[],
             Risk::Read,
         ),
+        t(
+            "digest_get",
+            "Ce que cette société a fait dans la journée",
+            "Rend la journée UTC en une lecture : les lettres e-mail parties par séquence et \
+             les runs arrêtés avec leur raison (`not_sent`, `declined`…), les réponses reçues \
+             (expéditeur, objet, heure), les questions internes sans réponse de moins de 24 h par \
+             siège demandeur — chacune bloque ce siège —, les approbations en attente par \
+             `action_kind`, les tours par siège, les flux nourris ou non, et les deux compteurs \
+             de santé. **C'est ce que le mail de 18 h porte** : l'appeler, c'est le recevoir \
+             avant l'heure. `company_health_get` dit si la société pense ; celui-ci dit ce \
+             qu'elle a fait. `day` par défaut est aujourd'hui.",
+            Method::Get,
+            "/v1/digest",
+            json!({
+                "type": "object",
+                "properties": {
+                    "day": {
+                        "type": "string",
+                        "format": "date",
+                        "description": "Le jour UTC, `YYYY-MM-DD`. Aujourd'hui par défaut."
+                    }
+                },
+                "required": []
+            }),
+            &["day"],
+            Risk::Read,
+        ),
         // Il n'y a **pas** de ligne pour `GET /v1/public-register`, et c'est une
         // correction plutôt qu'un oubli. Mesuré le 2026-09-11 depuis un
         // terminal : l'outil qui existait ici rendait un 404 nu à chaque appel,
@@ -1689,8 +1716,9 @@ mod tests {
     /// une route, sans qu'aucun test ne rougisse. En lisant le source, le test
     /// compare la table à ce qui est **réellement monté**, et un fichier déplacé
     /// ne compile même pas.
-    const ROUTE_SOURCES: [&str; 18] = [
+    const ROUTE_SOURCES: [&str; 19] = [
         include_str!("../../../../apps/server/src/routes/employees.rs"),
+        include_str!("../../../../apps/server/src/routes/digest.rs"),
         include_str!("../../../../apps/server/src/routes/teams.rs"),
         include_str!("../../../../apps/server/src/routes/companies.rs"),
         include_str!("../../../../apps/server/src/routes/desk.rs"),
