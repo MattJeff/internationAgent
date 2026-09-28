@@ -207,41 +207,36 @@ async fn set_feed(
         source: body.source,
     };
     let mut tx = db.tenant_tx(principal.tenant_id).await?;
-    sequence::set_feed(
-        &mut tx,
-        SequenceId::from_uuid(id),
-        &feed,
-        Utc::now().date_naive(),
-    )
-    .await
-    .map_err(|err| match err {
-        FeedError::NotFound(what) => {
-            ApiError::not_found().with_detail(format!("no such {what} in this company"))
-        }
-        FeedError::BadSegment => {
-            ApiError::new(StatusCode::BAD_REQUEST, "bad_segment", "unknown segment")
-                .with_detail(err.to_string())
-        }
-        FeedError::OverBudget { .. } => ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "feed_over_budget",
-            "the feed asks for more strangers a day than the seat may write to",
-        )
-        .with_detail(err.to_string()),
-        FeedError::ZeroPerDay | FeedError::BadHour | FeedError::BadCountry(_) => {
-            ApiError::bad_request(err.to_string())
-        }
-        FeedError::Policy(PolicyLoadError::NoPlatformLayer) => ApiError::new(
-            StatusCode::CONFLICT,
-            "no_platform_policy",
-            "this deployment has no platform ceiling",
-        ),
-        FeedError::Policy(err) => {
-            tracing::error!(error = %err, "a feed could not read the seat's policy");
-            ApiError::internal()
-        }
-        FeedError::Store(err) => ApiError::from(err),
-    })?;
+    sequence::set_feed(&mut tx, SequenceId::from_uuid(id), &feed, Utc::now())
+        .await
+        .map_err(|err| match err {
+            FeedError::NotFound(what) => {
+                ApiError::not_found().with_detail(format!("no such {what} in this company"))
+            }
+            FeedError::BadSegment => {
+                ApiError::new(StatusCode::BAD_REQUEST, "bad_segment", "unknown segment")
+                    .with_detail(err.to_string())
+            }
+            FeedError::OverBudget { .. } => ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "feed_over_budget",
+                "the feed asks for more strangers a day than the seat may write to",
+            )
+            .with_detail(err.to_string()),
+            FeedError::ZeroPerDay | FeedError::BadHour | FeedError::BadCountry(_) => {
+                ApiError::bad_request(err.to_string())
+            }
+            FeedError::Policy(PolicyLoadError::NoPlatformLayer) => ApiError::new(
+                StatusCode::CONFLICT,
+                "no_platform_policy",
+                "this deployment has no platform ceiling",
+            ),
+            FeedError::Policy(err) => {
+                tracing::error!(error = %err, "a feed could not read the seat's policy");
+                ApiError::internal()
+            }
+            FeedError::Store(err) => ApiError::from(err),
+        })?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -295,6 +290,7 @@ mod tests {
     use agentos_domain::ids::TenantId;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request as HttpRequest, header};
+    use chrono::{TimeDelta, Timelike as _};
     use serde_json::Value;
     use tower::ServiceExt;
 
@@ -666,10 +662,18 @@ mod tests {
         );
         assert_eq!(mine["feed"]["countries"], json!(["FR"]), "{body}");
         assert_eq!(mine["feed"]["employee_id"], json!(h.lena), "{body}");
+        // Before 8 h UTC the feed is due today, so yesterday counts as the
+        // last fed day; after, today does.
+        let now = Utc::now();
+        let last_fed = if now.hour() < 8 {
+            now.date_naive() - TimeDelta::days(1)
+        } else {
+            now.date_naive()
+        };
         assert_eq!(
             mine["fed_on"],
-            json!(Utc::now().date_naive().to_string()),
-            "the day it is set counts as fed: {body}"
+            json!(last_fed.to_string()),
+            "fed today at 8 h if not past, else tomorrow: {body}"
         );
 
         let (status, _) = h.send("DELETE", &uri, SECRET_B, None).await;

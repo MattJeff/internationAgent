@@ -685,7 +685,7 @@ pub fn tools() -> Vec<ToolDef> {
                  `max_new_contacts_per_day` effectif du siège (le détail dit les deux nombres) ; \
                  c'est cette borne, et non une lecture du budget au moment de nourrir, qui \
                  protège des refus `contact_budget_exhausted` — le seul risque restant est un \
-                 envoi autonome du siège avant `hour`. Le jour de la pose compte comme nourri : la première inscription est le lendemain. 400 `bad_segment` \
+                 envoi autonome du siège avant `hour`. Posé avant `hour`, le flux nourrit le jour même à `hour` ; posé après, dès le lendemain ; jamais deux fois le même jour. 400 `bad_segment` \
                  hors de `prospects_segments_list` ; 404 si la séquence ou le siège ne sont pas à \
                  cette entreprise. L'`id` vient de `sequences_list`, l'`employee_id` \
                  d'`employees_list` ; ce que le flux a fait se lit sur `sequences_runs_list`.",

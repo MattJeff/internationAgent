@@ -358,7 +358,7 @@ mod tests {
         )
         .await
         .expect("define");
-        // Set yesterday, so that today is a new day for it.
+        // Set at 7 h this morning: before its hour, so today is fed today.
         sequence::set_feed(
             &mut tx,
             seq,
@@ -370,7 +370,10 @@ mod tests {
                 countries: Vec::new(),
                 source: None,
             },
-            (now - TimeDelta::days(1)).date_naive(),
+            now.date_naive()
+                .and_hms_opt(7, 0, 0)
+                .expect("time")
+                .and_utc(),
         )
         .await
         .expect("set");

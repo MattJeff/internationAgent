@@ -158,11 +158,16 @@
 //! possible dans la fenêtre est un envoi autonome du siège avant l'heure — un
 //! défaut reproduit chez une OTA, rare — et ce risque est préféré à des mails de
 //! nuit ; la ceinture est que `per_day` reste borné par le budget à la pose,
-//! donc un jour sans envoi autonome ne gaspille jamais rien.** Le jour de la
-//! pose compte comme nourri (`fed_on = aujourd'hui`) : on ne sait pas ce que le
-//! siège a déjà écrit ce jour-là, et le premier jour sûr est demain. Ce que le
-//! fondateur inscrit à la main par-dessus est son choix et se voit dans
-//! `refusals_get`.
+//! donc un jour sans envoi autonome ne gaspille jamais rien.** Un flux posé
+//! ou modifié nourrit **le jour même si son heure n'est pas passée** : posé à
+//! 7 h pour 9 h, `fed_on = hier` et la boucle nourrit à 9 h ; posé à 11 h,
+//! `fed_on = aujourd'hui` et le premier jour nourri est demain — l'heure est
+//! passée, le budget du jour est peut-être dépensé. `fed_on` ne recule jamais
+//! (`GREATEST`) : un flux qui a nourri ce matin puis est modifié ne renourrit
+//! pas aujourd'hui. Mesuré le 2026-09-28 : cinq flux posés ou retouchés le
+//! matin, dont une baisse de `per_day`, n'ont rien tiré à 9 h parce que la
+//! pose comptait comme nourri. Ce que le fondateur inscrit à la main
+//! par-dessus est son choix et se voit dans `refusals_get`.
 //!
 //! **Un contact déjà écrit n'est pas re-démarché.** La sélection exclut tout
 //! contact vers qui une ligne `messages` sortante existe, quel que soit le
@@ -558,13 +563,15 @@ impl From<sqlx::Error> for FeedError {
 }
 
 /// Poser (ou remplacer) le flux d'une séquence vivante. `per_day` est borné
-/// par le budget effectif du siège, et `fed_on` est posé à `today` : le premier
-/// jour nourri est demain, le seul dont on sait que le budget est neuf.
+/// par le budget effectif du siège. `fed_on` est posé à hier si l'heure du
+/// flux n'est pas encore passée à `now` — la boucle nourrit aujourd'hui à
+/// `hour` — et à aujourd'hui sinon ; jamais reculé sous sa valeur existante,
+/// pour qu'un flux déjà nourri ce jour ne nourrisse pas deux fois.
 pub async fn set_feed(
     tx: &mut TenantTx<'_>,
     sequence: SequenceId,
     feed: &Feed,
-    today: NaiveDate,
+    now: DateTime<Utc>,
 ) -> Result<(), FeedError> {
     if feed.per_day == 0 {
         return Err(FeedError::ZeroPerDay);
@@ -615,12 +622,20 @@ pub async fn set_feed(
             .map(str::to_owned),
         ..feed.clone()
     };
+    let today = now.date_naive();
+    let fed_on = if now.hour() < u32::from(feed.hour) {
+        today - TimeDelta::days(1)
+    } else {
+        today
+    };
+    // GREATEST ignore un `fed_on` NULL : la pose ne recule jamais la date.
     let n = sqlx::query(
-        "UPDATE sequences SET feed = $2, fed_on = $3 WHERE id = $1 AND archived_at IS NULL",
+        "UPDATE sequences SET feed = $2, fed_on = GREATEST(fed_on, $3::date) \
+          WHERE id = $1 AND archived_at IS NULL",
     )
     .bind(sequence.as_uuid())
     .bind(serde_json::to_value(&stored).map_err(|e| StoreError::conflict(e.to_string()))?)
-    .bind(today)
+    .bind(fed_on)
     .execute(&mut ***tx)
     .await?
     .rows_affected();
@@ -2365,7 +2380,7 @@ mod tests {
                 countries: Vec::new(),
                 source: None,
             },
-            today,
+            at(0, 10, 0),
         )
         .await
         .expect("feed");
@@ -2832,8 +2847,8 @@ mod tests {
             source: None,
         };
         let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
-        set_feed(&mut tx, seq_a, &plan, day).await.expect("feed a");
-        set_feed(&mut tx, seq_b, &plan, day).await.expect("feed b");
+        set_feed(&mut tx, seq_a, &plan, t0).await.expect("feed a");
+        set_feed(&mut tx, seq_b, &plan, t0).await.expect("feed b");
         tx.commit().await.expect("commit");
 
         let tomorrow = day + TimeDelta::days(1);
@@ -2885,6 +2900,8 @@ mod tests {
         .expect("install the policy");
         let t0 = Utc::now().trunc_subsecs(6);
         let day = |n: i64| (t0 + TimeDelta::days(n)).date_naive();
+        // Set at noon: past the hour, so the day it is set counts as fed.
+        let noon = |n: i64| day(n).and_hms_opt(12, 0, 0).expect("time").and_utc();
         let seq = defined(&f, &[email("hello")]).await;
 
         let fr_old = prospect_in(&f, "airline", "FR", None, t0 - TimeDelta::days(5)).await;
@@ -2975,7 +2992,7 @@ mod tests {
                 "NotFound",
             ),
         ] {
-            let err = set_feed(&mut tx, seq, &bad, day(0)).await.expect_err(why);
+            let err = set_feed(&mut tx, seq, &bad, noon(0)).await.expect_err(why);
             assert!(format!("{err:?}").starts_with(why), "{why}: {err:?}");
         }
         let err = set_feed(
@@ -2985,7 +3002,7 @@ mod tests {
                 per_day: 6,
                 ..plan.clone()
             },
-            day(0),
+            noon(0),
         )
         .await
         .expect_err("over the seat's budget");
@@ -2999,7 +3016,7 @@ mod tests {
             ),
             "{err:?}"
         );
-        set_feed(&mut tx, seq, &plan, day(0)).await.expect("set");
+        set_feed(&mut tx, seq, &plan, noon(0)).await.expect("set");
         let mine = list(&mut tx).await.expect("list");
         let stored = mine[0].feed.as_ref().expect("a feed");
         assert_eq!(stored.countries, ["GB", "FR"], "normalised on the way in");
@@ -3018,7 +3035,7 @@ mod tests {
                 employee_id: f.lena,
                 ..plan.clone()
             },
-            day(0),
+            noon(0),
         )
         .await
         .expect_err("not theirs");
@@ -3058,7 +3075,7 @@ mod tests {
                 countries: Vec::new(),
                 ..plan.clone()
             },
-            day(3),
+            noon(3),
         )
         .await
         .expect("set");
@@ -3076,7 +3093,7 @@ mod tests {
                 source: Some("liste-b".to_owned()),
                 ..plan.clone()
             },
-            day(4),
+            noon(4),
         )
         .await
         .expect("set");
@@ -3093,5 +3110,85 @@ mod tests {
         tx.commit().await.expect("commit");
         assert_eq!(fed(&f, seq, day(6)).await, None);
         assert_eq!(fed_on(&f, seq).await, Some(day(5)));
+    }
+
+    /// **A feed set before its hour feeds the same day; set after, tomorrow;
+    /// re-set after it fed, not twice.** Measured 2026-09-28: five feeds set
+    /// or retouched in the morning fed nothing at 9 h, because the day they
+    /// were set counted as fed.
+    #[tokio::test]
+    async fn a_feed_set_before_its_hour_feeds_the_same_day_and_never_twice() {
+        use agentos_domain::policy::PolicyLimits;
+        use agentos_store::policy;
+
+        let Some(f) = fixture().await else {
+            return;
+        };
+        policy::install(
+            &f.db,
+            f.tenant,
+            policy::Scope::Tenant,
+            &PolicyLimits {
+                max_new_contacts_per_day: 5,
+                ..PolicyLimits::default()
+            },
+        )
+        .await
+        .expect("install the policy");
+        let t0 = Utc::now().trunc_subsecs(6);
+        let day = t0.date_naive();
+        let yesterday = day - TimeDelta::days(1);
+        let at = |h: u32| day.and_hms_opt(h, 0, 0).expect("time").and_utc();
+        for n in 1..=3 {
+            prospect_in(&f, "airline", "FR", None, t0 - TimeDelta::days(n)).await;
+        }
+        let plan = Feed {
+            employee_id: f.lena,
+            per_day: 1,
+            hour: 9,
+            segment: "airline".to_owned(),
+            countries: Vec::new(),
+            source: None,
+        };
+        async fn set(f: &Fixture, seq: SequenceId, plan: Feed, now: DateTime<Utc>) {
+            let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+            set_feed(&mut tx, seq, &plan, now).await.expect("set");
+            tx.commit().await.expect("commit");
+        }
+
+        // 1. Set at 7 h for 9 h: yesterday counts as the last fed day, and
+        //    the 9 h pass of the same day feeds.
+        let early = defined(&f, &[email("hello")]).await;
+        set(&f, early, plan.clone(), at(7)).await;
+        assert_eq!(fed_on(&f, early).await, Some(yesterday));
+        assert_eq!(fed_at(&f, early, day, 8, 59).await, None, "before the hour");
+        assert_eq!(fed_at(&f, early, day, 9, 5).await, Some(1));
+        assert_eq!(fed_on(&f, early).await, Some(day));
+
+        // 2. Set at 11 h for 9 h: the hour is past, today counts as fed.
+        let late = defined(&f, &[email("hello")]).await;
+        set(&f, late, plan.clone(), at(11)).await;
+        assert_eq!(fed_on(&f, late).await, Some(day));
+        assert_eq!(fed_at(&f, late, day, 11, 5).await, None, "not today");
+        assert_eq!(
+            fed_at(&f, late, day + TimeDelta::days(1), 9, 0).await,
+            Some(1)
+        );
+
+        // 3. Already fed today, re-set at 7 h (a clock set back, a retouch
+        //    the same morning): `fed_on` stays today, no second feeding.
+        set(
+            &f,
+            early,
+            Feed {
+                per_day: 2,
+                ..plan.clone()
+            },
+            at(7),
+        )
+        .await;
+        assert_eq!(fed_on(&f, early).await, Some(day), "never set back");
+        assert_eq!(fed_at(&f, early, day, 9, 30).await, None, "not twice a day");
+        assert_eq!(fed_contacts(&f, early).await.len(), 1);
     }
 }
