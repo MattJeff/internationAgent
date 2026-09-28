@@ -4744,7 +4744,7 @@ fn approval_html(text: &str, approve: &str, deny: &str) -> String {
     )
 }
 
-fn escape_html(s: &str) -> String {
+pub(crate) fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {

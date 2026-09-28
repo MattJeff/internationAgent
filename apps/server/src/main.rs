@@ -575,6 +575,15 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
                 cancel.clone(),
             )),
         ),
+        (
+            "digest",
+            tokio::spawn(loops::digest::run(
+                db.clone(),
+                ports.clone(),
+                config.approval_notify.clone(),
+                cancel.clone(),
+            )),
+        ),
     ];
 
     let listener = TcpListener::bind(config.bind).await?;
@@ -911,6 +920,9 @@ fn app(
             // was it stopped from doing"; this one answers the question nobody
             // had a route for on 2026-09-06 — "is it doing anything at all".
             .merge(routes::health::router(db.clone()))
+            // À côté de `health` : ce que la société a fait aujourd'hui, la
+            // même lecture que le mail de 18 h.
+            .merge(routes::digest::router(db.clone()))
             // Et à côté de `health`, qui dit si l'entreprise pense : celle-ci
             // dit si elle **avance**. Sept étapes tirées de sept tables, leurs
             // taux de passage, la recette, le coût du modèle, et la cible que

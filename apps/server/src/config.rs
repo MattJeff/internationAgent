@@ -972,7 +972,7 @@ impl Config {
             Some(address) => tracing::info!(
                 to = %address,
                 "AGENTOS_APPROVAL_NOTIFY is set: every approval that enters the queue with a \
-                 draft is mailed to this address"
+                 draft is mailed to this address, and so is the day's digest at 18:00 UTC"
             ),
             None => tracing::info!(
                 "AGENTOS_APPROVAL_NOTIFY is unset: no mail leaves when an approval enters the \

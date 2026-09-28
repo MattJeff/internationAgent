@@ -57,6 +57,10 @@ pub mod events;
 pub mod growth; // l'entonnoir de bout en bout, la cible chiffrée, et le verdict
 pub mod halt; // wave J: stop the whole company, and let it go again
 pub mod health;
+// la journée d'une société en une lecture — à côté de `health`, qui dit si
+// elle pense : celle-ci dit ce qu'elle a fait. La même chose part par mail à
+// 18 h (`loops::digest`).
+pub mod digest;
 pub mod initiative;
 pub mod interview; // the guided conversation that finishes a company
 pub mod inventory;

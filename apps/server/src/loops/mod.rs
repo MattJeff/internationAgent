@@ -1,4 +1,5 @@
 pub mod citation; // 0115: measures each tenant's questions once a week, through the Gate
+pub mod digest; // 0119: writes each tenant's day to the founder once a day, at 18:00 UTC
 pub mod discovery; // 0113: reads each tenant's annuaires once a day, through the Gate
 pub mod inbound;
 pub mod initiative; // U37

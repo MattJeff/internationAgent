@@ -425,6 +425,12 @@ impl IdempotencyKey {
         Self(format!("employee:{employee}:step:{step_name}"))
     }
 
+    /// The key for one thing the platform itself does, outside any seat —
+    /// the daily digest to the founder. Same promise as [`Self::for_step`].
+    pub fn for_platform(what: &str) -> Self {
+        Self(format!("platform:{what}"))
+    }
+
     /// Accept an `Idempotency-Key` header value.
     pub fn from_client(raw: &str) -> Result<Self, IdempotencyKeyError> {
         if !(Self::MIN_CLIENT_LEN..=Self::MAX_CLIENT_LEN).contains(&raw.len()) {
