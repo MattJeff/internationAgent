@@ -630,6 +630,14 @@ async fn get(
             }),
         Err(_) => None,
     };
+    // Shown with the seat's real limits, as the poller reads it.
+    let charter = match (
+        charter,
+        agentos_store::policy::load(&mut tx, employee_id).await,
+    ) {
+        (Some(charter), Ok(policy)) => Some(charter.with_policy(&policy)),
+        (charter, _) => charter,
+    };
     tx.rollback().await?;
 
     Ok(Json(InitiativeView::of(&schedule?, charter.as_ref(), Utc::now())).into_response())

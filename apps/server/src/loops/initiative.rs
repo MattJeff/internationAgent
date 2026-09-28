@@ -980,6 +980,12 @@ async fn assignment_for(
     let Some(charter) = charter else {
         return Ok(None);
     };
+    // The plan speaks about the budget this seat really has, not the pack's
+    // default — see `Charter::with_policy`.
+    let charter = match &policy {
+        Some(policy) => charter.with_policy(policy),
+        None => charter,
+    };
     // The gaps question, before any model call. See the module docs.
     plan_of(&charter).map_err(Outcome::Clarify)?;
 
