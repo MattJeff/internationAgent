@@ -1498,7 +1498,11 @@ pub async fn brief(db: &Db, tenant: TenantId, run: SequenceRunId) -> Option<Stri
     Some(format!(
         "This hour is step {} of {} of the sequence \"{}\", for {}. What this step asks of you: {}. \
          {} Write that email now, as one `send_email` to that address — and if the send is \
-         refused, they have asked to be left alone and that is the answer.",
+         refused, they have asked to be left alone and that is the answer. Write and send it \
+         in this turn: a turn that ends without the email has done nothing. Do not message a \
+         colleague — no question, no status — before that email has gone. If this contact is \
+         plainly not a target (no travellers, no border to cross), send nothing, put one line \
+         on your board with `add_work_item` saying why you passed, and do not ask anyone.",
         step + 1,
         steps.len(),
         name.trim(),
