@@ -443,7 +443,7 @@ async fn a_posted_employee_is_provisioned_by_the_loops_and_the_edges_are_authent
     // inside a transaction, and nothing else in the suite would notice. It has
     // now caught two additions in a row, which is the whole argument for
     // asserting the count rather than only the names.
-    const LOOPS: [&str; 9] = [
+    const LOOPS: [&str; 10] = [
         "provisioning",
         "outbox",
         "inbound",
@@ -453,6 +453,7 @@ async fn a_posted_employee_is_provisioned_by_the_loops_and_the_edges_are_authent
         "discovery",
         "citation",
         "patience",
+        "digest",
     ];
     for loop_name in LOOPS {
         assert!(
