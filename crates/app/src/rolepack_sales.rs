@@ -822,8 +822,9 @@ impl fmt::Display for Segment {
 /// seller is a claim the company owes.
 pub const PRICING_PAGE: &str = "https://visa.orizn.app/visa-api";
 
-/// The four public tiers of `visa.orizn.app`, as `docs/ROADMAP_CROISSANCE.md`
-/// read them on 2026-09-13 and as `stripe_subscriptions` models them.
+/// The four public tiers of `visa.orizn.app`, as the pricing page names them
+/// on 2026-09-28 (Free / Commercial / Production / License — the variants keep
+/// the 2026-09-13 names; a seat quotes `name()`, never the variant).
 ///
 /// Closed and ordered from cheapest up, so that "the lowest tier that fits" is
 /// a comparison and not a lookup.
@@ -845,9 +846,9 @@ impl Tier {
     pub const fn name(self) -> &'static str {
         match self {
             Tier::Free => "Free",
-            Tier::Starter => "Starter",
-            Tier::Pro => "Pro",
-            Tier::Enterprise => "Enterprise",
+            Tier::Starter => "Commercial",
+            Tier::Pro => "Production",
+            Tier::Enterprise => "License",
         }
     }
 
@@ -883,7 +884,7 @@ pub struct TierFit {
 ///
 /// # The boundary this function keeps
 ///
-/// "The tier that matches your volume is Starter, here is the page" is a
+/// "The tier that matches your volume is Commercial, here is the page" is a
 /// fact about a public page. "I can do the $199 one" is a commercial term, and
 /// this pack's job ends before commercial terms exist —
 /// [`RolePack::may_propose`] refuses `PaymentCreate` and `ContractSign` for
@@ -1715,7 +1716,7 @@ mod tests {
     fn the_approach_step_names_the_tier_as_a_fact_and_not_as_a_proposal() {
         let plan = sales().plan(&objective());
         let approach = &plan[3].instruction;
-        assert!(approach.contains("Starter"), "{approach}");
+        assert!(approach.contains("Commercial"), "{approach}");
         assert!(
             !approach.contains('$'),
             "no price in a seat's mail: {approach}"
@@ -1810,8 +1811,8 @@ mod tests {
         );
 
         let approach = &plan[3].instruction;
-        assert!(approach.contains("Enterprise"), "{approach}");
-        assert!(!approach.contains("Starter"), "{approach}");
+        assert!(approach.contains("License"), "{approach}");
+        assert!(!approach.contains("Commercial"), "{approach}");
         assert!(approach.contains(PRICING_PAGE), "{approach}");
         assert!(!approach.contains('$'), "{approach}");
         assert!(!approach.contains("600"), "{approach}");
