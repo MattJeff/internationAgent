@@ -143,6 +143,7 @@ case "$ACTION" in
     dit "veille : je relance le serveur seul si $JOURNAL n'a plus bougé depuis $VEILLE_MINUTES min (Ctrl-C pour arrêter)."
     tunnel_mort=0
     synchro_jour=""
+    verif_jour=""
     while :; do
       sleep 300
       # Une fois par jour après 09:30 UTC : les inscrits du site entrent dans
@@ -153,6 +154,17 @@ case "$ACTION" in
         "$RACINE/scripts/site-inscrits.sh" >> "$ETAT/site-inscrits.log" 2>&1 \
           && dit "$(date -u +%FT%TZ) : inscrits du site synchronisés." \
           || dit "$(date -u +%FT%TZ) : la synchro des inscrits a échoué — voir $ETAT/site-inscrits.log."
+      fi
+      # Une fois par jour après 10:40 UTC, les nourrissages de 09:00 et 10:00
+      # passés : les cinq contrôles réels (scripts/verif-quotidienne.sh). Il
+      # tient son propre journal et envoie lui-même le mail rouge au moindre KO.
+      if [ "$(date -u +%H%M)" -ge 1040 ] && [ "$verif_jour" != "$(date -u +%F)" ]; then
+        verif_jour="$(date -u +%F)"
+        if "$RACINE/scripts/verif-quotidienne.sh" >/dev/null 2>&1; then
+          dit "$(date -u +%FT%TZ) : vérification quotidienne : tout OK."
+        else
+          dit "$(date -u +%FT%TZ) : vérification quotidienne : au moins un KO — mail rouge parti, détail dans $ETAT/verif-quotidienne.log."
+        fi
       fi
       # Le tunnel nommé : l'adresse fixe doit répondre. 530 = « tunnel not
       # connected », 000 = rien. Deux fois de suite (10 min), on relance
