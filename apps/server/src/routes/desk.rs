@@ -555,6 +555,13 @@ impl From<Refusal> for ApiError {
                 "this seat's previous question to that colleague is still unanswered",
             )
             .with_detail(err.to_string()),
+            // A status asks nothing and wakes nobody, from a chair as from a
+            // seat: the rule and its phrase list live in `inbound::send`.
+            InternalError::StatusIsNotAQuestion => Self::conflict(
+                "status_is_not_a_question",
+                "a status is not a question: it belongs on a board, not on a desk",
+            )
+            .with_detail(err.to_string()),
             // Not reachable: `handover` is not in `Kind`, so neither refusal
             // about one can be produced from here. Mapped rather than asserted,
             // because a refusal that escaped should be a status and not a panic.

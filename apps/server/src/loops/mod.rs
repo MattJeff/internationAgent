@@ -3,6 +3,7 @@ pub mod discovery; // 0113: reads each tenant's annuaires once a day, through th
 pub mod inbound;
 pub mod initiative; // U37
 pub mod outbox; // U36
+pub mod patience; // une question sans réponse depuis un jour se ferme seule
 pub mod provisioning; // U35
 pub mod sequence; // 0092: moves a position, never sends
 

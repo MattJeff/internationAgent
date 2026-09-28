@@ -556,6 +556,10 @@ async fn serve_until_signal(mut config: Config) -> Result<(), BootError> {
             tokio::spawn(loops::sequence::run(db.clone(), cancel.clone())),
         ),
         (
+            "patience",
+            tokio::spawn(loops::patience::run(db.clone(), cancel.clone())),
+        ),
+        (
             "discovery",
             tokio::spawn(loops::discovery::run(
                 db.clone(),
