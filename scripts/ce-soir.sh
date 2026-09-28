@@ -140,6 +140,16 @@ case "$ACTION" in
     # plus bougé depuis $VEILLE_MINUTES minutes. C'est une béquille, pas un
     # diagnostic : la cause est à trouver dans le serveur.
     VEILLE_MINUTES="${VEILLE_MINUTES:-20}"
+    # Une seule veille à la fois : le 2026-09-28 deux tournaient (le pid dans
+    # le fichier était celui d'une troisième, morte) et chacune relançait,
+    # synchronisait et sondait pour son compte. La précédente est arrêtée par
+    # son pid, et celle-ci écrit le sien.
+    if [ -f "$ETAT/veille.pid" ] && [ "$(cat "$ETAT/veille.pid")" != "$$" ] \
+       && kill -0 "$(cat "$ETAT/veille.pid")" 2>/dev/null; then
+      dit "une veille tourne déjà (pid $(cat "$ETAT/veille.pid")) : je l'arrête."
+      kill "$(cat "$ETAT/veille.pid")" 2>/dev/null || true; sleep 1
+    fi
+    echo "$$" > "$ETAT/veille.pid"
     dit "veille : je relance le serveur seul si $JOURNAL n'a plus bougé depuis $VEILLE_MINUTES min (Ctrl-C pour arrêter)."
     tunnel_mort=0
     synchro_jour=""
