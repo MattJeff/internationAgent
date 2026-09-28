@@ -3855,9 +3855,9 @@ impl Effects {
                     // Unreachable colleague, unanswerable question, somebody
                     // else's thread, not the owner, a colleague out of turns, a
                     // recipient whose policy will not load, a question still
-                    // pending. **Seven**, not the four this comment used to
+                    // pending, a status that asks nothing. **Eight**, not the four this comment used to
                     // name — the arm catches every `InternalError` but `Store`.
-                    // All seven are the world saying no to something the
+                    // All eight are the world saying no to something the
                     // policy allows.
                     refused => EffectError::Refused(refused.code()),
                 })

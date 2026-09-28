@@ -3457,7 +3457,42 @@ const MAX_OUTSTANDING: i64 = 20;
 /// two paragraphs a model rewrote — so the unit is the pair: one open question
 /// per colleague at a time. A seat with a genuinely new question for somebody
 /// who has not answered its last one is blocked on that person either way.
-const QUESTION_PATIENCE: chrono::TimeDelta = chrono::TimeDelta::hours(24);
+pub const QUESTION_PATIENCE: chrono::TimeDelta = chrono::TimeDelta::hours(24);
+
+/// What a message that asks nothing opens with. Ninety-seven of these sat
+/// unanswered on the founder's desk on 2026-09-28 — « Status update », « Status
+/// check-in », « no action needed » — each one a turn spent telling somebody
+/// that nothing happened. A status is a board item, not a question; see
+/// [`InternalError::StatusIsNotAQuestion`]. Matched on word boundaries,
+/// case-insensitively — `fyi` alone would otherwise hit "verifying".
+const STATUS_PHRASES: [&str; 8] = [
+    "status update",
+    "status check",
+    "status check-in",
+    "status report",
+    "no action needed",
+    "just flagging",
+    "for your awareness",
+    "fyi",
+];
+
+/// Whether `body` is a status rather than an ask.
+fn is_a_status(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    STATUS_PHRASES.iter().any(|phrase| {
+        body.match_indices(phrase).any(|(at, _)| {
+            let before = body[..at].chars().next_back();
+            let after = body[at + phrase.len()..].chars().next();
+            !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+        })
+    })
+}
+
+/// The answer the clock gives when nobody did, after [`QUESTION_PATIENCE`].
+/// Written by `loops::patience` through [`answer_for_silence`].
+pub const NO_ANSWER: &str = "No answer in 24 h. Apply your plan's default for this and do not \
+                             wait: write the letter, pass on a non-fit, or put it on your board. \
+                             Ask again only if a real action depends on the answer.";
 
 /// What one employee is doing to another.
 ///
@@ -3624,6 +3659,15 @@ pub enum InternalError {
     )]
     StillPending,
 
+    /// A question or an order that asks nothing: it opens with one of
+    /// [`STATUS_PHRASES`]. A status belongs on the sender's own board, where it
+    /// costs nobody a turn.
+    #[error(
+        "a status is not a question: put it on your board (`add_work_item`) and carry on; a \
+         question asks for one precise decision"
+    )]
+    StatusIsNotAQuestion,
+
     /// The recipient's policy would not load, so its turn budget cannot be
     /// known. Fails closed: no budget that can be read is no message.
     #[error("your colleague's policy is unusable, so nothing can be sent to it")]
@@ -3644,6 +3688,7 @@ impl InternalError {
             InternalError::NotAnOwner => "not_an_owner",
             InternalError::NoTurnsLeft(code) => code,
             InternalError::StillPending => "question_still_pending",
+            InternalError::StatusIsNotAQuestion => "status_is_not_a_question",
             InternalError::RecipientPolicyUnusable => "recipient_policy_unusable",
             InternalError::Store(_) => "store",
         }
@@ -4014,6 +4059,52 @@ async fn still_pending(
     .map_err(StoreError::from)
 }
 
+/// Close one question the clock gave up on: the recipient answers it with
+/// [`NO_ANSWER`], through [`send`] like any other answer — same row, same
+/// wake-up for the asker, same idempotency. `Ok(None)` when `question` is not
+/// an open question older than [`QUESTION_PATIENCE`] here, which is also what
+/// makes a second pass a no-op.
+pub async fn answer_for_silence(
+    tx: &mut TenantTx<'_>,
+    question: Uuid,
+    now: DateTime<Utc>,
+) -> Result<Option<Delivered>, InternalError> {
+    let row: Option<(Uuid, Uuid, String)> = sqlx::query_as(
+        "SELECT q.employee_id, q.conversation_id, q.sender \
+           FROM messages q \
+          WHERE q.id = $1 \
+            AND q.internal_kind = 'question' \
+            AND q.created_at <= $2 \
+            AND NOT EXISTS (SELECT 1 FROM messages a WHERE a.answers_message_id = q.id)",
+    )
+    .bind(question)
+    .bind(now - QUESTION_PATIENCE)
+    .fetch_optional(&mut ***tx)
+    .await
+    .map_err(StoreError::from)?;
+    let Some((asked_of, conversation_id, asker)) = row else {
+        return Ok(None);
+    };
+    let asked_of = EmployeeId::from_uuid(asked_of);
+    let asker = Slug::parse(&asker).map_err(|e| StoreError::conflict(e.to_string()))?;
+    send(
+        tx,
+        asked_of,
+        &asker,
+        Errand::Answer,
+        NO_ANSWER,
+        TrustLabel::Trusted,
+        Some(Thread {
+            conversation_id: ConversationId::from_uuid(conversation_id),
+            message_id: question,
+        }),
+        &IdempotencyKey::for_step(asked_of, &format!("silence:{question}")),
+        now,
+    )
+    .await
+    .map(Some)
+}
+
 /// Move a thread to its new owner. `false` when it was not the sender's to
 /// move.
 ///
@@ -4093,6 +4184,11 @@ pub async fn send(
         .ok_or(InternalError::Unreachable)?;
     if !may_message(tx, from, recipient, errand).await? {
         return Err(InternalError::Unreachable);
+    }
+    // Before anything is priced: a status wakes nobody, and the model is told
+    // where it goes instead. An answer may fairly say "no action needed".
+    if matches!(errand, Errand::Question | Errand::Order) && is_a_status(body) {
+        return Err(InternalError::StatusIsNotAQuestion);
     }
 
     // The cost, read through the same four-layer intersection as every other
@@ -8677,6 +8773,122 @@ mod tests {
         );
         assert_eq!(note, None);
         assert_eq!(link, Some(asked.message_id));
+    }
+
+    /// **Un statut n'est pas une question.** « Status update: … » est refusé
+    /// avec `status_is_not_a_question` avant de coûter un tour ; une vraie
+    /// question au même collègue passe juste après — rien n'a été posé.
+    #[tokio::test]
+    async fn un_statut_nest_pas_une_question() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena, bruno) = company(&db, 5).await;
+
+        for body in [
+            "Status update: the FR entry-requirements page is still in draft.",
+            "Quick note, FYI — the outage is still on. No action needed.",
+        ] {
+            let refused = say(
+                &db,
+                tenant,
+                lena,
+                "bruno",
+                Errand::Question,
+                body,
+                TrustLabel::Trusted,
+                None,
+                "status-1",
+            )
+            .await
+            .expect_err("a status is refused");
+            assert_eq!(refused.code(), "status_is_not_a_question", "{body}");
+        }
+        assert_eq!(
+            turns_taken(&db, tenant, bruno).await,
+            0,
+            "a status costs nobody a turn"
+        );
+
+        // A real question, and one whose only "fyi" is inside a word.
+        say(
+            &db,
+            tenant,
+            lena,
+            "bruno",
+            Errand::Question,
+            "Which warehouse do I quote for PO-4471? I am verifying the delivery terms.",
+            TrustLabel::Trusted,
+            None,
+            "status-2",
+        )
+        .await
+        .expect("a question that asks for a decision goes through");
+    }
+
+    /// **Une question sans réponse depuis 24 h se ferme seule**, une fois : la
+    /// réponse est celle de l'horloge, signée du collègue interrogé, et un
+    /// second passage n'en ajoute pas. Une question de 2 h attend encore.
+    #[tokio::test]
+    async fn une_question_sans_reponse_depuis_un_jour_se_ferme_seule() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena, bruno) = company(&db, 5).await;
+        let now = Utc::now();
+        let db = &db;
+        let ask = |from, to: &'static str, when, tag: &'static str| async move {
+            let key = IdempotencyKey::for_step(from, &format!("internal:{tag}"));
+            let mut tx = db.tenant_tx(tenant).await.expect("tx");
+            let sent = send(
+                &mut tx,
+                from,
+                &Slug::parse(to).expect("a slug"),
+                Errand::Question,
+                "Which warehouse do I quote for PO-4471?",
+                TrustLabel::Trusted,
+                None,
+                &key,
+                when,
+            )
+            .await
+            .expect("the question goes");
+            tx.commit().await.expect("commit");
+            sent
+        };
+        let stale = ask(
+            lena,
+            "bruno",
+            now - QUESTION_PATIENCE - chrono::TimeDelta::hours(1),
+            "s-1",
+        )
+        .await;
+        let fresh = ask(bruno, "lena", now - chrono::TimeDelta::hours(2), "s-2").await;
+
+        let close = |question| async move {
+            let mut tx = db.tenant_tx(tenant).await.expect("tx");
+            let done = answer_for_silence(&mut tx, question, now)
+                .await
+                .expect("close");
+            tx.commit().await.expect("commit");
+            done
+        };
+        let answered = close(stale.message_id)
+            .await
+            .expect("a day-old question is answered");
+        assert_eq!(answered.recipient, lena, "the asker hears it");
+        assert!(
+            close(fresh.message_id).await.is_none(),
+            "two hours is not a day"
+        );
+        assert!(close(stale.message_id).await.is_none(), "answered once");
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let (sender, body): (String, String) =
+            sqlx::query_as("SELECT sender, body FROM messages WHERE answers_message_id = $1")
+                .bind(stale.message_id)
+                .fetch_one(&mut **tx)
+                .await
+                .expect("one answer");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(sender, "bruno");
+        assert_eq!(body, NO_ANSWER);
     }
 
     /// **Une deuxième question au même collègue, sans réponse entre-temps, ne
