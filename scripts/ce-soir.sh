@@ -142,8 +142,18 @@ case "$ACTION" in
     VEILLE_MINUTES="${VEILLE_MINUTES:-20}"
     dit "veille : je relance le serveur seul si $JOURNAL n'a plus bougé depuis $VEILLE_MINUTES min (Ctrl-C pour arrêter)."
     tunnel_mort=0
+    synchro_jour=""
     while :; do
       sleep 300
+      # Une fois par jour après 09:30 UTC : les inscrits du site entrent dans
+      # le CRM (scripts/site-inscrits.sh, idempotent). Avant les nourrissages
+      # d'accueil de 10:00.
+      if [ "$(date -u +%H%M)" -ge 0930 ] && [ "$synchro_jour" != "$(date -u +%F)" ]; then
+        synchro_jour="$(date -u +%F)"
+        "$RACINE/scripts/site-inscrits.sh" >> "$ETAT/site-inscrits.log" 2>&1 \
+          && dit "$(date -u +%FT%TZ) : inscrits du site synchronisés." \
+          || dit "$(date -u +%FT%TZ) : la synchro des inscrits a échoué — voir $ETAT/site-inscrits.log."
+      fi
       # Le tunnel nommé : l'adresse fixe doit répondre. 530 = « tunnel not
       # connected », 000 = rien. Deux fois de suite (10 min), on relance
       # cloudflared — le processus peut être vivant et ses connexions mortes.
