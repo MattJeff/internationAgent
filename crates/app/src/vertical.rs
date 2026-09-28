@@ -422,6 +422,22 @@ impl Charter {
     /// founder writes can close it**, because the remedy is a policy layer and
     /// widening a policy is not something an answer is allowed to do. It is
     /// reported so a person can go and do it, and refused as an interview
+    /// The same charter, its sales pack carrying the policy this employee
+    /// actually has. `Charter::of` builds the pack with the role's *default*
+    /// limits (cold outreach off), so without this every SDR read "Cold
+    /// outreach is switched off for this employee" in its plan for weeks while
+    /// the ceiling gave it 20 strangers a day. The other packs read no limits.
+    #[must_use]
+    pub fn with_policy(self, policy: &agentos_domain::policy::EffectivePolicy) -> Self {
+        match self {
+            Charter::Sales { pack, objective } => Charter::Sales {
+                pack: pack.with_limits(policy.limits().clone()),
+                objective,
+            },
+            other => other,
+        }
+    }
+
     /// question so nothing tries to do it for them.
     pub fn open_questions(&self) -> Vec<Question> {
         match self {
