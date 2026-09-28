@@ -2802,6 +2802,17 @@ pub async fn conversation_for(
 /// payload under `from` rather than the `counterparty` key `app::gate` reads
 /// back: that aggregation is over *allowed outbound actions*, and an inbound
 /// message must not quietly enlarge the cold-outreach budget.
+/// The subject prefix of the daily probe `scripts/verif-quotidienne.sh` mails
+/// to a seat to prove that inbound mail still reaches this database. A probe
+/// **lands** — the row is the proof — but wakes nobody and opens no ticket:
+/// a seat woken once a day to read "probe — no reply needed" would spend a
+/// model call answering it, and the founder's box would get the answer.
+pub const PROBE_SUBJECT_PREFIX: &str = "verif-quotidienne ";
+
+fn is_probe(subject: Option<&Untrusted<String>>) -> bool {
+    subject.is_some_and(|s| s.expose_for_parsing().starts_with(PROBE_SUBJECT_PREFIX))
+}
+
 pub async fn land(
     tx: &mut TenantTx<'_>,
     message: &CanonicalMessage,
@@ -2858,15 +2869,22 @@ pub async fn land(
         .await
         .map_err(StoreError::from)?;
 
-    let turn_event_id = enqueue_turn(
-        tx,
-        message.employee_id,
-        message.conversation_id,
-        message_id,
-        &message.idempotency_key,
-        now,
-    )
-    .await?;
+    // ponytail: nil = no turn queued; the probe is the only message that
+    // lands without one, and `resume` hands back the same nil on redelivery.
+    let probe = is_probe(message.subject.as_ref());
+    let turn_event_id = if probe {
+        Uuid::nil()
+    } else {
+        enqueue_turn(
+            tx,
+            message.employee_id,
+            message.conversation_id,
+            message_id,
+            &message.idempotency_key,
+            now,
+        )
+        .await?
+    };
 
     // **Where a message becomes a ticket.** A third party wrote to this
     // employee, so something is on its board until it says the thread is dealt
@@ -2885,6 +2903,7 @@ pub async fn land(
     // `Untrusted` has no `Display` for the reason this line respects it — a
     // subject is the sender's words, and a title goes into a brief.
     let ticket = match (message.direction, message.channel) {
+        _ if probe => None,
         (
             Direction::Inbound,
             Channel::Email | Channel::Sms | Channel::Whatsapp | Channel::Voice,
@@ -3316,8 +3335,9 @@ async fn resume(
     employee_id: EmployeeId,
     now: DateTime<Utc>,
 ) -> Result<Option<Landed>, InboundError> {
-    let found: Option<(Uuid, Uuid)> = sqlx::query_as(
-        "SELECT id, conversation_id FROM messages WHERE tenant_id = $1 AND idempotency_key = $2",
+    let found: Option<(Uuid, Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT id, conversation_id, subject FROM messages \
+          WHERE tenant_id = $1 AND idempotency_key = $2",
     )
     .bind(tx.tenant_id().as_uuid())
     .bind(key.as_str())
@@ -3325,12 +3345,15 @@ async fn resume(
     .await
     .map_err(StoreError::from)?;
 
-    let Some((message_id, conversation_id)) = found else {
+    let Some((message_id, conversation_id, subject)) = found else {
         return Ok(None);
     };
     let conversation_id = ConversationId::from_uuid(conversation_id);
-    let turn_event_id =
-        enqueue_turn(tx, employee_id, conversation_id, message_id, key, now).await?;
+    let turn_event_id = if subject.is_some_and(|s| s.starts_with(PROBE_SUBJECT_PREFIX)) {
+        Uuid::nil()
+    } else {
+        enqueue_turn(tx, employee_id, conversation_id, message_id, key, now).await?
+    };
 
     Ok(Some(Landed {
         message_id,
@@ -5983,6 +6006,40 @@ mod tests {
         assert!(!landed.duplicate);
         assert_eq!(messages(&db, tenant).await, 1);
         assert_eq!(turns(&db, tenant).await, 1);
+    }
+
+    /// **The daily probe lands and wakes nobody.** `scripts/verif-quotidienne.sh`
+    /// mails a seat once a day to prove inbound still reaches this database;
+    /// the row is the proof, and a seat woken to read "no reply needed" would
+    /// be a model call a day for nothing. Redelivered, it still queues nothing.
+    #[tokio::test]
+    async fn the_daily_probe_lands_without_a_turn_or_a_ticket() {
+        let Some(db) = db().await else { return };
+        let (tenant, _) = seed(&db).await;
+        let now = Utc::now();
+        let email = MockEmailProvider::new();
+        let mut probe = raw("probe_1", now, Duration::hours(1));
+        probe.subject = Some(format!("{PROBE_SUBJECT_PREFIX}2026-09-28 deadbeef"));
+        probe.attachments.clear();
+        email.seed_inbound(probe, Vec::<(String, Vec<u8>)>::new());
+
+        let landed = deliver(&db, &email, tenant, &notice("probe_1", now), now)
+            .await
+            .expect("the probe lands");
+        assert_eq!(landed.turn_event_id, Uuid::nil());
+        assert_eq!(messages(&db, tenant).await, 1, "the row is the proof");
+        assert_eq!(turns(&db, tenant).await, 0, "nobody is woken");
+        assert_eq!(
+            count(&db, tenant, "SELECT count(*) FROM work_items").await,
+            0,
+            "no ticket for a probe"
+        );
+
+        let again = deliver(&db, &email, tenant, &notice("probe_1", now), now)
+            .await
+            .expect("redelivery");
+        assert!(again.duplicate);
+        assert_eq!(turns(&db, tenant).await, 0);
     }
 
     /// The attachment window: the bytes are fetched during the ingest that
