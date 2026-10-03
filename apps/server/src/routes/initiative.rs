@@ -1015,7 +1015,9 @@ mod tests {
         assert!(body["plan"].is_null(), "gaps must not produce a plan");
         let question = body["clarify"].as_str().expect("a question");
         assert!(question.contains("which market"), "{question}");
-        assert!(question.contains("which accounts"), "{question}");
+        // No named account is not a gap since 2026-10-03: the sequences feed
+        // the seat, so the plan asks about the market alone.
+        assert!(!question.contains("which accounts"), "{question}");
 
         h.teardown().await;
     }

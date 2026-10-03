@@ -556,7 +556,11 @@ impl RolePack {
     /// act on — returns a single [`Stage::Clarify`] task. Pure, recomputed per
     /// turn, stored nowhere.
     pub fn plan(&self, objective: &Objective) -> Vec<Task> {
-        let mut gaps = objective.gaps();
+        let mut gaps: Vec<Gap> = objective
+            .gaps()
+            .into_iter()
+            .filter(|gap| gap.blocks())
+            .collect();
         let channel = self.approach_channel(objective.segment);
         if channel.is_none() {
             gaps.push(Gap::Channel);
@@ -649,9 +653,28 @@ impl RolePack {
             )
         };
 
-        vec![
-            Task::new(Stage::Research, research),
-            Task::new(Stage::Evidence, evidence),
+        let fed_by_sequences = objective
+            .target_accounts
+            .iter()
+            .all(|account| account.trim().is_empty());
+        let opening = if fed_by_sequences {
+            vec![Task::new(
+                Stage::Research,
+                "No account is named here: the accounts come to you one at a time from the \
+                 sequences that wake you — one contact, its site, and the letter to write, \
+                 in that same turn. Outside a sequence wake there is nothing to research, \
+                 nothing to compare with a colleague and nothing to report: take no action \
+                 and send no message."
+                    .to_owned(),
+            )]
+        } else {
+            vec![
+                Task::new(Stage::Research, research),
+                Task::new(Stage::Evidence, evidence),
+            ]
+        };
+        let mut plan = opening;
+        plan.extend([
             Task::new(
                 Stage::Contact,
                 "For each account with a reproduced finding, identify the person accountable \
@@ -681,7 +704,8 @@ impl RolePack {
                  human's judgement and was never yours to assert. Pricing, SLAs and contract \
                  terms are theirs to give: quote no price and sign nothing.",
             ),
-        ]
+        ]);
+        plan
     }
 
     /// What the plan says about approaching people who have not been contacted
@@ -1007,6 +1031,15 @@ impl Gap {
             Gap::TargetAccounts => "target_accounts",
             Gap::Channel => "channel",
         }
+    }
+
+    /// Whether the plan waits on this answer. The interview asks every gap;
+    /// only a missing market (or channel) stops the seat. No named account is
+    /// a question the founder may answer and a plan the sequences feed in the
+    /// meantime — from 2026-09-22 to 2026-10-02 the named accounts produced a
+    /// daily status report to the founder and letters lost behind it.
+    pub const fn blocks(self) -> bool {
+        !matches!(self, Gap::TargetAccounts)
     }
 }
 
@@ -1850,24 +1883,29 @@ mod tests {
         let plan = sales().plan(&vague);
         assert_eq!(plan.len(), 1, "a guess got planned: {plan:?}");
         assert_eq!(plan[0].stage, Stage::Clarify);
-        for gap in vague.gaps() {
+        for gap in vague.gaps().into_iter().filter(|gap| gap.blocks()) {
             assert!(
                 plan[0].instruction.contains(gap.question()),
                 "{} was not asked about",
                 gap.code()
             );
         }
+        // The accounts are the interview's question, not the plan's wall.
+        assert!(!plan[0].instruction.contains(Gap::TargetAccounts.question()));
 
-        // One missing field is enough.
+        // No named account is not a gap: the plan is the one the sequences
+        // feed — no research, no evidence, nothing to report outside a wake.
         let no_accounts = Objective {
             target_accounts: Vec::new(),
             ..objective()
         };
         assert_eq!(no_accounts.gaps(), vec![Gap::TargetAccounts]);
         let plan = sales().plan(&no_accounts);
-        assert_eq!(plan.len(), 1);
-        assert_eq!(plan[0].stage, Stage::Clarify);
-        assert!(!plan[0].instruction.contains(Gap::Market.question()));
+        assert_eq!(plan[0].stage, Stage::Research);
+        assert!(plan[0].instruction.contains("sequences that wake you"));
+        assert!(plan[0].instruction.contains("send no message"));
+        assert!(plan.iter().all(|task| task.stage != Stage::Evidence));
+        assert!(plan.iter().any(|task| task.stage == Stage::Approach));
     }
 
     /// The interesting clarification: everything is specified, but this
