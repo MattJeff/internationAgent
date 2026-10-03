@@ -556,7 +556,11 @@ impl RolePack {
     /// act on — returns a single [`Stage::Clarify`] task. Pure, recomputed per
     /// turn, stored nowhere.
     pub fn plan(&self, objective: &Objective) -> Vec<Task> {
-        let mut gaps = objective.gaps();
+        let mut gaps: Vec<Gap> = objective
+            .gaps()
+            .into_iter()
+            .filter(|gap| gap.blocks())
+            .collect();
         let channel = self.approach_channel(objective.segment);
         if channel.is_none() {
             gaps.push(Gap::Channel);
@@ -1028,6 +1032,15 @@ impl Gap {
             Gap::Channel => "channel",
         }
     }
+
+    /// Whether the plan waits on this answer. The interview asks every gap;
+    /// only a missing market (or channel) stops the seat. No named account is
+    /// a question the founder may answer and a plan the sequences feed in the
+    /// meantime — from 2026-09-22 to 2026-10-02 the named accounts produced a
+    /// daily status report to the founder and letters lost behind it.
+    pub const fn blocks(self) -> bool {
+        !matches!(self, Gap::TargetAccounts)
+    }
 }
 
 /// A sales objective, as an operator states it.
@@ -1051,10 +1064,13 @@ impl Objective {
         if self.market.is_none() {
             gaps.push(Gap::Market);
         }
-        // No named account is not a gap any more: the sequences feed the
-        // seat one contact at a time, and a plan that named four accounts to
-        // research produced, from 2026-09-22 to 2026-10-02, a daily status
-        // report on those four to the founder — and letters lost to it.
+        if self
+            .target_accounts
+            .iter()
+            .all(|account| account.trim().is_empty())
+        {
+            gaps.push(Gap::TargetAccounts);
+        }
         gaps
     }
 }
@@ -1862,18 +1878,20 @@ mod tests {
             market: None,
             target_accounts: vec![String::new(), "  ".to_owned()],
         };
-        assert_eq!(vague.gaps(), vec![Gap::Market]);
+        assert_eq!(vague.gaps(), vec![Gap::Market, Gap::TargetAccounts]);
 
         let plan = sales().plan(&vague);
         assert_eq!(plan.len(), 1, "a guess got planned: {plan:?}");
         assert_eq!(plan[0].stage, Stage::Clarify);
-        for gap in vague.gaps() {
+        for gap in vague.gaps().into_iter().filter(|gap| gap.blocks()) {
             assert!(
                 plan[0].instruction.contains(gap.question()),
                 "{} was not asked about",
                 gap.code()
             );
         }
+        // The accounts are the interview's question, not the plan's wall.
+        assert!(!plan[0].instruction.contains(Gap::TargetAccounts.question()));
 
         // No named account is not a gap: the plan is the one the sequences
         // feed — no research, no evidence, nothing to report outside a wake.
@@ -1881,7 +1899,7 @@ mod tests {
             target_accounts: Vec::new(),
             ..objective()
         };
-        assert_eq!(no_accounts.gaps(), vec![]);
+        assert_eq!(no_accounts.gaps(), vec![Gap::TargetAccounts]);
         let plan = sales().plan(&no_accounts);
         assert_eq!(plan[0].stage, Stage::Research);
         assert!(plan[0].instruction.contains("sequences that wake you"));
