@@ -4105,7 +4105,9 @@ pub(crate) mod tests {
         assert_eq!(outcome, "clarify");
         let question = detail.expect("a clarify outcome carries its question");
         assert!(question.contains("which market"), "{question}");
-        assert!(question.contains("which accounts"), "{question}");
+        // No named account is not a gap since 2026-10-03 (the sequences feed
+        // the seat): the question is about the market, not the accounts.
+        assert!(!question.contains("which accounts"), "{question}");
 
         assert_eq!(outcome_of(&db, tenant, bare).await.0, "no_charter");
 

@@ -649,9 +649,28 @@ impl RolePack {
             )
         };
 
-        vec![
-            Task::new(Stage::Research, research),
-            Task::new(Stage::Evidence, evidence),
+        let fed_by_sequences = objective
+            .target_accounts
+            .iter()
+            .all(|account| account.trim().is_empty());
+        let opening = if fed_by_sequences {
+            vec![Task::new(
+                Stage::Research,
+                "No account is named here: the accounts come to you one at a time from the \
+                 sequences that wake you — one contact, its site, and the letter to write, \
+                 in that same turn. Outside a sequence wake there is nothing to research, \
+                 nothing to compare with a colleague and nothing to report: take no action \
+                 and send no message."
+                    .to_owned(),
+            )]
+        } else {
+            vec![
+                Task::new(Stage::Research, research),
+                Task::new(Stage::Evidence, evidence),
+            ]
+        };
+        let mut plan = opening;
+        plan.extend([
             Task::new(
                 Stage::Contact,
                 "For each account with a reproduced finding, identify the person accountable \
@@ -681,7 +700,8 @@ impl RolePack {
                  human's judgement and was never yours to assert. Pricing, SLAs and contract \
                  terms are theirs to give: quote no price and sign nothing.",
             ),
-        ]
+        ]);
+        plan
     }
 
     /// What the plan says about approaching people who have not been contacted
@@ -1031,13 +1051,10 @@ impl Objective {
         if self.market.is_none() {
             gaps.push(Gap::Market);
         }
-        if self
-            .target_accounts
-            .iter()
-            .all(|account| account.trim().is_empty())
-        {
-            gaps.push(Gap::TargetAccounts);
-        }
+        // No named account is not a gap any more: the sequences feed the
+        // seat one contact at a time, and a plan that named four accounts to
+        // research produced, from 2026-09-22 to 2026-10-02, a daily status
+        // report on those four to the founder — and letters lost to it.
         gaps
     }
 }
@@ -1845,7 +1862,7 @@ mod tests {
             market: None,
             target_accounts: vec![String::new(), "  ".to_owned()],
         };
-        assert_eq!(vague.gaps(), vec![Gap::Market, Gap::TargetAccounts]);
+        assert_eq!(vague.gaps(), vec![Gap::Market]);
 
         let plan = sales().plan(&vague);
         assert_eq!(plan.len(), 1, "a guess got planned: {plan:?}");
@@ -1858,16 +1875,19 @@ mod tests {
             );
         }
 
-        // One missing field is enough.
+        // No named account is not a gap: the plan is the one the sequences
+        // feed — no research, no evidence, nothing to report outside a wake.
         let no_accounts = Objective {
             target_accounts: Vec::new(),
             ..objective()
         };
-        assert_eq!(no_accounts.gaps(), vec![Gap::TargetAccounts]);
+        assert_eq!(no_accounts.gaps(), vec![]);
         let plan = sales().plan(&no_accounts);
-        assert_eq!(plan.len(), 1);
-        assert_eq!(plan[0].stage, Stage::Clarify);
-        assert!(!plan[0].instruction.contains(Gap::Market.question()));
+        assert_eq!(plan[0].stage, Stage::Research);
+        assert!(plan[0].instruction.contains("sequences that wake you"));
+        assert!(plan[0].instruction.contains("send no message"));
+        assert!(plan.iter().all(|task| task.stage != Stage::Evidence));
+        assert!(plan.iter().any(|task| task.stage == Stage::Approach));
     }
 
     /// The interesting clarification: everything is specified, but this

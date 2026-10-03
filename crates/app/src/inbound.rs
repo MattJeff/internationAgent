@@ -2838,6 +2838,11 @@ const AUTO_REPLY_MARKS: &[&str] = &[
     "risposta automatica",
     "autosvar",
     "automatisch antwoord",
+    "received your ticket",
+    "has been received",
+    "has been recieved",
+    "ticket #",
+    "your request (ticket",
     "delivery status notification",
     "undeliverable",
     "mail delivery failed",
@@ -3509,11 +3514,16 @@ pub const QUESTION_PATIENCE: chrono::TimeDelta = chrono::TimeDelta::hours(24);
 /// that nothing happened. A status is a board item, not a question; see
 /// [`InternalError::StatusIsNotAQuestion`]. Matched on word boundaries,
 /// case-insensitively — `fyi` alone would otherwise hit "verifying".
-const STATUS_PHRASES: [&str; 8] = [
+const STATUS_PHRASES: [&str; 13] = [
     "status update",
     "status check",
     "status check-in",
     "status report",
+    "status on",
+    "status read",
+    "checking in",
+    "quick sync",
+    "not re-asking",
     "no action needed",
     "just flagging",
     "for your awareness",
@@ -3536,7 +3546,9 @@ fn is_a_status(body: &str) -> bool {
 /// Written by `loops::patience` through [`answer_for_silence`].
 pub const NO_ANSWER: &str = "No answer in 24 h. Apply your plan's default for this and do not \
                              wait: write the letter, pass on a non-fit, or put it on your board. \
-                             Ask again only if a real action depends on the answer.";
+                             If you no longer know what you asked, you do not need the answer: \
+                             take the next letter a sequence gives you. Do not ask what the \
+                             question was, and ask again only if a real action depends on it.";
 
 /// What one employee is doing to another.
 ///
@@ -6215,6 +6227,8 @@ mod tests {
         for s in [
             "自动回复: Welcome to the Orizn Visa API",
             "Automatic reply: Your Orizn Visa API usage",
+            "Rentals United - We have received your ticket 2151",
+            "Cloudbeds - Re: Entry requirements (Ticket #3589987)",
             "Réponse automatique : Bienvenue",
             "Out of Office Re: entry requirements",
             "Undeliverable: Welcome to the Orizn Visa API",
