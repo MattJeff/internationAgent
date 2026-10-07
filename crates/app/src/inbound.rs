@@ -3514,7 +3514,12 @@ pub const QUESTION_PATIENCE: chrono::TimeDelta = chrono::TimeDelta::hours(24);
 /// that nothing happened. A status is a board item, not a question; see
 /// [`InternalError::StatusIsNotAQuestion`]. Matched on word boundaries,
 /// case-insensitively — `fyi` alone would otherwise hit "verifying".
-const STATUS_PHRASES: [&str; 13] = [
+const STATUS_PHRASES: [&str; 18] = [
+    "skipped",
+    "skipping",
+    "no email sent",
+    "no-send",
+    "blocked since",
     "status update",
     "status check",
     "status check-in",
@@ -8893,6 +8898,7 @@ mod tests {
         for body in [
             "Status update: the FR entry-requirements page is still in draft.",
             "Quick note, FYI — the outage is still on. No action needed.",
+            "Skipped tech-quotidien step 1 for jeff@outdoorsy.com — no email sent.",
         ] {
             let refused = say(
                 &db,
