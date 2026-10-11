@@ -156,6 +156,12 @@ case "$ACTION" in
     verif_jour=""
     while :; do
       sleep 300
+      # Un serveur vivant sans caffeinate laisse le Mac dormir : rattacher.
+      if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null \
+         && ! pgrep -f "caffeinate -i -s -w $(cat "$PIDFILE")" >/dev/null 2>&1; then
+        nohup caffeinate -i -s -w "$(cat "$PIDFILE")" >/dev/null 2>&1 &
+        dit "$(date -u +%FT%TZ) : caffeinate rattaché au serveur $(cat "$PIDFILE")."
+      fi
       # Une fois par jour après 09:30 UTC : les inscrits du site entrent dans
       # le CRM (scripts/site-inscrits.sh, idempotent). Avant les nourrissages
       # d'accueil de 10:00.
@@ -168,7 +174,9 @@ case "$ACTION" in
       # Une fois par jour après 10:40 UTC, les nourrissages de 09:00 et 10:00
       # passés : les cinq contrôles réels (scripts/verif-quotidienne.sh). Il
       # tient son propre journal et envoie lui-même le mail rouge au moindre KO.
-      if [ "$(date -u +%H%M)" -ge 1040 ] && [ "$verif_jour" != "$(date -u +%F)" ]; then
+      # 11:40 : après le réveil des dormants (11:00) et le réveil horaire du
+      # siège support, qui écrit ses lettres de 10:00 jusqu'à 10:59.
+      if [ "$(date -u +%H%M)" -ge 1140 ] && [ "$verif_jour" != "$(date -u +%F)" ]; then
         verif_jour="$(date -u +%F)"
         if "$RACINE/scripts/verif-quotidienne.sh" >/dev/null 2>&1; then
           dit "$(date -u +%FT%TZ) : vérification quotidienne : tout OK."
@@ -513,7 +521,10 @@ attendre() { # url, secondes, quoi
     printf .; sleep 1
   done; echo
 }
-attendre "http://127.0.0.1:$PORT/livez" 60 "le serveur"
+# 180 s : sur un portable qui sort de veille, 60 s ne suffisaient pas (le
+# 2026-10-10 à 22:54 UTC le refus a laissé un serveur vivant sans caffeinate,
+# et le Mac a dormi par tranches toute la nuit).
+attendre "http://127.0.0.1:$PORT/livez" 180 "le serveur"
 dit "serveur vivant, pid $SERVEUR, journal $JOURNAL"
 # Le portable ne doit pas s'endormir tant que le serveur tourne : `sleep 1`
 # dans pmset, et le 2026-09-27 de 16:43 à 19:01 UTC le réseau est parti avec
