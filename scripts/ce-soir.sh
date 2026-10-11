@@ -168,7 +168,9 @@ case "$ACTION" in
       # Une fois par jour après 10:40 UTC, les nourrissages de 09:00 et 10:00
       # passés : les cinq contrôles réels (scripts/verif-quotidienne.sh). Il
       # tient son propre journal et envoie lui-même le mail rouge au moindre KO.
-      if [ "$(date -u +%H%M)" -ge 1040 ] && [ "$verif_jour" != "$(date -u +%F)" ]; then
+      # 11:40 : après le réveil des dormants (11:00) et le réveil horaire du
+      # siège support, qui écrit ses lettres de 10:00 jusqu'à 10:59.
+      if [ "$(date -u +%H%M)" -ge 1140 ] && [ "$verif_jour" != "$(date -u +%F)" ]; then
         verif_jour="$(date -u +%F)"
         if "$RACINE/scripts/verif-quotidienne.sh" >/dev/null 2>&1; then
           dit "$(date -u +%FT%TZ) : vérification quotidienne : tout OK."

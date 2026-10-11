@@ -64,9 +64,9 @@ resend() { # $1 destinataire, $2 sujet, $3 corps HTML
 }
 
 # 1. Nourri à l'heure.
-r="$(sql "select count(*) filter (where (feed->>'hour')::int <= extract(hour from now())::int),
+r="$(sql "select count(*) filter (where (feed->>'hour')::int < extract(hour from now())::int),
                  coalesce(string_agg(name || ' (feed ' || (feed->>'hour') || 'h, fed_on ' || coalesce(fed_on::text,'jamais') || ')', ', ')
-                   filter (where (feed->>'hour')::int <= extract(hour from now())::int and fed_on is distinct from current_date), '')
+                   filter (where (feed->>'hour')::int < extract(hour from now())::int and fed_on is distinct from current_date), '')
             from sequences where archived_at is null and feed is not null")" \
   || r="|psql injoignable"
 dues="${r%%|*}"; tard="${r#*|}"
