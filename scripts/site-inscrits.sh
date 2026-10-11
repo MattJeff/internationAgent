@@ -4,7 +4,7 @@
 # seules personnes qui ont déjà dit oui au produit, et personne ne leur
 # écrivait (1 751 comptes le 2026-09-28, 12 payants). Quatre viviers, par
 # `origin_ref` :
-#   site-inscrits · quota   — gratuit, ≥ 50 requêtes ce mois  → montee-en-gamme
+#   site-inscrits · quota   — gratuit, ≥ 80 requêtes ce mois  → montee-en-gamme
 #   site-inscrits · actif   — gratuit, connecté sous 30 j ou ≥ 10 requêtes → accueil-gratuit
 #   site-inscrits           — gratuit, dormant (rien pour l'instant)
 #   site-inscrits · payant  — abonné (Stripe fait le reste ; pas de nourrissage)
@@ -51,7 +51,7 @@ for line in open(src, encoding='utf-8', errors='replace'):
     except ValueError: ll = None
     rec = [email, first[:60], last[:60], comp[:120], '', ('https://'+dom) if dom not in consumer else '', '', '']
     if plan != 'free': rows['payant'].append(rec)
-    elif int(rm or 0) >= 50: rows['quota'].append(rec)
+    elif int(rm or 0) >= 80: rows['quota'].append(rec)
     elif (ll and ll >= now - timedelta(days=30)) or int(rt or 0) >= 10: rows['actif'].append(rec)
     else: rows['dormant'].append(rec)
 for k, v in rows.items():
