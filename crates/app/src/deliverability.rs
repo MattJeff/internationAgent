@@ -251,6 +251,27 @@ pub fn check(subject: &str, body: &str) -> Verdict {
     if body.trim().is_empty() {
         refusals.push(Problem::new("empty_body", "the body is empty"));
     }
+    // A mail with nothing to say. On 2026-10-04 a seat sent a paying customer
+    // the subject « test-retry-placeholder » and the body « placeholder » —
+    // a model trying something out, through the real door. `body_short`
+    // below already warns on a short body; this refuses the words a human
+    // never sends on purpose.
+    let lower = format!("{subject}\n{body}").to_lowercase();
+    if [
+        "placeholder",
+        "lorem ipsum",
+        "test-retry",
+        "test mail",
+        "test email",
+    ]
+    .iter()
+    .any(|w| lower.contains(w))
+    {
+        refusals.push(Problem::new(
+            "not_a_letter",
+            "the body is a placeholder, not a letter",
+        ));
+    }
 
     let subject_letters = subject.chars().filter(|c| c.is_alphabetic()).count();
     if subject_letters >= SUBJECT_CAPS_MIN_LETTERS
@@ -418,6 +439,28 @@ mod tests {
     /// sous le seuil qui passe. Le sujet et le corps du cas « passe » sont
     /// construits pour ne déclencher **que** la règle testée, sinon un refus
     /// voisin ferait passer un cas rouge pour un cas vert.
+    /// **A placeholder is not a letter.** The 2026-10-04 mail to a paying
+    /// customer, verbatim: refused before the door.
+    #[test]
+    fn a_placeholder_is_refused() {
+        for (subject, body) in [
+            ("test-retry-placeholder", "placeholder"),
+            (
+                "Hello",
+                "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod.",
+            ),
+        ] {
+            let verdict = check(subject, body);
+            assert!(verdict.is_refused(), "{subject}: {verdict}");
+            assert!(verdict.to_string().contains("not_a_letter"), "{verdict}");
+        }
+        let fine = check(
+            "Re: your Orizn Visa API key",
+            "Hi Evan, did the first calls go through? Reply here if a pair is missing.\n\nMathis Higuinen, Orizn",
+        );
+        assert!(!fine.to_string().contains("not_a_letter"), "{fine}");
+    }
+
     #[test]
     fn each_refusal_bites_and_stops_just_under_its_threshold() {
         let links = |n: usize| {

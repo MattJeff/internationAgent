@@ -68,6 +68,13 @@ for k in quota actif dormant payant; do
     -H "Authorization: Bearer $CLE_OPS" -H 'content-type: text/csv' --data-binary @"$ETAT/site-$k.csv" \
     | python3 -c "import sys,json; j=json.loads(sys.stdin.read(),strict=False); c=j['contacts']; print('$k: créés', c['created'], '| déjà là', c['existing'], '| erreurs', len(j.get('errors') or []))"
 done
+# Un inscrit déjà en base qui est passé payant depuis change de vivier : l'import
+# ne retouche pas un contact existant (Evan, gratuit le 28/09, Commercial le 14/10).
+python3 - "$ETAT/site-payant.csv" <<'PY' | PGPORT="${PGPORT:-5432}" psql -d "${DB_NAME:-agentos_ce_soir}" -Atq
+import csv,sys
+mails=[r['email'].strip().lower() for r in csv.DictReader(open(sys.argv[1])) if r.get('email')]
+if mails: print("update contacts set origin_ref='site-inscrits · payant' where lower(email) in (" + ",".join("'"+m.replace("'","''")+"'" for m in mails) + ") and origin_ref like 'site-inscrits%' and origin_ref <> 'site-inscrits · payant';")
+PY
 # La base légale des inscrits est le contrat ; l'import pose « intérêt légitime ».
 PGPORT="${PGPORT:-5432}" psql -d "${DB_NAME:-agentos_ce_soir}" -Atc \
   "update contacts set lawful_basis='contract' where origin_ref like 'site-inscrits%' and lawful_basis <> 'contract'" >/dev/null
