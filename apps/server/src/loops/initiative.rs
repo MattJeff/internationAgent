@@ -1677,14 +1677,18 @@ async fn take_turn(agent: Agent, assignment: Assignment) -> Result<(), String> {
                 let slept = async {
                     let mut tx = db.tenant_tx(due.tenant_id).await?;
                     let seats = initiative::sleep_until(&mut tx, until, Utc::now()).await?;
+                    // And the promises, or they ring into sleeping seats and
+                    // spend their turns on the same error (2026-10-14).
+                    let promises = calendar::postpone_until(&mut tx, until).await?;
                     tx.commit().await?;
-                    Ok::<u64, StoreError>(seats)
+                    Ok::<(u64, u64), StoreError>((seats, promises))
                 }
                 .await;
                 match slept {
-                    Ok(seats) => tracing::warn!(
+                    Ok((seats, promises)) => tracing::warn!(
                         tenant_id = %due.tenant_id.as_uuid(),
                         seats,
+                        promises,
                         %until,
                         "the subscription's ceiling: every seat sleeps until it lifts"
                     ),

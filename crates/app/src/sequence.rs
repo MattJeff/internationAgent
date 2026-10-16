@@ -1040,6 +1040,32 @@ async fn budget_refused(
     Ok(refused)
 }
 
+/// Si le réveil de `since` a buté sur le plafond de l'abonnement, l'heure où
+/// il se lève — lue dans la trace du tour (« rate limited by the subscription
+/// until <RFC 3339>; … »). Un tel réveil n'a rien tenté : il n'est pas un
+/// rejeu, et la lettre repart quand le plafond se lève.
+async fn rate_limited_until(
+    tx: &mut TenantTx<'_>,
+    employee: EmployeeId,
+    since: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>, StoreError> {
+    let detail: Option<String> = sqlx::query_scalar(
+        "SELECT detail FROM turn_outcomes \
+          WHERE employee_id = $1 AND at >= $2 AND code = 'error' \
+            AND detail LIKE 'rate limited by the subscription until %' \
+          ORDER BY at DESC LIMIT 1",
+    )
+    .bind(employee.as_uuid())
+    .bind(since)
+    .fetch_optional(&mut ***tx)
+    .await?;
+    Ok(detail
+        .and_then(|d| d.split("until ").nth(1).map(str::to_owned))
+        .and_then(|rest| rest.split(';').next().map(str::trim).map(str::to_owned))
+        .and_then(|ts| DateTime::parse_from_rfc3339(&ts).ok())
+        .map(|t| t.with_timezone(&Utc)))
+}
+
 /// Le lendemain de `now`, à `hour` UTC : quand un budget du jour est neuf.
 fn tomorrow(now: DateTime<Utc>, hour: u32) -> DateTime<Utc> {
     (now.date_naive() + TimeDelta::days(1))
@@ -1299,11 +1325,16 @@ pub async fn advance(
                 .get::<Option<serde_json::Value>, _>("feed")
                 .and_then(|v| serde_json::from_value::<Feed>(v).ok())
                 .map_or(0, |f| u32::from(f.hour));
+            let limited = if outcome == "error" {
+                rate_limited_until(tx, employee, rang).await?
+            } else {
+                None
+            };
             let again = match outcome {
                 "over_budget" => tomorrow(now, hour),
                 "turn" if budget_refused(tx, employee, rang).await? => tomorrow(now, hour),
                 "turn" if replays == 0 => now,
-                "error" => now,
+                "error" => limited.unwrap_or(now),
                 "no_charter" => {
                     let chartered: bool = sqlx::query_scalar(
                         "SELECT EXISTS (SELECT 1 FROM employee_charters WHERE employee_id = $1)",
@@ -1318,7 +1349,8 @@ pub async fn advance(
                 }
                 _ => return stop(tx, run, "stopped", Some("not_sent"), now).await,
             };
-            if replays >= MAX_REPLAYS || again > deadline {
+            // Un réveil sous plafond n'a rien tenté : il ne compte pas.
+            if (replays >= MAX_REPLAYS && limited.is_none()) || again > deadline {
                 return stop(tx, run, "stopped", Some("not_sent"), now).await;
             }
             book(tx, run, employee, again, &email, conversation).await?;
@@ -2591,6 +2623,56 @@ mod tests {
             ("stopped", Some("not_sent"))
         );
         assert_eq!(promises(&f, run).await.len(), 2);
+    }
+
+    /// **The subscription's ceiling is not a replay.** A wake whose trace says
+    /// « rate limited … until T » re-books at T, as many times as the ceiling
+    /// bites, and never ends `not_sent` for it. The 2026-10-14 ceiling killed
+    /// 40 letters through `"error" => now` and `MAX_REPLAYS`.
+    #[tokio::test]
+    async fn a_subscription_ceiling_rebooks_at_its_end_and_burns_no_replay() {
+        let Some(f) = fixture_alone("plafond_abonnement").await else {
+            return;
+        };
+        let t0 = Utc::now().trunc_subsecs(6);
+        let seq = defined(&f, &[email("hello")]).await;
+        let run = enrolled(&f, seq, t0).await;
+        tick(&f, run, t0).await;
+        let mut t = t0;
+        for round in 1..=(MAX_REPLAYS + 2) {
+            // The trace carries seconds: what comes back is second-precise.
+            let until = (t + TimeDelta::hours(2)).trunc_subsecs(0);
+            woken(&f, run, t + TimeDelta::minutes(1), "error").await;
+            let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+            sqlx::query(
+                "INSERT INTO turn_outcomes (id, tenant_id, employee_id, at, code, detail) \
+                 VALUES ($1, $2, $3, $4, 'error', $5)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(f.tenant.as_uuid())
+            .bind(f.lena.as_uuid())
+            .bind(t + TimeDelta::minutes(1))
+            .bind(format!(
+                "rate limited by the subscription until {}; every seat of this company sleeps until then",
+                until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ))
+            .execute(&mut **tx)
+            .await
+            .expect("trace");
+            tx.commit().await.expect("commit");
+            let r = tick(&f, run, t + TimeDelta::minutes(2)).await;
+            assert_eq!(
+                r.state, "active",
+                "round {round}: the ceiling is not a replay"
+            );
+            assert_eq!(
+                r.next_at,
+                Some(until + WAKE_POLL),
+                "round {round}: re-booked at the end"
+            );
+            assert_eq!(promises(&f, run).await.len(), round + 1);
+            t = until;
+        }
     }
 
     /// **A run keeps its arm, the wake carries that arm's brief, and the
