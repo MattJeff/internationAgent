@@ -479,6 +479,22 @@ pub async fn claim_due(
 /// exactly the one-comparison-carrying-two-facts defect `0072` exists to remove,
 /// reintroduced one column over. `appointments_outcome_agrees_with_the_clock` is
 /// what makes the two spellings inseparable rather than merely consistent.
+/// Push every promise not yet rung and due before `until` to `until`: the
+/// subscription's ceiling has every seat asleep till then, and a promise that
+/// rings into a sleeping seat is a turn spent on a rate-limit error. The
+/// 2026-10-14 ceiling (10:06–12:00 UTC) rang 108 promises into three sleeping
+/// seats, burned their whole day of turns and killed 40 letters `not_sent`.
+pub async fn postpone_until(
+    tx: &mut TenantTx<'_>,
+    until: DateTime<Utc>,
+) -> Result<u64, StoreError> {
+    let moved = sqlx::query("UPDATE appointments SET at = $1 WHERE rang_at IS NULL AND at < $1")
+        .bind(until)
+        .execute(&mut ***tx)
+        .await?;
+    Ok(moved.rows_affected())
+}
+
 pub async fn cancel_outstanding(
     tx: &mut TenantTx<'_>,
     employee: EmployeeId,
@@ -671,6 +687,54 @@ mod tests {
     /// appointments are booked **at the same instant** in two zones; a schema
     /// that stored only `timestamptz` could not tell them apart afterwards, and
     /// this asserts that it can.
+    /// **A ceiling pushes the unrung promises past it.** Due before `until`:
+    /// moved to `until`. Due after, or already rung: untouched.
+    #[tokio::test]
+    async fn a_ceiling_postpones_the_promises_not_yet_rung() {
+        let Some((db, tenant, _)) = fixture().await else {
+            return;
+        };
+        let ada = seed_employee(&db, tenant, "ada-ceiling").await;
+        let now = Utc::now().trunc_subsecs(6);
+        let until = now + TimeDelta::hours(2);
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        let soon = book(
+            &mut tx,
+            AppointmentId::new_v7(now),
+            ada,
+            now + TimeDelta::minutes(10),
+            "UTC",
+            "soon",
+        )
+        .await
+        .expect("book");
+        let later = book(
+            &mut tx,
+            AppointmentId::new_v7(now),
+            ada,
+            until + TimeDelta::hours(1),
+            "UTC",
+            "later",
+        )
+        .await
+        .expect("book");
+        assert_eq!(postpone_until(&mut tx, until).await.expect("postpone"), 1);
+        let ats: Vec<(uuid::Uuid, DateTime<Utc>)> =
+            sqlx::query_as("SELECT id, at FROM appointments WHERE id = ANY($1)")
+                .bind(vec![soon.id.as_uuid(), later.id.as_uuid()])
+                .fetch_all(&mut **tx)
+                .await
+                .expect("at");
+        let at = |id: AppointmentId| ats.iter().find(|(i, _)| *i == id.as_uuid()).expect("row").1;
+        assert_eq!(at(soon.id), until, "due before the ceiling: pushed to it");
+        assert_eq!(
+            at(later.id),
+            until + TimeDelta::hours(1),
+            "due after: untouched"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
     #[tokio::test]
     async fn a_promised_moment_rings_once_and_says_itself_back_in_its_own_zone() {
         let Some((db, tenant, _)) = fixture().await else {
