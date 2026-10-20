@@ -1534,7 +1534,9 @@ pub async fn brief(db: &Db, tenant: TenantId, run: SequenceRunId) -> Option<Stri
          in this turn: a turn that ends without the email has done nothing. Do not message a \
          colleague — no question, no status — before that email has gone. If this contact is \
          plainly not a target (no travellers, no border to cross), send nothing, put one line \
-         on your board with `add_work_item` saying why you passed, and do not ask anyone.",
+         on your board with `add_work_item` saying why you passed, and do not ask anyone. \
+         Your diary may list other promised hours at this same minute — each is its own turn; \
+         this turn is for the address named here, and the diary is never a reason to hold.",
         step + 1,
         steps.len(),
         name.trim(),
