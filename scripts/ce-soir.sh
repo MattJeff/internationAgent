@@ -192,13 +192,20 @@ case "$ACTION" in
           000|530) tunnel_mort=$((tunnel_mort + 1)) ;;
           *) tunnel_mort=0 ;;
         esac
-        if [ "$tunnel_mort" -ge 2 ]; then
+        # Pas de cloudflared du tout (Mac redémarré) : inutile d'attendre 10 min.
+        if [ "$tunnel_mort" -ge 2 ] || ! pgrep -f "cloudflared tunnel --no-autoupdate run" >/dev/null; then
           dit "$(date -u +%FT%TZ) : $PUBLIC_HOST_FIXE ne répond plus — je relance le tunnel nommé."
           pkill -f "cloudflared tunnel --no-autoupdate run" 2>/dev/null || true
           nohup cloudflared tunnel --no-autoupdate run --token "$(cat "$HOME/.cloudflared/orizn-local.token")" \
             >> "$ETAT/tunnel-nomme.log" 2>&1 &
           tunnel_mort=0
         fi
+      fi
+      # Le service social (LinkedIn) : aucun autre script ne le lance.
+      if [ -f "$ETAT/social.env" ] && ! lsof -nP -iTCP:8791 -sTCP:LISTEN >/dev/null 2>&1; then
+        ( set -a; . "$ETAT/social.env"; set +a
+          nohup "$RACINE/target/debug/agentos-social" >> "$ETAT/social.log" 2>&1 </dev/null & )
+        dit "$(date -u +%FT%TZ) : agentos-social n'écoutait plus sur 8791 — relancé."
       fi
       [ -f "$JOURNAL" ] || continue
       age=$(( $(date +%s) - $(stat -f %m "$JOURNAL") ))
@@ -263,17 +270,21 @@ if [ "$REEL" = 1 ]; then
   [ -n "${AGENT_EMAIL_DOMAIN:-}" ] \
     || refuse "--reel sans AGENT_EMAIL_DOMAIN. Nomme le domaine d'envoi vérifié chez Resend ; le faux domaine par défaut ferait refuser chaque envoi par Resend."
   if [ -n "${EMAIL_API_BASE:-}" ]; then
+    rm -f "$ETAT/reel.oui"
     # La répétition générale. L'adaptateur est le vrai — même code, même
     # `Idempotency-Key`, même `provider_message_id` relu — et il parle à
     # l'adresse nommée. Pas de `OUI` à taper : il n'y a rien à confirmer quand
     # rien ne sort de la machine, et un avertissement qui ment la première fois
     # n'est plus lu la seconde.
     dit "--reel contre EMAIL_API_BASE=$EMAIL_API_BASE : l'adaptateur Resend est le vrai, son correspondant ne l'est pas. Rien ne sortira de cette machine."
-  elif [ "$RELANCER" = 1 ] && deja_reel; then
+  elif [ "$RELANCER" = 1 ] && { deja_reel || [ -f "$ETAT/reel.oui" ]; }; then
     # Le OUI a été tapé pour passer en réel ; relancer un binaire sur une
     # instance qui y est déjà ne change pas ce qui sort de la machine. Le
     # redemander à chaque nouveau binaire apprendrait à ne plus le lire — et
     # une instance qui n'était PAS en réel le demande, elle, comme avant.
+    # Serveur mort (redémarrage du Mac, le 2026-10-24) : deja_reel ne voit
+    # plus rien et la veille butait sur ce OUI. reel.oui garde le
+    # consentement, pas l'état : écrit au OUI, effacé par toute marche à blanc.
     dit "--relancer sur une instance déjà en réel : je le reste, sans redemander OUI."
   else
     cat >&2 <<'AVERT'
@@ -290,6 +301,7 @@ AVERT
     printf '  tape OUI pour continuer : ' >&2
     read -r reponse
     [ "$reponse" = "OUI" ] || refuse "annulé. Relance sans --reel pour la marche à blanc."
+    date -u +%FT%TZ > "$ETAT/reel.oui"
   fi
 fi
 
@@ -501,7 +513,7 @@ export AGENTOS_LLM=cli
 export AGENTOS_API_KEYS="ops:$TENANT_ID:$CLE_OPS,approver:$TENANT_ID:$CLE_APPROBATEUR"
 export RUST_LOG="${RUST_LOG:-info,agentos_server=debug}"
 if [ -n "$CHROME_URL" ]; then export BROWSER_CDP_URL="$CHROME_URL"; fi
-[ "$REEL" = 1 ] || unset EMAIL_API_KEY EMAIL_API_BASE
+[ "$REEL" = 1 ] || { unset EMAIL_API_KEY EMAIL_API_BASE; rm -f "$ETAT/reel.oui"; }
 # La clé de plate-forme n'existe QUE sous `--recevoir`. C'est la seule qui peut
 # écrire `webhook_endpoints` — aucune clé de locataire ne le peut, et c'est
 # délibéré : un locataire qui écrirait sa propre ligne pourrait nommer un chemin
