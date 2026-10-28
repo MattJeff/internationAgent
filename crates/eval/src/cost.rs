@@ -395,7 +395,19 @@ pub fn by_model(sample: Sample, calls_per_turn: f64) -> Vec<(ModelId, usize, f64
 /// Aucune ligne de catalogue n'est entrée, aucun schéma d'outil n'a bougé :
 /// le précédent du 09-20 autorise le re-pin sans re-mesure. Seul `DIGEST` a
 /// bougé (`8a10a296b9c6b62c` → `785d10ae7be4cc3d`).
-pub const DIGEST: &str = "785d10ae7be4cc3d";
+///
+/// # Déplacé encore le 2026-10-28, même règle, côté support
+///
+/// Du **prompt** seul, sur le seul briefing du siège support
+/// (`CUSTOMER_SUCCESS_BRIEFING`) et la tâche `Answer` de son plan : « no
+/// prices » devient « les paliers publics cités tels quels, pas de
+/// négociation, le plan à 100 requêtes jamais offert à une entreprise », et la
+/// même section « How a reply is written » (25–80 mots, pas de
+/// `last_verified_at` collé). Cause : les réponses du siège à Pascal (« handled
+/// separately », 176 mots), Fluxir (« I won't quote figures », 109 mots) et
+/// Naveen (148 mots). Aucune ligne de catalogue, aucun schéma d'outil : re-pin
+/// sans re-mesure (`785d10ae7be4cc3d` → `c6d7c3840f96edd7`).
+pub const DIGEST: &str = "c6d7c3840f96edd7";
 
 // ---------------------------------------------------------------------------
 // The company, as the operator wrote it down
