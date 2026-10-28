@@ -7,10 +7,13 @@ src, out = sys.argv[1], sys.argv[2]
 # été importés actifs et nourris). L'import ne réactive jamais un contact
 # existant, donc ne pas les écrire suffit.
 # ponytail: liste à la main ; un paquet de domaines jetables si d'autres arrivent.
-JETABLES = ('mailinator.com', 'yopmail.com', 'guerrillamail.com', 'sharklasers.com',
-            '10minutemail.com', 'trashmail.com', 'maildrop.cc', 'temp-mail.org')
+JETABLES = ('mailinator.com', 'yopmail.com', 'sharklasers.com', 'maildrop.cc',
+            'dispostable.com', 'getnada.com')
+# Ces familles changent de TLD (guerrillamail.net, 10minutemail.co.uk…) : le nom suffit.
+FAMILLES = {'guerrillamail', '10minutemail', 'temp-mail', 'trashmail'}
 def jetable(dom):
-    return 'tempmail' in dom or any(dom == d or dom.endswith('.' + d) for d in JETABLES)
+    return ('tempmail' in dom or any(dom == d or dom.endswith('.' + d) for d in JETABLES)
+            or not FAMILLES.isdisjoint(dom.split('.')))
 consumer = {'gmail.com','qq.com','163.com','126.com','yahoo.com','hotmail.com','outlook.com','icloud.com','proton.me','protonmail.com','live.com','yandex.ru','mail.ru','foxmail.com','gmx.de','web.de','me.com','aol.com','msn.com','hotmail.fr','yahoo.fr','orange.fr','free.fr','wanadoo.fr','laposte.net','sfr.fr'}
 now = datetime.utcnow()
 rows = {'quota':[], 'actif':[], 'dormant':[], 'payant':[]}
