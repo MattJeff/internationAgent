@@ -601,7 +601,10 @@ cat <<FIN_MSG
  L'instance tourne. Colle ceci dans ton terminal :
 
    claude mcp add --transport http siglair http://127.0.0.1:$PORT/v1/mcp/server \\
-     --header "Authorization: Bearer $CLE_OPS"
+     --header "Authorization: Bearer \$(sed -n 's/^CLE_OPS=//p' "$SECRETS")"
+
+ (La clé ${CLE_OPS:0:4}… est lue dans $SECRETS au collage : ce script ne
+ l'imprime plus en clair, la veille recopie sa sortie dans veille.log.)
 
  Puis, dans Claude Code : /mcp doit montrer « siglair » connecté.
 
@@ -612,7 +615,7 @@ cat <<FIN_MSG
  geste suivant tomberait sur un 404). Puis le geste lancer-une-campagne.
 
  La clé qui approuve (une autre, sinon les quatre yeux refusent sur soi) :
-   $CLE_APPROBATEUR
+   ${CLE_APPROBATEUR:0:4}…  (en entier : CLE_APPROBATEUR dans $SECRETS)
 
  Arrêter : scripts/ce-soir.sh --arreter
  Tout jeter : scripts/ce-soir.sh --effacer
@@ -624,7 +627,7 @@ if [ "$RECEVOIR" = 1 ]; then
  À coller dans le tableau de bord Resend (Webhooks → Add endpoint) :
 
    URL     $PUBLIC$ROUTE_WEBHOOK
-   Secret  $SECRET_WEBHOOK
+   Secret  ${SECRET_WEBHOOK:0:10}…  (en entier : SECRET_WEBHOOK dans $SECRETS)
 
  L'adresse du tunnel CHANGE à chaque lancement de ce script : c'est ce que
  coûte un tunnel rapide, qui ne demande ni compte ni carte. Le secret, lui,
