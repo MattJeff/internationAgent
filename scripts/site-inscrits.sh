@@ -31,34 +31,7 @@ ssh -o BatchMode=yes "$SERVER" 'docker exec -i backend-postgres-1 sh -c "PGPASSW
 rm -f /tmp/inscrits.sql
 chmod 600 "$ETAT/site-inscrits.psv"
 
-python3 - "$ETAT/site-inscrits.psv" "$ETAT" <<'PY'
-import sys, csv, re
-from datetime import datetime, timedelta
-src, out = sys.argv[1], sys.argv[2]
-consumer = {'gmail.com','qq.com','163.com','126.com','yahoo.com','hotmail.com','outlook.com','icloud.com','proton.me','protonmail.com','live.com','yandex.ru','mail.ru','foxmail.com','gmx.de','web.de','me.com','aol.com','msn.com','hotmail.fr','yahoo.fr','orange.fr','free.fr','wanadoo.fr','laposte.net','sfr.fr'}
-now = datetime.utcnow()
-rows = {'quota':[], 'actif':[], 'dormant':[], 'payant':[]}
-for line in open(src, encoding='utf-8', errors='replace'):
-    p = line.rstrip('\n').split('|')
-    if len(p) < 12: continue
-    uid, email, name, company, plan, rm, rt, last_login, created, verified, stripe, chan = p[:12]
-    email = email.strip().lower()
-    if not re.match(r'^[^@\s]+@[^@\s]+\.[a-z]{2,}$', email) or email.endswith('@example.com'): continue
-    dom = email.split('@')[1]
-    first, last = (name.strip().split(' ',1)+[''])[:2] if name.strip() else ('','')
-    comp = company.strip() or (dom if dom not in consumer else (name.strip() or email.split('@')[0]))
-    try: ll = datetime.fromisoformat(last_login[:19]) if last_login else None
-    except ValueError: ll = None
-    rec = [email, first[:60], last[:60], comp[:120], '', ('https://'+dom) if dom not in consumer else '', '', '']
-    if plan != 'free': rows['payant'].append(rec)
-    elif int(rm or 0) >= 80: rows['quota'].append(rec)
-    elif (ll and ll >= now - timedelta(days=30)) or int(rt or 0) >= 10: rows['actif'].append(rec)
-    else: rows['dormant'].append(rec)
-for k, v in rows.items():
-    with open(f'{out}/site-{k}.csv','w', newline='', encoding='utf-8') as f:
-        w = csv.writer(f); w.writerow(['email','first_name','last_name','company_name','phone_number','website','linkedin_profile','location']); w.writerows(v)
-    print(f'{k} {len(v)}')
-PY
+python3 "$(dirname "$0")/site-inscrits.py" "$ETAT/site-inscrits.psv" "$ETAT"
 chmod 600 "$ETAT"/site-*.csv
 
 for k in quota actif dormant payant; do

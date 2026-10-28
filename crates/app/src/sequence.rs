@@ -2295,6 +2295,32 @@ mod tests {
     /// Le geste qui manquait le 2026-09-20 : retirer un contact arrête son run
     /// tout de suite, annule la promesse qui n'a pas sonné, et ne touche à
     /// rien d'autre — un second retrait est un 404, pas un second arrêt.
+    /// A contact switched off mid-run (`active = false`, the 2026-10-28
+    /// mailinator clean-up) stops the run as `inactive`: the code must be one
+    /// the constraint admits, or every tick fails on the violation.
+    #[tokio::test]
+    async fn a_contact_switched_off_mid_run_stops_it_as_inactive() {
+        let Some(f) = fixture_alone("inactif").await else {
+            return;
+        };
+        let t0 = Utc::now().trunc_subsecs(6);
+        let seq = defined(&f, &[wait(1), email("hello")]).await;
+        let run = enrolled(&f, seq, t0).await;
+        tick(&f, run, t0).await;
+        let mut tx = f.db.tenant_tx(f.tenant).await.expect("tx");
+        sqlx::query("UPDATE contacts SET active = false WHERE id = $1")
+            .bind(f.contact)
+            .execute(&mut **tx)
+            .await
+            .expect("inactive");
+        tx.commit().await.expect("commit");
+        let r = tick(&f, run, t0 + TimeDelta::hours(1)).await;
+        assert_eq!(
+            (r.state.as_str(), r.stop_reason.as_deref()),
+            ("stopped", Some("inactive"))
+        );
+    }
+
     #[tokio::test]
     async fn unenrolling_stops_the_run_and_cancels_its_unrung_promise() {
         let Some(f) = fixture_alone("desinscrit").await else {
