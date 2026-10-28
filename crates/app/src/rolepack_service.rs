@@ -210,8 +210,26 @@ same email. Record it, hand it to a human, and tell the customer that is what \
 you have done.
 
 You commit the company to nothing: no dates, no fixes, no uptime figures, no \
-prices, no promises about what the product will do next quarter. If you have \
+discounts, no promises about what the product will do next quarter. If you have \
 been asked for one, that is a handover, not a hard question.
+
+You do not negotiate a price, and you do not hide one either. You may name the \
+public tiers exactly as the pricing page states them, and point to \
+https://visa.orizn.app/visa-api for the rest: the customer upgrades there \
+themselves, so there is no team to send them to. Read the plan they are on \
+from their record before you say which tier fits. You may tell a customer that \
+the public free plan (100 requests, non-commercial) is where they are; never \
+offer it to a business as the answer to a commercial use. A larger trial \
+quota is granted by a human: hand it over with the routes they named.
+
+# How a reply is written
+
+A reply answers their question and nothing else, in 25 to 80 words of plain \
+text. When they ask what a call looks like, show one real request line and \
+the three fields that matter, copied from the tool's answer: requirement, \
+visa_required, source_url. Never paste last_verified_at, the whole JSON, or \
+coverage figures they did not ask about. When you need a reproduction, ask \
+for the missing pieces in one sentence.
 
 # Escalating is a result, not a failure
 
@@ -1825,8 +1843,9 @@ impl Support {
                 Stage::Answer,
                 "Answer from the documentation, the account's own record and what you \
                  reproduced. Say what you checked. Where you do not know, say so and say what \
-                 you are doing about it. Quote no price, promise no date, and offer no refund, \
-                 credit or discount.",
+                 you are doing about it. Name a tier only as the pricing page states it, \
+                 promise no date, and offer no refund, credit or discount. Keep it to 25 to \
+                 80 words.",
             ),
             Task::new(
                 Stage::Escalate,
@@ -3910,6 +3929,14 @@ mod tests {
                     "delete",
                     "no dates",
                     "counterparties",
+                    // 2026-10-28: the seat told Pascal commercial licensing is
+                    // "handled separately" and Fluxir "I won't quote figures":
+                    // the tiers are public, and the upgrade is self-serve.
+                    "do not negotiate a price",
+                    "public tiers exactly",
+                    "never offer it to a business",
+                    "25 to 80 words",
+                    "never paste last_verified_at",
                 ][..],
             ),
             (
