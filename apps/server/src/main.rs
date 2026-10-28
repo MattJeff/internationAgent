@@ -2963,7 +2963,6 @@ impl Agent {
                 &Reply {
                     conversation_id,
                     employee_id,
-                    channel: &channel,
                     from: &from,
                     subject: subject.as_deref(),
                     body: reply,
@@ -2991,7 +2990,6 @@ impl Agent {
 struct Reply<'a> {
     conversation_id: ConversationId,
     employee_id: EmployeeId,
-    channel: &'a str,
     from: &'a str,
     subject: Option<&'a str>,
     body: &'a str,
@@ -3000,6 +2998,13 @@ struct Reply<'a> {
 }
 
 /// Record the employee's answer on the conversation.
+///
+/// `channel = 'internal'` whatever the thread's channel: this is the turn's
+/// closing prose, and nothing delivers it — a mail leaves only through the
+/// send tool, which writes its own row with recipients and a provider id. On
+/// an email thread an `'email'` row here was counted as sent by the digest,
+/// `traces::health` and `traces::engagement`, while its body was the seat's
+/// reasoning ("I escalated to the founder…").
 ///
 /// In the handler's transaction, so it commits with the event being marked
 /// published: an acknowledged turn whose reply was not written is not a state
@@ -3016,15 +3021,14 @@ async fn record_reply(
              (id, tenant_id, conversation_id, employee_id, channel, direction, sender, \
               recipients, subject, body, attachments, trust_label, idempotency_key, \
               received_at, created_at) \
-         VALUES ($1, $2, $3, $4, $5, 'outbound', $6, '[]'::jsonb, $7, $8, '[]'::jsonb, $9, \
-                 $10, $11, $11) \
+         VALUES ($1, $2, $3, $4, 'internal', 'outbound', $5, '[]'::jsonb, $6, $7, '[]'::jsonb, $8, \
+                 $9, $10, $10) \
          ON CONFLICT (tenant_id, idempotency_key) DO NOTHING",
     )
     .bind(uuid::Uuid::now_v7())
     .bind(tx.tenant_id().as_uuid())
     .bind(reply.conversation_id.as_uuid())
     .bind(reply.employee_id.as_uuid())
-    .bind(reply.channel)
     .bind(reply.from)
     .bind(reply.subject)
     .bind(reply.body)
@@ -4995,6 +4999,20 @@ mod tests {
         // output — recorded as such rather than laundered into `trusted`.
         assert_eq!(trust, "untrusted");
         assert_eq!(landed.count("SELECT count(*) FROM messages").await, 2);
+        // The turn's closing text is a note, never a mail: nothing delivers
+        // it, so on an email thread it must not read as one. The digest, the
+        // trace health and the per-thread engagement all count
+        // `channel = 'email' AND direction = 'outbound'` as sent.
+        assert_eq!(
+            landed
+                .count(
+                    "SELECT count(*) FROM messages \
+                      WHERE direction = 'outbound' AND channel = 'email'"
+                )
+                .await,
+            0,
+            "the turn's closing prose was recorded as an outbound email"
+        );
 
         // And the model was actually asked, with the email framed rather than
         // spliced into an instruction of ours.
