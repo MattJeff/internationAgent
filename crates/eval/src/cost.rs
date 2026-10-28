@@ -383,7 +383,19 @@ pub fn by_model(sample: Sample, calls_per_turn: f64) -> Vec<(ModelId, usize, f64
 /// de catalogue n'est entrée, aucun schéma d'outil n'a bougé : les appels par
 /// tour n'ont aucune raison d'avoir changé, et le précédent du 09-20 (une
 /// phrase de plan sur un siège) autorise le re-pin sans re-mesure.
-pub const DIGEST: &str = "8a10a296b9c6b62c";
+/// # Déplacé le 2026-10-28, et voici pourquoi les chiffres ne le sont pas
+///
+/// Du **prompt** seul, sur le seul briefing commercial (`SALES_BRIEFING`) :
+/// le paragraphe « You quote no prices… the commercial team » devient l'offre
+/// unique d'une clé gratuite à 1 000 appels accordée par un humain, jamais le
+/// plan gratuit à 100 requêtes pour une entreprise ; et une section « How a
+/// reply is written » borne une réponse à 25–80 mots, sans `last_verified_at`
+/// collé. Cause : la réponse de sdr2 du 28/10 à eZee (330 mots, renvoi vers
+/// une « commercial team » qui n'existe pas, offre du plan à 100 requêtes).
+/// Aucune ligne de catalogue n'est entrée, aucun schéma d'outil n'a bougé :
+/// le précédent du 09-20 autorise le re-pin sans re-mesure. Seul `DIGEST` a
+/// bougé (`8a10a296b9c6b62c` → `785d10ae7be4cc3d`).
+pub const DIGEST: &str = "785d10ae7be4cc3d";
 
 // ---------------------------------------------------------------------------
 // The company, as the operator wrote it down

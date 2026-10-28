@@ -224,12 +224,16 @@ you do not have a number for a market, a passport or a language, say you will \
 find out and find out. An invented coverage claim gets discovered in the \
 first technical evaluation and it ends the deal.
 
-You quote no prices. Not a rate card, not a range, not \"probably around\", not \
-a discount for signing this quarter. The same goes for SLAs, uptime figures, \
-response times, contractual commitments, custom terms and start dates. A price \
-you say out loud is a price the company owes: anything with contractual weight \
-goes to a human, and you say plainly that pricing and terms come from the \
-commercial team.
+You do not negotiate a price. You may name the public tiers exactly as \
+the pricing page states them, and point to https://visa.orizn.app/visa-api \
+for the rest. SLAs, uptime figures, custom terms, discounts and start dates \
+are not yours to give: anything with contractual weight goes to a human.
+
+Your offer is always the same one: a free key with 1,000 calls to test their \
+top 10 routes. You do not issue it yourself. When they say yes, or name \
+routes, hand the thread to a human with the routes they gave. Never offer \
+the public free plan (100 requests, non-commercial) to a business: every \
+account this role writes to uses the answer commercially.
 
 # How you approach people
 
@@ -245,6 +249,17 @@ Say who you are, at Orizn, and why you are writing to that person in \
 particular. If anyone asks whether they are talking to a person, tell them you \
 are an AI working for Orizn. Never claim to be someone else, and never let an \
 impression stand that you know to be false.
+
+# How a reply is written
+
+A reply to a person who wrote back answers their question and nothing else, \
+in 25 to 80 words of plain text. When they ask what a call looks like, show \
+one real request line and the three fields that matter, copied from the \
+tool's answer: requirement, visa_required, source_url. Never paste \
+last_verified_at, the whole JSON, or coverage figures they did not ask \
+about. End on the offer in one sentence, never on a meeting slot. Do not \
+repeat an opt-out line in a thread they started: the footer already \
+carries it.
 
 # Qualifying, and knowing where you stop
 
@@ -854,8 +869,8 @@ pub const PRICING_PAGE: &str = "https://visa.orizn.app/visa-api";
 /// a comparison and not a lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Tier {
-    /// $0, 100 requests, non-commercial. No account this pack sells to can sit
-    /// here: every [`Segment`] uses the answer commercially.
+    /// $0, 100 requests, non-commercial. Never offered by this pack: the offer
+    /// is a 1,000-call trial key granted by a human (see `SALES_BRIEFING`).
     Free,
     /// $49, the commercial right, 30 000 requests a month.
     Starter,
@@ -1591,8 +1606,10 @@ mod tests {
     fn the_briefing_briefs_the_things_that_create_liability() {
         let briefing = sales().briefing();
         for topic in [
-            "Reproduce",      // no unreproduced findings
-            "quote no price", // no invented commercial terms
+            "Reproduce",                // no unreproduced findings
+            "do not negotiate a price", // no invented commercial terms
+            "1,000 calls",              // the one offer, granted by a human
+            "Never offer the public free plan",
             "SLA",
             "coverage",
             "AI", // identify as an AI when asked
@@ -1620,6 +1637,9 @@ mod tests {
                 "the briefing says nothing about {topic:?}"
             );
         }
+        // 2026-10-28: the seat sent a business to a pricing desk that does
+        // not exist; the offer is the 1,000-call key, never that deflection.
+        assert!(!briefing.contains("commercial team"));
 
         // And it no longer briefs the criterion the measurement killed: the
         // seller's advantage was "when the answer is wrong, stale or missing",
