@@ -1262,10 +1262,10 @@ pub async fn advance(
                 return stop(tx, run, "stopped", Some("inactive"), now).await;
             };
             if let Some(thread) = conversation {
-                let outbound: i64 = sqlx::query_scalar(
-                    "SELECT count(*) FROM messages \
-                      WHERE conversation_id = $1 AND direction = 'outbound'",
-                )
+                let outbound: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                    "SELECT count(*) FROM messages WHERE conversation_id = $1 AND {}",
+                    crate::revenue::TOUCH
+                )))
                 .bind(thread.as_uuid())
                 .fetch_one(&mut ***tx)
                 .await?;
@@ -1498,9 +1498,10 @@ pub async fn brief(db: &Db, tenant: TenantId, run: SequenceRunId) -> Option<Stri
     let conversation: Option<Uuid> = row.get("conversation_id");
     let last_message: Option<Uuid> = row.get("last_message_id");
     let outbound: i64 = match conversation {
-        Some(thread) => sqlx::query_scalar(
-            "SELECT count(*) FROM messages WHERE conversation_id = $1 AND direction = 'outbound'",
-        )
+        Some(thread) => sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM messages WHERE conversation_id = $1 AND {}",
+            crate::revenue::TOUCH
+        )))
         .bind(thread)
         .fetch_one(&mut **tx)
         .await

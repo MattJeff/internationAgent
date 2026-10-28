@@ -410,6 +410,16 @@ impl Suppression {
 /// Make it configurable when somebody has a counter-example.
 pub const MAX_TOUCHES: usize = 3;
 
+/// The `messages` rows that are a touch: ours, and not the turn's closing note.
+///
+/// `main.rs::record_reply` writes a turn's closing prose on the thread as
+/// `direction = 'outbound'`, `channel = 'internal'` (#110): nothing delivers
+/// it, so it is not a mail the prospect received. Counted as one, two
+/// escalating turns used up a thread's [`MAX_TOUCHES`] and its follow-ups
+/// before anything had been sent. Every reader that counts our mails on a
+/// thread splices this in rather than spelling `direction = 'outbound'`.
+pub const TOUCH: &str = "direction = 'outbound' AND channel <> 'internal'";
+
 /// How long a follow-up waits behind the touch before it.
 ///
 /// `TimeDelta::hours` rather than `days` because it is `const`; three days.

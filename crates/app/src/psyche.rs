@@ -1039,8 +1039,11 @@ mod tests {
         .await
         .expect("conversation");
 
-        // Our message, exactly as `main.rs::record_reply` writes one — including
-        // its `ON CONFLICT DO NOTHING`, so re-running an exchange is the
+        // Our message, as a mail that left is recorded: `channel = 'email'`,
+        // `direction = 'outbound'`. Not `main.rs::record_reply`'s row — since
+        // #110 that is the turn's closing note, `channel = 'internal'`, and
+        // `inbound::preceded_by_our_message` does not time a reply from it.
+        // `ON CONFLICT DO NOTHING`, so re-running an exchange is the
         // redelivery it is meant to be rather than a unique violation.
         if let Some(sent_at) = we_wrote_at {
             sqlx::query(
@@ -1153,6 +1156,51 @@ mod tests {
         }
         tx.rollback().await.expect("rollback");
 
+        drop_tenant(&db, tenant).await;
+    }
+
+    /// A turn's closing note is not a message they answered. An escalated
+    /// turn sends no mail and `record_reply` still writes its prose on the
+    /// thread, `outbound` and `internal`; a reply after it has no message of
+    /// ours to be timed from, so no latency is learned.
+    #[tokio::test]
+    async fn a_turn_note_is_not_our_message_on_the_thread() {
+        let Some(db) = db().await else { return };
+        let (tenant, lena) = seed(&db).await;
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let conversation =
+            crate::inbound::conversation_for(&mut tx, lena, Channel::Email, SUPPLIER, None, at(0))
+                .await
+                .expect("conversation");
+        sqlx::query(
+            "INSERT INTO messages \
+                 (id, tenant_id, conversation_id, employee_id, channel, direction, sender, \
+                  body, trust_label, idempotency_key, received_at, created_at) \
+             VALUES ($1, $2, $3, $4, 'internal', 'outbound', 'lena@agents.example', \
+                     'I escalated to the founder.', 'untrusted', 'turn:note', $5, $5)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant.as_uuid())
+        .bind(conversation.as_uuid())
+        .bind(lena.as_uuid())
+        .bind(at(0))
+        .execute(&mut **tx)
+        .await
+        .expect("the turn's note");
+        tx.commit().await.expect("commit note");
+
+        deliver(&db, tenant, lena, SUPPLIER, None, at(0) + hours(6.0)).await;
+
+        let mut tx = db.tenant_tx(tenant).await.expect("tenant tx");
+        let after = standing(&mut tx, lena, SUPPLIER, at(86_400))
+            .await
+            .expect("standing");
+        tx.rollback().await.expect("rollback");
+        assert_eq!(
+            after.latency.observations(),
+            0,
+            "a reply was timed from the turn's internal note"
+        );
         drop_tenant(&db, tenant).await;
     }
 

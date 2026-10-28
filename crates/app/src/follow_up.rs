@@ -202,11 +202,12 @@ pub async fn schedule(
     to: &EmailAddress,
     now: DateTime<Utc>,
 ) -> Result<Option<AppointmentId>, StoreError> {
-    let (outbound, answered): (i64, bool) = sqlx::query_as(
-        "SELECT count(*) FILTER (WHERE direction = 'outbound'), \
+    let (outbound, answered): (i64, bool) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FILTER (WHERE {}), \
                 coalesce(bool_or(direction = 'inbound'), false) \
            FROM messages WHERE conversation_id = $1",
-    )
+        crate::revenue::TOUCH
+    )))
     .bind(conversation.as_uuid())
     .fetch_one(&mut ***tx)
     .await?;
@@ -249,10 +250,10 @@ pub async fn schedule(
 /// rendered as-is, bounded by `Signal::MAX_LINK` at the parser.
 pub async fn brief(db: &Db, tenant: TenantId, conversation: ConversationId) -> Option<String> {
     let mut tx = db.tenant_tx(tenant).await.ok()?;
-    let since: Option<DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT max(received_at) FROM messages \
-          WHERE conversation_id = $1 AND direction = 'outbound'",
-    )
+    let since: Option<DateTime<Utc>> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT max(received_at) FROM messages WHERE conversation_id = $1 AND {}",
+        crate::revenue::TOUCH
+    )))
     .bind(conversation.as_uuid())
     .fetch_one(&mut **tx)
     .await
@@ -624,6 +625,51 @@ mod tests {
         assert!(
             outstanding(&db, tenant, lena).await.is_empty(),
             "the second chase's promise rang, and no third replaced it"
+        );
+    }
+
+    /// A turn's closing note is not a touch. `record_reply` writes it on the
+    /// thread as `outbound`, `channel = 'internal'`; counted, two escalating
+    /// turns after the approach spent both follow-ups before any had gone.
+    #[tokio::test]
+    async fn turn_notes_do_not_spend_the_follow_ups() {
+        let Some((db, tenant, lena, _)) = fixture().await else {
+            return;
+        };
+        let now = Utc::now().trunc_subsecs(6);
+        let (thread, first) = send(&db, tenant, lena, "n-1", now).await;
+        assert!(first.is_some(), "approach → chase 1 promised");
+        let mut tx = db.tenant_tx(tenant).await.expect("tx");
+        for n in 1..=2 {
+            sqlx::query(
+                "INSERT INTO messages \
+                     (id, tenant_id, conversation_id, employee_id, channel, direction, sender, \
+                      recipients, body, attachments, trust_label, idempotency_key, \
+                      received_at, created_at) \
+                 VALUES ($1, $2, $3, $4, 'internal', 'outbound', 'lena@ours.example', \
+                         '[]'::jsonb, 'I escalated to the founder.', '[]'::jsonb, 'trusted', \
+                         $5, $6, $6)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(tenant.as_uuid())
+            .bind(thread.as_uuid())
+            .bind(lena.as_uuid())
+            .bind(format!("turn:note-{n}"))
+            .bind(now + TimeDelta::days(n))
+            .execute(&mut **tx)
+            .await
+            .expect("the turn's note");
+        }
+        tx.commit().await.expect("commit notes");
+        let wake = brief(&db, tenant, thread).await.expect("brief");
+        assert!(
+            wake.contains(&now.format("%Y-%m-%d").to_string()),
+            "the silence is timed from the mail, not the note: {wake}"
+        );
+        let (_, second) = send(&db, tenant, lena, "n-2", now + FOLLOW_UP_AFTER).await;
+        assert!(
+            second.is_some(),
+            "one mail and two notes on the thread: chase 2 is still owed"
         );
     }
 

@@ -3028,7 +3028,9 @@ pub async fn land(
         // follow it are the same person on the same channel, and two spellings
         // of that would be two answers to it.
         let addressed = suppressible(message.channel, &from);
-        let ours = preceded_by_our_message(tx, message.conversation_id, message_id).await?;
+        let ours =
+            preceded_by_our_message(tx, message.conversation_id, message.channel, message_id)
+                .await?;
         psyche::observe_reply(
             tx,
             message.employee_id,
@@ -3236,19 +3238,26 @@ pub async fn land(
 /// A reply latency is *our message, then their answer*. Two of their messages in
 /// a row would otherwise both be measured against the same outbound one, and the
 /// second would record a wait that nobody was waiting.
+///
+/// On their message's channel only: a turn's closing note is written on the
+/// same thread as `channel = 'internal'` (`main.rs::record_reply`), and it is
+/// not a message they answered. Read as ours, an escalated turn with no mail
+/// sent would time their reply from our reasoning.
 async fn preceded_by_our_message(
     tx: &mut TenantTx<'_>,
     conversation_id: ConversationId,
+    channel: Channel,
     message_id: Uuid,
 ) -> Result<Option<DateTime<Utc>>, InboundError> {
     let previous: Option<(String, DateTime<Utc>)> = sqlx::query_as(
         "SELECT direction, received_at FROM messages \
-          WHERE conversation_id = $1 AND id <> $2 \
+          WHERE conversation_id = $1 AND id <> $2 AND channel = $3 \
           ORDER BY received_at DESC, id DESC \
           LIMIT 1",
     )
     .bind(conversation_id.as_uuid())
     .bind(message_id)
+    .bind(channel.as_str())
     .fetch_optional(&mut ***tx)
     .await
     .map_err(StoreError::from)?;
