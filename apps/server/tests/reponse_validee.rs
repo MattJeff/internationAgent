@@ -588,7 +588,13 @@ async fn un_prospect_repond_le_siege_redige_le_fondateur_valide_et_ca_part() {
             .as_array()
             .expect("approvals")
             .iter()
-            .find(|row| row["state"] == "pending" && row["action"]["action"] == "email_send")
+            // Le brouillon est posé par `attach_email_draft` après que la Gate
+            // a écrit la ligne : attendre les deux, pas la ligne seule.
+            .find(|row| {
+                row["state"] == "pending"
+                    && row["action"]["action"] == "email_send"
+                    && !row["draft"].is_null()
+            })
             .cloned();
         if let Some(row) = found {
             break row;

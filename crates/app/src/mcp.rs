@@ -1082,6 +1082,22 @@ fn digest(tool: &Tool) -> [u8; 32] {
     Sha256::digest(buf.as_bytes()).into()
 }
 
+/// True the first time this process sees `wire_name` without a handle.
+///
+/// The fleet rebinds every few minutes, so the same unhandled tool would warn
+/// on every rebind; once per process says it, the rest goes to debug. The tool
+/// is skipped either way: this only governs the log line.
+// ponytail: unbounded set, but it holds tool names served by vetted servers.
+fn first_time_unhandled(wire_name: &str) -> bool {
+    use std::collections::BTreeSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    SEEN.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(wire_name.to_owned())
+}
+
 fn inventory(
     discovered: &[Tool],
     declared: &BTreeMap<Slug, Declaration>,
@@ -1089,7 +1105,11 @@ fn inventory(
     let mut tools: BTreeMap<Slug, BoundTool> = BTreeMap::new();
     for tool in discovered {
         let Some(handle) = handle(&tool.name) else {
-            tracing::warn!(tool = %tool.name, "mcp tool name has no policy handle; skipping");
+            if first_time_unhandled(&tool.name) {
+                tracing::warn!(tool = %tool.name, "mcp tool name has no policy handle; skipping");
+            } else {
+                tracing::debug!(tool = %tool.name, "mcp tool name has no policy handle; skipping");
+            }
             continue;
         };
         if let Some(clash) = tools.get(&handle) {
@@ -2615,6 +2635,42 @@ mod tests {
         let tools = inventory(&[tool("x"), tool("Ünïcødé!"), tool("ok")], &BTreeMap::new())
             .expect("no collision");
         assert_eq!(tools.keys().map(Slug::as_str).collect::<Vec<_>>(), ["ok"]);
+    }
+
+    #[test]
+    fn an_unhandled_name_warns_once_per_process_and_stays_skipped() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Logs(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Logs {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // Past Slug::MAX_LEN, like GitHub's add_reply_to_pull_request_comment
+        // (33). Unique to this test so the process-wide set has not seen it.
+        let long = "add_reply_to_pull_request_comment_probe";
+        let logs = Logs::default();
+        let sink = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..3 {
+                let tools =
+                    inventory(&[tool(long), tool("ok")], &BTreeMap::new()).expect("no collision");
+                assert_eq!(tools.keys().map(Slug::as_str).collect::<Vec<_>>(), ["ok"]);
+            }
+        });
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.matches("has no policy handle").count(), 1, "{text}");
     }
 
     // -- the wire ----------------------------------------------------------

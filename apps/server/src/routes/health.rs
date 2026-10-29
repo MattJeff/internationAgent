@@ -806,11 +806,18 @@ mod tests {
         connect_model(&h.db, h.a).await;
         connect_model(&h.db, h.b).await;
         let seat = employee(&h.db, h.a, "a-ventes").await;
+        // Ancré à midi comme plus haut : `now - 5 min` tombe la veille quand la
+        // suite passe minuit UTC (CI du 2026-10-28, 23:58 → 00:03).
+        let midi = Utc::now()
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .expect("midi existe")
+            .and_utc();
         trace(
             &h.db,
             h.a,
             seat,
-            Utc::now() - Duration::minutes(5),
+            midi - Duration::minutes(5),
             "error",
             Some("la panne de A"),
         )
