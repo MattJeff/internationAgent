@@ -17,8 +17,11 @@ def jetable(dom):
 consumer = {'gmail.com','qq.com','163.com','126.com','yahoo.com','hotmail.com','outlook.com','icloud.com','proton.me','protonmail.com','live.com','yandex.ru','mail.ru','foxmail.com','gmx.de','web.de','me.com','aol.com','msn.com','hotmail.fr','yahoo.fr','orange.fr','free.fr','wanadoo.fr','laposte.net','sfr.fr'}
 now = datetime.utcnow()
 rows = {'quota':[], 'actif':[], 'dormant':[], 'payant':[]}
+inactifs = []
 for line in open(src, encoding='utf-8', errors='replace'):
     p = line.rstrip('\n').split('|')
+    if len(p) == 2 and p[0] == 'inactif':
+        inactifs.append(p[1].strip().lower()); continue
     if len(p) < 12: continue
     uid, email, name, company, plan, rm, rt, last_login, created, verified, stripe, chan = p[:12]
     email = email.strip().lower()
@@ -38,3 +41,6 @@ for k, v in rows.items():
     with open(f'{out}/site-{k}.csv','w', newline='', encoding='utf-8') as f:
         w = csv.writer(f); w.writerow(['email','first_name','last_name','company_name','phone_number','website','linkedin_profile','location']); w.writerows(v)
     print(f'{k} {len(v)}')
+with open(f'{out}/site-inactifs.txt', 'w', encoding='utf-8') as f:
+    f.write(''.join(m + '\n' for m in inactifs))
+print(f'inactifs {len(inactifs)}')
