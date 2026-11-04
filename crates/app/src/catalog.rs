@@ -203,6 +203,22 @@ pub enum ClientAuth {
     Basic,
     /// `client_id` and `client_secret` as form fields in the token request.
     Post,
+    /// A public client with no secret at all: `client_id` in the form, PKCE as
+    /// the only proof, `token_endpoint_auth_method: "none"`.
+    ///
+    /// Only for a provider that offers no dynamic registration and no developer
+    /// portal, but announces `client_id_metadata_document_supported`. Its
+    /// `client_id` is then an https URL **of this deployment** serving a JSON
+    /// document that names our callback, so the provider checks the
+    /// redirect_uri against a document only we can publish. That is what makes
+    /// a secret-less client safe to replay: somebody else holding our
+    /// `client_id` still cannot receive our codes. Sentry's entry refuses `none`
+    /// for exactly the replay reason; the metadata document is what answers it.
+    ///
+    /// No `AGENTOS_OAUTH_CLIENTS` entry: the id is derived from `PUBLIC_HOST`
+    /// by `crate::oauth::OauthClients::with_metadata_documents`, and
+    /// `apps/server`'s `public_router` serves the document.
+    MetadataDocument,
 }
 
 impl Credential {
@@ -1954,6 +1970,59 @@ pub const CATALOG: &[Connector] = &[
         opt_outs: OptOuts::NoStrangers,
     },
     Connector {
+        key: "elevenlabs",
+        label: "ElevenLabs — voice, video and voice agents",
+        // Le serveur MCP hébergé d'ElevenLabs, en Streamable HTTP. Relevé le
+        // 2026-11-04, pas deviné :
+        //
+        //   POST https://api.elevenlabs.io/v1/mcp → 401, www-authenticate: Bearer
+        //     resource_metadata="https://api.elevenlabs.io/.well-known/oauth-protected-resource"
+        //     corps : « OAuth bearer token required for the hosted MCP. » —
+        //     une clé d'API ElevenLabs n'y est PAS acceptée.
+        //   GET  …/oauth-protected-resource → authorization_servers:
+        //     ["https://api.us.elevenlabs.io"], scopes_supported: convai_read
+        //     convai_write text_to_speech speech_history_read flows
+        //     image_video_generation voice_generation ads_read
+        //   GET  https://api.us.elevenlabs.io/.well-known/oauth-authorization-server
+        //     → authorization_endpoint, token_endpoint, authorization_code +
+        //     refresh_token, PKCE S256, token_endpoint_auth_methods_supported:
+        //     ["none","client_secret_post","private_key_jwt"], PAS de
+        //     registration_endpoint, client_id_metadata_document_supported: true
+        //
+        // `client_secret_post` est annoncé, mais sans enregistrement dynamique
+        // ni portail où obtenir un secret il n'y a rien à poster. Le seul
+        // chemin est un client public identifié par un document de métadonnées
+        // (CIMD) : `ClientAuth::MetadataDocument`, dont la doc dit pourquoi ce
+        // `none`-là n'a pas le défaut que l'entrée `sentry` refuse.
+        //
+        // **`tools/list` n'a pas encore été sondé avec un jeton** : aucun
+        // jeton n'a été obtenu par ce déploiement à la date de l'entrée.
+        provision: Provision::Dial("https://api.elevenlabs.io/v1/mcp"),
+        reach: Reach::Public,
+        credential: Credential::OAuth(&OAuth {
+            authorize: "https://elevenlabs.io/app/oauth/authorize",
+            token: "https://api.us.elevenlabs.io/v1/oauth/token",
+            // Toutes les portées annoncées sauf `ads_read` : la voix off et la
+            // vidéo courte du siège Growth, l'agent vocal du support, et
+            // l'historique pour relire ce qui a été généré. Les publicités ne
+            // sont le travail d'aucun siège ici.
+            scopes: "text_to_speech voice_generation image_video_generation flows convai_read convai_write speech_history_read",
+            auth: ClientAuth::MetadataDocument,
+        }),
+        // `Write` : générer dépense les crédits du client, et `convai_write`
+        // crée des agents vocaux qu'on peut brancher à un numéro de téléphone.
+        floor: RiskClass::Write,
+        // Lu, faute de mieux, sur la liste d'outils d'un serveur MCP ElevenLabs
+        // branché à une session d'assistant le 2026-11-04 — pas via un jeton de
+        // ce déploiement : `creative_*` (générer image, vidéo, voix,
+        // transcrire) et `agents_*` (créer, configurer, rattacher un numéro
+        // **entrant**, lire les conversations). Aucun outil n'y passe un appel
+        // sortant ni n'écrit à une adresse. Le falsificateur est nommé : un
+        // outil d'appel sortant ou de « batch calling » dans le `tools/list`
+        // réel, et cette entrée devient `HeldHere` ou `Pulled`.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
         key: "x",
         label: "X",
         // Le serveur MCP hébergé de X, en Streamable HTTP — docs.x.com/tools/mcp.md
@@ -2458,14 +2527,14 @@ pub const CATALOG: &[Connector] = &[
 /// It is `pub` because it is the artifact the obligation actually needs: the
 /// list of connectors this deployment asserts have no unsubscribe list
 /// anywhere, in one place, readable by whoever has to answer for it.
-pub const NO_OUTREACH: [&str; 20] = {
-    let mut out = [""; 20];
+pub const NO_OUTREACH: [&str; 21] = {
+    let mut out = [""; 21];
     let (mut i, mut n) = (0, 0);
     while i < CATALOG.len() {
         vet(&CATALOG[i]);
         if matches!(CATALOG[i].opt_outs, OptOuts::NoStrangers) {
             assert!(
-                n < 20,
+                n < 21,
                 "a connector claiming `OptOuts::NoStrangers` was added to CATALOG and \
                  NO_OUTREACH's length was not updated. That claim is read off the vendor's \
                  own tool list — every tool this server serves, and not one of them can put \
@@ -2480,7 +2549,7 @@ pub const NO_OUTREACH: [&str; 20] = {
         i += 1;
     }
     assert!(
-        n == 20,
+        n == 21,
         "a connector stopped claiming `OptOuts::NoStrangers` and NO_OUTREACH's length was \
          not updated"
     );

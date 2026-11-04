@@ -655,9 +655,13 @@ impl Config {
         // Parsed here rather than in `routes::mcp`, because this file is the one
         // place that reads the environment and a second `std::env::var` is how a
         // deployment ends up with two answers about what it is registered for.
+        // `with_metadata_documents`: connectors whose `client_id` is a document
+        // this deployment serves (ElevenLabs) need no line in the variable —
+        // their id is derived from `PUBLIC_HOST`, here, once.
         let oauth_clients = Arc::new(
             OauthClients::parse(&get("AGENTOS_OAUTH_CLIENTS").unwrap_or_default())
-                .map_err(|err| ConfigError::OauthClientEntry { index: err.index })?,
+                .map_err(|err| ConfigError::OauthClientEntry { index: err.index })?
+                .with_metadata_documents(&public_host),
         );
 
         // The one read per adapter. What it produces decides *both* what gets
