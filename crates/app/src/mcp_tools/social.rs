@@ -127,8 +127,11 @@ fn contenu() -> Value {
         "placement": {
             "type": "string",
             "enum": ["feed", "story", "reel"],
-            "description": "Instagram. `story` publie un conteneur STORIES sans légende. \
-                            `reel` force un Reel. Absent : image, Reel ou carrousel selon les octets.",
+            "description": "instagram : `story` publie un conteneur STORIES sans légende, \
+                            `reel` force un Reel, absent = image, Reel ou carrousel selon les octets. \
+                            instagram_reels n'accepte que l'absence ou `reel`. \
+                            facebook_page : absent ou `feed` = texte, photo ou vidéo de fil ; \
+                            `reel` = Reel de Page.",
         },
         "delivery": {
             "type": "string",
@@ -212,10 +215,13 @@ pub fn tools() -> Vec<ToolDef> {
                 "properties": {
                     "platform": {
                         "type": "string",
-                        "enum": ["x", "linkedin", "instagram", "tiktok", "youtube"],
-                        "description": "Les cinq plateformes servies. Une sixième n'existe \
-                                        pas : elle attend une revue d'app que seul le \
-                                        fondateur peut déposer.",
+                        "enum": ["x", "linkedin", "instagram", "tiktok", "youtube", "instagram_reels", "facebook_page", "threads"],
+                        "description": "instagram est le connecteur historique (SOCIAL_META_*, Instagram Login). \
+                                        instagram_reels et facebook_page partagent UN consentement \
+                                        Facebook Login for Business (META2_APP_* et META2_FB_CONFIG_ID) : \
+                                        la Page et le compte Instagram professionnel qui y est lié. \
+                                        threads est l'app Threads (META2_THREADS_APP_*). \
+                                        Mode testeur tant que la revue n'est pas passée.",
                     },
                 },
                 "required": ["platform"],

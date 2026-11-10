@@ -18,6 +18,7 @@ axum.workspace = true
 # verifieur PKCE (base64) et construit les URLs d'autorisation (url).
 base64.workspace = true
 chrono.workspace = true
+hmac.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true

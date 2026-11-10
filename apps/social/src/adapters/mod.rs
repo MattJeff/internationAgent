@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 pub mod instagram;
 pub mod linkedin;
+pub mod meta2;
 pub mod tiktok;
 pub mod x;
 pub mod youtube;
@@ -307,10 +308,12 @@ pub trait Plateforme: Send + Sync {
     ) -> Result<Option<Metriques>, ErreurPlateforme>;
 }
 
-/// Les cinq plateformes de l'éditeur. C'est ce que `mcp::Etat` embarque ;
-/// les tests du cœur y substituent leur adaptateur compteur. Instagram et
-/// TikTok reçoivent le contexte (dépôt + base publique) : leurs modèles
-/// « pull » servent NOS octets vettés, jamais l'URL du client.
+/// Les plateformes de l'éditeur. C'est ce que `mcp::Etat` embarque ;
+/// les tests du cœur y substituent leur adaptateur compteur. Instagram,
+/// TikTok et le second connecteur Meta reçoivent le contexte (dépôt + base
+/// publique) : leurs modèles « pull » servent NOS octets vettés, jamais
+/// l'URL du client. `instagram` (app `SOCIAL_META_*`) et `instagram_reels`
+/// (app `META2_*`) sont deux adaptateurs.
 pub fn adaptateurs(ctx: &ContexteAdaptateurs) -> Vec<Box<dyn Plateforme>> {
     vec![
         Box::new(x::X),
@@ -318,6 +321,9 @@ pub fn adaptateurs(ctx: &ContexteAdaptateurs) -> Vec<Box<dyn Plateforme>> {
         Box::new(instagram::Instagram::nouvel(ctx)),
         Box::new(tiktok::Tiktok::nouvel(ctx)),
         Box::new(youtube::Youtube),
+        Box::new(meta2::InstagramReels::nouvel(ctx)),
+        Box::new(meta2::FacebookPage::nouvel(ctx)),
+        Box::new(meta2::Threads::nouvel(ctx)),
     ]
 }
 
@@ -646,6 +652,12 @@ pub enum ErreurPlateforme {
     /// faire re-consentir l'humain, pas réessayer.
     #[error("pas de rafraîchissement programmatique pour cette plateforme")]
     RafraichissementIndisponible,
+    /// Limite de publication ou de débit Meta. Le corps de la réponse n'est
+    /// pas recopié : un message d'erreur Graph peut faire écho à la requête.
+    #[error(
+        "limite de publication ou de débit Meta atteinte (Instagram : posts API sur 24 h, sous-code 2207042 ; Threads : 250 posts / 24 h ; Reels de Page : 30 / 24 h) — réessayer après la fenêtre, pas en boucle"
+    )]
+    LimitePublication,
 }
 
 impl ErreurPlateforme {
@@ -657,6 +669,7 @@ impl ErreurPlateforme {
             Self::Injoignable => "plateforme_injoignable",
             Self::Illisible => "reponse_illisible",
             Self::RafraichissementIndisponible => "rafraichissement_indisponible",
+            Self::LimitePublication => "limite_publication",
         }
     }
 
@@ -672,6 +685,50 @@ impl ErreurPlateforme {
             _ => Some(Self::Refus { statut }),
         }
     }
+}
+
+/// Vrai quand le corps Graph est une limite de publication ou de débit.
+///
+/// Relevé le 2026-11-10 sur la table des erreurs Instagram Platform et le
+/// guide content publishing : le plafond de posts API sort en code 9,
+/// sous-code 2207042 (« maximum number of posts »). Les codes 4, 17, 32 et
+/// 613 sont les débits application, utilisateur, Page et API
+/// (developers.facebook.com/docs/graph-api/overview/rate-limiting).
+/// Seuls des entiers sont lus : le message, qui peut faire écho à la
+/// requête, ne sort jamais d'ici.
+pub(crate) fn est_limite_publication(corps: &[u8]) -> bool {
+    let Ok(document) = serde_json::from_slice::<serde_json::Value>(corps) else {
+        return false;
+    };
+    let Some(erreur) = document.get("error") else {
+        return false;
+    };
+    let sous = erreur.get("error_subcode").and_then(|v| v.as_u64());
+    if sous == Some(2_207_042) {
+        return true;
+    }
+    matches!(
+        erreur.get("code").and_then(|v| v.as_u64()),
+        Some(4 | 17 | 32 | 613)
+    )
+}
+
+/// Lit un corps Graph. Une limite est nommée avant le refus générique, et
+/// un 200 qui porte `error` reste un refus — le corps ne passe pas dans
+/// l'erreur.
+pub(crate) fn lire_json(statut: u16, corps: &[u8]) -> Result<serde_json::Value, ErreurPlateforme> {
+    if est_limite_publication(corps) {
+        return Err(ErreurPlateforme::LimitePublication);
+    }
+    if let Some(erreur) = ErreurPlateforme::depuis_statut(statut) {
+        return Err(erreur);
+    }
+    let document: serde_json::Value =
+        serde_json::from_slice(corps).map_err(|_| ErreurPlateforme::Illisible)?;
+    if document.get("error").is_some_and(|v| v.is_object()) {
+        return Err(ErreurPlateforme::Refus { statut: 400 });
+    }
+    Ok(document)
 }
 
 /// SHA-256 en hexadécimal — la brique des empreintes.
@@ -854,6 +911,29 @@ mod tests {
             );
         }
         assert_eq!(ErreurPlateforme::depuis_statut(201), None);
+    }
+
+    #[test]
+    fn une_limite_meta_est_nommee_sans_recopier_le_corps() {
+        let corps = br#"{"error":{"message":"access_token=NE-DOIT-PAS-FUITER","code":9,"error_subcode":2207042}}"#;
+        assert!(est_limite_publication(corps));
+        let err = lire_json(400, corps).expect_err("limite");
+        assert_eq!(err, ErreurPlateforme::LimitePublication);
+        assert_eq!(err.code(), "limite_publication");
+        let affiche = err.to_string();
+        assert!(!affiche.contains("NE-DOIT-PAS-FUITER"));
+        assert!(!affiche.contains("access_token"));
+        // Un 400 ordinaire reste un refus, pas une limite.
+        let banal = br#"{"error":{"message":"bad","code":100}}"#;
+        assert!(!est_limite_publication(banal));
+        assert_eq!(
+            lire_json(400, banal),
+            Err(ErreurPlateforme::Refus { statut: 400 })
+        );
+        // Débit d'application (code 4), même nom.
+        assert!(est_limite_publication(
+            br#"{"error":{"code":4,"message":"Application request limit reached"}}"#
+        ));
     }
 
     #[test]
