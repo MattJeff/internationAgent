@@ -144,7 +144,10 @@ Les cinq, chaque limite citée et datée dans son adaptateur :
   Page organisation, optionnelle : `SOCIAL_LINKEDIN_ORG_POSTING=1` ajoute
   `w_organization_social` et une ligne de compte par page
   (`urn:li:organization:…`), à côté du membre. Même contrainte
-  `UNIQUE (tenant, platform, handle)`.
+  `UNIQUE (tenant, platform, handle)`. Le drapeau ne change pas de client :
+  une seule paire `SOCIAL_LINKEDIN_*`. LinkedIn met Community Management sur
+  une autre app, et le binaire n'a pas de seconde paire —
+  `docs/SOCIAL_APPS_SETUP.md`.
   **Aucune analytics membre n'existe** (sonde 2026-09-02) : `post_metrics`
   répond « la plateforme ne les sert pas » au lieu de zéros — les analytics
   d'organisation sont derrière le Marketing API Program, hors périmètre.
@@ -266,6 +269,11 @@ quand la doc le donne. Faits repris de la sonde du 2026-09-02
 (`catalog.rs`, `CATALOGUE.md`) et complétés par lecture des docs officielles
 le 2026-09-02.
 
+La marche qui a marché le 2026-11-10 — un seul callback, une paire par
+réseau, et les endroits où un portail refuse ce que le binaire demande —
+est dans `docs/SOCIAL_APPS_SETUP.md`. Les blocs ci-dessous restent la carte
+des revues.
+
 **Ce que le rattachement du 2026-09-11 a changé à cette liste** — parce qu'une
 liste de ce qui reste au fondateur qui ne dit pas ce qui n'y est plus est une
 liste qu'on relit pour rien :
@@ -305,10 +313,12 @@ liste qu'on relit pour rien :
   2026-09-02) ; enregistrer la redirect URI (libre — pas le piège Canva) ;
   poser la paire client dans la config du service (`SOCIAL_X_CLIENT_ID` /
   `SOCIAL_X_CLIENT_SECRET`) ; acheter des crédits (pay-per-usage, aucun
-  abonnement). Scopes demandés par le service : `tweet.read tweet.write
-  users.read offline.access dm.read dm.write like.write bookmark.write`
-  (les quatre derniers pour `/mcp/messagerie` ; un compte connecté avant
-  leur ajout re-consent via `account_connect_url`).
+  abonnement). Scopes demandés par le service (`X_SCOPES` dans
+  `apps/social/src/oauth_flux.rs`) : `tweet.read tweet.write users.read
+  offline.access media.write dm.read dm.write like.write bookmark.write`
+  (`media.write` pour les médias ; `dm.read dm.write like.write
+  bookmark.write` pour `/mcp/messagerie` ; un compte connecté avant leur
+  ajout re-consent via `account_connect_url`).
 * **Débloque** : la publication immédiatement — aucune revue.
 * **Coût** : 0,015 USD/post créé ; 0,200 USD/post avec URL ; lectures de
   posts 0,005 USD/ressource (pricing.md, 2026-09-02). **Délai : aucun.**
@@ -325,6 +335,8 @@ liste qu'on relit pour rien :
   d'auteur `urn:li:person:{sub}`) — sans ce produit, le callback OAuth ne
   peut pas nommer le compte. La paire client va dans
   `SOCIAL_LINKEDIN_CLIENT_ID` / `SOCIAL_LINKEDIN_CLIENT_SECRET`.
+  Le callback à enregistrer, et pourquoi les Pages ne tiennent pas sur cette
+  app, sont dans `docs/SOCIAL_APPS_SETUP.md`.
 * **Débloque** : la publication sur le profil du membre authentifié.
   Self-serve, **sans revue. Délai : aucun.**
 * **Ne débloque PAS** : les analytics (membre : inexistantes ; organisation :
@@ -362,7 +374,11 @@ liste qu'on relit pour rien :
   DM entrants, activer « Allow Access to Messages » dans les réglages
   Instagram du compte. Poser `SOCIAL_META_CLIENT_ID` /
   `SOCIAL_META_CLIENT_SECRET` (META et pas INSTAGRAM : l'app cliente vit
-  chez Meta). Le service exige aussi que `SOCIAL_PUBLIC_URL` soit joignable
+  chez Meta). La valeur est l'Instagram App ID des réglages Instagram Login,
+  pas l'App ID du bandeau Basic. L'URI de redirection se pose dans ces mêmes
+  réglages : absente, la page d'autorisation reste blanche, sans erreur. Le
+  détail est dans `docs/SOCIAL_APPS_SETUP.md`. Le service
+  exige aussi que `SOCIAL_PUBLIC_URL` soit joignable
   publiquement : Instagram « cURL » les médias sur `GET /medias/{digest}`.
   **Délai : aucun.**
 * **Pour servir des tiers (Tech Provider)** : Advanced Access permission par
