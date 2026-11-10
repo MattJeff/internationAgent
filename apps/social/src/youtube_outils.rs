@@ -44,6 +44,7 @@ const GATES: &[&str] = &[
     "youtube_comment_moderate",
     "youtube_comment_delete",
     "youtube_caption_delete",
+    "youtube_reporting_job_delete",
 ];
 
 pub fn descriptions() -> Vec<Value> {
@@ -251,6 +252,51 @@ pub fn descriptions() -> Vec<Value> {
                 "dimensions": { "type": "string" }
             }),
             &["account_id", "start_date", "end_date"],
+        ),
+        schema(
+            "youtube_report_types_list",
+            "Types de rapports bulk (YouTube Reporting API, reportTypes.list). monetary indique un type de revenu, qui exige yt-analytics-monetary.readonly.",
+            props_liste(json!({ "include_system_managed": { "type": "boolean" } })),
+            &["account_id"],
+        ),
+        schema(
+            "youtube_reporting_job_create",
+            "Crée un job quotidien (jobs.create). Le premier CSV arrive sous 24 h. Un type monétaire sans la portée revenu renvoie vers account_connect_url.",
+            json!({
+                "idempotency_key": cle(),
+                "account_id": { "type": "string" },
+                "report_type_id": { "type": "string" },
+                "name": { "type": "string" }
+            }),
+            &["idempotency_key", "account_id", "report_type_id"],
+        ),
+        schema(
+            "youtube_reporting_jobs_list",
+            "Jobs de reporting déjà créés pour ce compte (jobs.list).",
+            props_liste(json!({})),
+            &["account_id"],
+        ),
+        schema(
+            "youtube_reporting_job_delete",
+            "Supprime un job de reporting. Approbation obligatoire avant l'appel YouTube : rien n'est effacé avant approval_decide.",
+            props_id("job_id"),
+            &["idempotency_key", "account_id", "job_id"],
+        ),
+        schema(
+            "youtube_reporting_reports_list",
+            "Rapports déjà générés pour un job (reports.list). Le téléchargement passe par youtube_reporting_report_get, pas par l'URL brute.",
+            props_liste(json!({ "job_id": { "type": "string" } })),
+            &["account_id", "job_id"],
+        ),
+        schema(
+            "youtube_reporting_report_get",
+            "Télécharge le CSV d'un rapport avec le jeton du compte (downloadUrl). Rend les lignes parsées et le SHA-256 des octets. Le fichier n'est pas publié sur /medias.",
+            json!({
+                "account_id": { "type": "string" },
+                "job_id": { "type": "string" },
+                "report_id": { "type": "string" }
+            }),
+            &["account_id", "job_id", "report_id"],
         ),
     ]
 }
@@ -511,6 +557,21 @@ async fn immediat(etat: &Etat, tenant: Uuid, outil: &str, args: &Value) -> Resul
     let cle = mcp::arg_str(args, "idempotency_key")?;
     let compte = compte_yt(etat, tenant, args).await?;
     valider_immediat(outil, args)?;
+    if outil == "youtube_reporting_job_create" {
+        exiger_analytics(&compte)?;
+        let type_id = args
+            .get("report_type_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if youtube_gestion::type_rapport_monetaire(type_id)
+            && !youtube_gestion::scopes_revenu_ok(compte.oauth_scopes.as_deref())
+        {
+            return Err(Erreur::nouvelle(
+                "scopes_insuffisants",
+                youtube_gestion::MESSAGE_RECONNEXION_REVENU,
+            ));
+        }
+    }
     let digest = digest_de(outil, args);
     let payload = payload_de(outil, args)?;
     let pose = store::poser_file(
@@ -628,6 +689,7 @@ fn valider_avant_file(outil: &str, args: &Value) -> Result<(), Erreur> {
         }
         "youtube_comment_delete" => exiger_id(args, "comment_id")?,
         "youtube_caption_delete" => exiger_id(args, "caption_id")?,
+        "youtube_reporting_job_delete" => exiger_id(args, "job_id")?,
         _ => {}
     }
     Ok(())
@@ -647,8 +709,22 @@ fn exiger_id(args: &Value, nom: &'static str) -> Result<(), Erreur> {
 
 async fn executer(etat: &Etat, tenant: Uuid, outil: &str, args: &Value) -> Result<Value, Erreur> {
     let compte = compte_yt(etat, tenant, args).await?;
-    if outil == "youtube_analytics_report" {
+    if outil == "youtube_analytics_report" || outil.starts_with("youtube_report") {
         exiger_analytics(&compte)?;
+    }
+    if outil == "youtube_reporting_job_create" {
+        let type_id = args
+            .get("report_type_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if youtube_gestion::type_rapport_monetaire(type_id)
+            && !youtube_gestion::scopes_revenu_ok(compte.oauth_scopes.as_deref())
+        {
+            return Err(Erreur::nouvelle(
+                "scopes_insuffisants",
+                youtube_gestion::MESSAGE_RECONNEXION_REVENU,
+            ));
+        }
     }
     let jeton = mcp::jeton_frais(etat, tenant, &compte).await?;
     let jeton = Arc::new(jeton);
@@ -981,6 +1057,66 @@ async fn jouer(
             )
             .await
         }
+        "youtube_report_types_list" => {
+            let (taille, jeton_page) = page_reporting(args)?;
+            youtube_gestion::lister_types_rapport(
+                youtube_gestion::POINT_REPORTING,
+                secret,
+                jeton_page.as_deref(),
+                taille,
+                opt_bool(args, "include_system_managed")?.unwrap_or(false),
+            )
+            .await
+        }
+        "youtube_reporting_job_create" => {
+            let type_id = id_de(args, "report_type_id")?;
+            let nom = opt(args, "name")?;
+            youtube_gestion::creer_job_rapport(
+                youtube_gestion::POINT_REPORTING,
+                secret,
+                &type_id,
+                nom,
+            )
+            .await
+        }
+        "youtube_reporting_jobs_list" => {
+            let (taille, jeton_page) = page_reporting(args)?;
+            youtube_gestion::lister_jobs_rapport(
+                youtube_gestion::POINT_REPORTING,
+                secret,
+                jeton_page.as_deref(),
+                taille,
+            )
+            .await
+        }
+        "youtube_reporting_job_delete" => {
+            let id = id_de(args, "job_id")?;
+            youtube_gestion::supprimer_job_rapport(youtube_gestion::POINT_REPORTING, secret, &id)
+                .await
+        }
+        "youtube_reporting_reports_list" => {
+            let id = id_de(args, "job_id")?;
+            let (taille, jeton_page) = page_reporting(args)?;
+            youtube_gestion::lister_rapports_job(
+                youtube_gestion::POINT_REPORTING,
+                secret,
+                &id,
+                jeton_page.as_deref(),
+                taille,
+            )
+            .await
+        }
+        "youtube_reporting_report_get" => {
+            let job = id_de(args, "job_id")?;
+            let rapport = id_de(args, "report_id")?;
+            youtube_gestion::telecharger_rapport(
+                youtube_gestion::POINT_REPORTING,
+                secret,
+                &job,
+                &rapport,
+            )
+            .await
+        }
         _ => Err(EchecYoutube::Argument("outil YouTube inconnu")),
     }
 }
@@ -1064,6 +1200,9 @@ fn opt_bool(args: &Value, nom: &str) -> Result<Option<bool>, EchecYoutube> {
     match args.get(nom) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(b)) => Ok(Some(*b)),
+        // Un GET d'employé transporte les booléens en texte de query.
+        Some(Value::String(s)) if s == "true" => Ok(Some(true)),
+        Some(Value::String(s)) if s == "false" => Ok(Some(false)),
         _ => Err(EchecYoutube::Argument("argument booléen illisible")),
     }
 }
@@ -1116,6 +1255,19 @@ fn patch_video(args: &Value) -> Result<PatchVideo, EchecYoutube> {
     })
 }
 
+fn page_reporting(args: &Value) -> Result<(u32, Option<String>), EchecYoutube> {
+    let max = match args.get("max_results") {
+        None | Some(Value::Null) => 20u64,
+        Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
+        Some(Value::String(s)) => s.parse().unwrap_or(0),
+        _ => 0,
+    };
+    if !(1..=50).contains(&max) {
+        return Err(EchecYoutube::Argument("max_results : 1 à 50"));
+    }
+    Ok((max as u32, opt(args, "page_token")?.map(str::to_owned)))
+}
+
 fn page_dans(q: &mut Vec<(String, String)>, args: &Value) -> Result<(), EchecYoutube> {
     let max = match args.get("max_results") {
         None | Some(Value::Null) => 20u64,
@@ -1147,7 +1299,7 @@ mod tests {
             .iter()
             .map(|o| o["name"].as_str().unwrap().to_owned())
             .collect();
-        assert_eq!(noms.len(), 23);
+        assert_eq!(noms.len(), 29);
         for gate in GATES {
             assert!(noms.iter().any(|n| n == gate), "{gate}");
         }

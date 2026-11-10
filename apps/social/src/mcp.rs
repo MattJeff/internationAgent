@@ -116,7 +116,9 @@ impl Etat {
 /// v5 : gestion YouTube (chaîne, vidéos, playlists, commentaires, captions,
 /// Analytics). Les suppressions, la visibilité et la modération passent par
 /// la file d'approbation.
-pub const VERSION_TABLE: &str = "5";
+/// v6 : YouTube Reporting API (types, jobs, CSV). La suppression d'un job
+/// passe par la même file.
+pub const VERSION_TABLE: &str = "6";
 
 /// La table d'éditeur. Le pin SHA-256 du runtime la fige : tout ajout bumpe
 /// [`VERSION_TABLE`]. `approval_decide` est un outil du service pour que la
@@ -2072,6 +2074,11 @@ mod tests {
         (
             "5",
             "dcbb78859ac58e51ac68a8cd4ba8ce018e8aa458ec69725899b2606b19451dd2",
+        ),
+        // v6 : YouTube Reporting API.
+        (
+            "6",
+            "92a1685527aab057fcb30e1e2b150a109708a4f3227d845a1eb8f41bdaa02a6f",
         ),
     ];
 

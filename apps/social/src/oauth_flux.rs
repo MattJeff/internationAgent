@@ -172,7 +172,14 @@ pub const TIKTOK_SCOPES: &str = "user.info.basic,video.list,video.publish,video.
 /// ESPACES, comme X/LinkedIn.
 pub const YOUTUBE_SCOPE_READONLY: &str = "https://www.googleapis.com/auth/youtube.readonly";
 pub const YOUTUBE_SCOPE_ANALYTICS: &str = "https://www.googleapis.com/auth/yt-analytics.readonly";
-pub const YOUTUBE_SCOPES: &str = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.force-ssl https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/yt-analytics.readonly";
+/// Rapports de revenu du Reporting API. Les autres rapports bulk passent
+/// avec `yt-analytics.readonly` seul (authorization guide, page datée
+/// 2026-11-05 : « Any request that retrieves earnings or ad performance
+/// metrics must use this scope »). On le demande pour qu'un
+/// `account_connect_url` suffise le jour où le type de rapport est monétaire.
+pub const YOUTUBE_SCOPE_MONETAIRE: &str =
+    "https://www.googleapis.com/auth/yt-analytics-monetary.readonly";
+pub const YOUTUBE_SCOPES: &str = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.force-ssl https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/yt-analytics.readonly https://www.googleapis.com/auth/yt-analytics-monetary.readonly";
 
 /// Mêmes largeurs que `oauth.rs` : 32 octets d'OS pour le `state` (256 bits
 /// contre qui regarde les flux passer), 32 pour le vérifieur (le minimum de
@@ -1184,6 +1191,7 @@ mod tests {
         assert_eq!(params["scope"], YOUTUBE_SCOPES);
         assert!(params["scope"].contains(YOUTUBE_SCOPE_READONLY));
         assert!(params["scope"].contains(YOUTUBE_SCOPE_ANALYTICS));
+        assert!(params["scope"].contains(YOUTUBE_SCOPE_MONETAIRE));
         assert!(flux.verifieur_scelle.is_none());
     }
 

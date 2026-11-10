@@ -115,6 +115,12 @@ parlent pas à YouTube : elles posent une ligne `pending_approval`, et
 | `youtube_captions_list` / `youtube_caption_upload` / `youtube_caption_download` | sous-titres |
 | `youtube_caption_delete` | suppression — approbation |
 | `youtube_analytics_report` | vues, watch time, abonnés gagnés/perdus, par dates, chaîne ou vidéo |
+| `youtube_report_types_list` | types de rapports bulk (Reporting API). `monetary` signale un revenu |
+| `youtube_reporting_job_create` | job quotidien. Le CSV arrive sous 24 h |
+| `youtube_reporting_jobs_list` | jobs du compte |
+| `youtube_reporting_job_delete` | suppression du job — approbation |
+| `youtube_reporting_reports_list` | fichiers déjà produits pour un job |
+| `youtube_reporting_report_get` | CSV téléchargé avec le jeton du compte : lignes parsées + SHA-256 |
 
 Les miroirs employé sont `social_youtube_*` (`docs/SOCIAL_APPS_SETUP.md`).
 
@@ -124,9 +130,15 @@ Communauté, l'édition de la bannière. `youtube_channel_update` préserve
 n'en pose pas une nouvelle.
 
 Un compte connecté avant la v5 n'a pas `youtube.readonly` ni
-`yt-analytics.readonly`. `youtube_analytics_report` répond
-`scopes_insuffisants` et demande un passage par `account_connect_url`. Les
-autres appels Data API, couverts par `youtube.force-ssl`, continuent.
+`yt-analytics.readonly`. `youtube_analytics_report` et les outils Reporting
+répondent `scopes_insuffisants` et demandent un passage par
+`account_connect_url`. Les autres appels Data API, couverts par
+`youtube.force-ssl`, continuent. Les types de rapport dont l'identifiant
+porte un revenu (`revenue`, `ad_rate`, …) exigent en plus
+`yt-analytics-monetary.readonly` : sans elle, seul ce job est refusé, avec
+le même renvoi vers `account_connect_url`. Le CSV n'est pas déposé sur
+`/medias` (route publique) : l'outil rend les lignes et le SHA-256 des
+octets.
 
 Transport : `POST /mcp` (JSON-RPC 2.0 : `initialize`, `tools/list`,
 `tools/call`), `GET /livez`. Auth : `Authorization: Bearer <jeton par

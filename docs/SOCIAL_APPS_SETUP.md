@@ -16,9 +16,10 @@ Les deux API se activent dans le **même** projet Google Cloud
 dans `SOCIAL_GOOGLE_*`.
 
 1. **API et services → Bibliothèque.** Activer **YouTube Data API v3**
-   (déjà requise pour publier) et **YouTube Analytics API**. Sans la
-   seconde, `youtube_analytics_report` prend un 403 d'API non activée, pas
-   un rapport.
+   (déjà requise pour publier), **YouTube Analytics API** et **YouTube
+   Reporting API**. Sans Analytics, `youtube_analytics_report` prend un
+   403 d'API non activée. Sans Reporting, `reportTypes.list` et `jobs.*`
+   aussi.
 2. **Écran de consentement OAuth.** Les portées demandées par le service,
    séparées par des espaces :
 
@@ -26,21 +27,28 @@ dans `SOCIAL_GOOGLE_*`.
    `https://www.googleapis.com/auth/youtube.force-ssl`
    `https://www.googleapis.com/auth/youtube.readonly`
    `https://www.googleapis.com/auth/yt-analytics.readonly`
+   `https://www.googleapis.com/auth/yt-analytics-monetary.readonly`
 
    `youtube.readonly` est exigé par `reports.query` en plus de
    `yt-analytics.readonly` (documentation Analytics, page datée
-   2026-10-15). On ne demande pas la portée monétaire.
+   2026-10-15). Le Reporting API (types, jobs, CSV) accepte
+   `yt-analytics.readonly` pour les rapports d'activité. La portée
+   monétaire n'est exigée que pour les types de revenu
+   (guide d'autorisation du Reporting API : « Any request that retrieves
+   earnings or ad performance metrics must use this scope »). Elle est
+   demandée au consentement pour qu'un seul `account_connect_url` couvre
+   les deux.
 3. **Redémarrer `agentos-social`.** Le binaire applique la migration
    `0008` au démarrage (`oauth_scopes` sur `social_accounts`, kind
    `youtube` dans la file d'approbation). Un redémarrage sans le nouveau
    binaire laisse les outils absents.
 4. **Reconnecter les deux chaînes une fois.** Chaque compte YouTube déjà
    connecté n'a que `youtube.upload` et `youtube.force-ssl`.
-   `youtube_analytics_report` répond `scopes_insuffisants` et nomme
-   `account_connect_url` : un humain ouvre l'URL (`prompt=consent`,
-   `include_granted_scopes=true`). Les autres écritures Data API, couvertes
-   par `youtube.force-ssl`, continuent en attendant. Deux chaînes, deux
-   consentements, pas plus.
+   `youtube_analytics_report` et les outils Reporting répondent
+   `scopes_insuffisants` et nomment `account_connect_url` : un humain ouvre
+   l'URL (`prompt=consent`, `include_granted_scopes=true`). Les autres
+   écritures Data API, couvertes par `youtube.force-ssl`, continuent en
+   attendant. Deux chaînes, deux consentements, pas plus.
 
 Après coup, `accounts_list` montre les mêmes handles. Les outils neufs se
 déclarent comme les autres (`integrations_discover`, puis
@@ -61,9 +69,10 @@ Il n'en téléverse pas une.
 
 ## Approbation
 
-Supprimer une vidéo, une playlist, un élément de playlist, un commentaire
-ou une piste de sous-titres, changer une visibilité (`privacy`,
-`publish_at`), ou modérer un commentaire pose une ligne `pending_approval`.
+Supprimer une vidéo, une playlist, un élément de playlist, un commentaire,
+une piste de sous-titres ou un job de reporting, changer une visibilité
+(`privacy`, `publish_at`), ou modérer un commentaire pose une ligne
+`pending_approval`.
 `approval_decide` (route opérateur, pas un outil d'employé) envoie l'appel
 YouTube. Le rejeu de la même `idempotency_key` ne crée pas une seconde
 ligne.

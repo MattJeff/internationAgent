@@ -161,6 +161,12 @@ const OUTILS: &[&str] = &[
     "youtube-caption-download",
     "youtube-caption-delete",
     "youtube-analytics-report",
+    "youtube-report-types-list",
+    "youtube-reporting-job-create",
+    "youtube-reporting-jobs-list",
+    "youtube-reporting-job-delete",
+    "youtube-reporting-reports-list",
+    "youtube-reporting-report-get",
 ];
 
 /// Ce module.
@@ -242,6 +248,23 @@ pub fn router(fleets: Fleets) -> Router {
             post(yt_caption_delete),
         )
         .route("/v1/social/youtube/analytics", get(yt_analytics))
+        .route("/v1/social/youtube/report-types", get(yt_report_types))
+        .route(
+            "/v1/social/youtube/reporting-jobs",
+            get(yt_reporting_jobs).post(yt_reporting_job_create),
+        )
+        .route(
+            "/v1/social/youtube/reporting-jobs/delete",
+            post(yt_reporting_job_delete),
+        )
+        .route(
+            "/v1/social/youtube/reporting-reports",
+            get(yt_reporting_reports),
+        )
+        .route(
+            "/v1/social/youtube/reporting-reports/get",
+            get(yt_reporting_report),
+        )
         .with_state(fleets)
 }
 
@@ -549,6 +572,8 @@ post_yt!(yt_comment_moderate, "youtube-comment-moderate");
 post_yt!(yt_comment_delete, "youtube-comment-delete");
 post_yt!(yt_caption_upload, "youtube-caption-upload");
 post_yt!(yt_caption_delete, "youtube-caption-delete");
+post_yt!(yt_reporting_job_create, "youtube-reporting-job-create");
+post_yt!(yt_reporting_job_delete, "youtube-reporting-job-delete");
 
 get_yt!(yt_channel_get, "youtube-channel-get", "account_id");
 get_yt!(
@@ -596,6 +621,36 @@ get_yt!(
     "video_id",
     "metrics",
     "dimensions"
+);
+get_yt!(
+    yt_report_types,
+    "youtube-report-types-list",
+    "account_id",
+    "page_token",
+    "max_results",
+    "include_system_managed"
+);
+get_yt!(
+    yt_reporting_jobs,
+    "youtube-reporting-jobs-list",
+    "account_id",
+    "page_token",
+    "max_results"
+);
+get_yt!(
+    yt_reporting_reports,
+    "youtube-reporting-reports-list",
+    "account_id",
+    "job_id",
+    "page_token",
+    "max_results"
+);
+get_yt!(
+    yt_reporting_report,
+    "youtube-reporting-report-get",
+    "account_id",
+    "job_id",
+    "report_id"
 );
 
 fn objet(body: Value) -> Result<Value, ApiError> {

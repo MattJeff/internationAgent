@@ -18,6 +18,7 @@ const DESTRUCTIFS: &[&str] = &[
     "social_youtube_comment_moderation_set",
     "social_youtube_comment_remove",
     "social_youtube_caption_remove",
+    "social_youtube_reporting_job_remove",
 ];
 
 pub fn est_destructif(nom: &str) -> bool {
@@ -375,6 +376,92 @@ pub fn tools() -> Vec<ToolDef> {
                 "metrics",
                 "dimensions",
             ],
+        ),
+        lire(
+            "social_youtube_report_types_list",
+            "Les types de rapports YouTube",
+            "Les rapports bulk que cette chaîne peut planifier. monetary signale un type de revenu. À appeler avant de créer un job.",
+            "/v1/social/youtube/report-types",
+            json!({
+                "account_id": {"type": "string"},
+                "page_token": {"type": "string"},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 50},
+                "include_system_managed": {"type": "boolean"}
+            }),
+            &["account_id"],
+            &[
+                "account_id",
+                "page_token",
+                "max_results",
+                "include_system_managed",
+            ],
+        ),
+        ecrire(
+            "social_youtube_reporting_job_create",
+            "Un job de rapport créé",
+            "Planifie un rapport quotidien. Le premier fichier arrive sous 24 h. Un type de revenu sans la portée monétaire demande une reconnexion.",
+            "/v1/social/youtube/reporting-jobs",
+            json!({
+                "idempotency_key": {"type": "string"},
+                "account_id": {"type": "string"},
+                "report_type_id": {"type": "string"},
+                "name": {"type": "string"}
+            }),
+            &["idempotency_key", "account_id", "report_type_id"],
+            Risk::Write,
+        ),
+        lire(
+            "social_youtube_reporting_jobs_list",
+            "Les jobs de rapports de la chaîne",
+            "Les jobs déjà planifiés. À appeler pour retrouver un job_id avant de lister ses fichiers.",
+            "/v1/social/youtube/reporting-jobs",
+            json!({
+                "account_id": {"type": "string"},
+                "page_token": {"type": "string"},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 50}
+            }),
+            &["account_id"],
+            &["account_id", "page_token", "max_results"],
+        ),
+        ecrire(
+            "social_youtube_reporting_job_remove",
+            "La suppression d'un job de rapport en attente",
+            "Pose l'approbation qui supprimera le job. YouTube cesse alors de générer ce rapport. Rien n'est effacé avant approval_decide.",
+            "/v1/social/youtube/reporting-jobs/delete",
+            json!({
+                "idempotency_key": {"type": "string"},
+                "account_id": {"type": "string"},
+                "job_id": {"type": "string"}
+            }),
+            &["idempotency_key", "account_id", "job_id"],
+            Risk::Destructive,
+        ),
+        lire(
+            "social_youtube_reporting_reports_list",
+            "Les fichiers d'un job de rapport",
+            "Les CSV déjà produits pour un job. À appeler pour choisir un report_id à télécharger.",
+            "/v1/social/youtube/reporting-reports",
+            json!({
+                "account_id": {"type": "string"},
+                "job_id": {"type": "string"},
+                "page_token": {"type": "string"},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 50}
+            }),
+            &["account_id", "job_id"],
+            &["account_id", "job_id", "page_token", "max_results"],
+        ),
+        lire(
+            "social_youtube_reporting_report_get",
+            "Un rapport CSV lu",
+            "Télécharge le CSV avec le jeton du compte et rend les lignes plus le SHA-256 des octets. Le fichier ne passe pas par la route publique des médias.",
+            "/v1/social/youtube/reporting-reports/get",
+            json!({
+                "account_id": {"type": "string"},
+                "job_id": {"type": "string"},
+                "report_id": {"type": "string"}
+            }),
+            &["account_id", "job_id", "report_id"],
+            &["account_id", "job_id", "report_id"],
         ),
     ]
 }

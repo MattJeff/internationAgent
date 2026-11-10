@@ -37,6 +37,8 @@ pub const POINT_CAPTIONS_UPLOAD: &str = "https://www.googleapis.com/upload/youtu
 pub const POINT_COMMENT_MODERATION: &str =
     "https://www.googleapis.com/youtube/v3/comments/setModerationStatus";
 pub const POINT_ANALYTICS: &str = "https://youtubeanalytics.googleapis.com/v2/reports";
+/// YouTube Reporting API v1 (bulk CSV), relevé le 2026-11-10.
+pub const POINT_REPORTING: &str = "https://youtubereporting.googleapis.com/v1";
 
 pub const SCOPE_READONLY: &str = "https://www.googleapis.com/auth/youtube.readonly";
 pub const SCOPE_ANALYTICS: &str = "https://www.googleapis.com/auth/yt-analytics.readonly";
@@ -47,6 +49,9 @@ pub const SCOPE_ANALYTICS_MONETAIRE: &str =
 /// seul geste qui réécrit les portées scellées.
 pub const MESSAGE_RECONNEXION: &str = "ce compte YouTube a été connecté avant les portées Analytics \
      (youtube.readonly et yt-analytics.readonly) — reconnecter via account_connect_url";
+/// Même geste, pour un type de rapport qui porte des revenus.
+pub const MESSAGE_RECONNEXION_REVENU: &str = "ce type de rapport YouTube contient des revenus et exige \
+     yt-analytics-monetary.readonly — reconnecter via account_connect_url";
 
 pub const NON_SUPPORTE: &[&str] = &[
     "Liens de la section À propos (site, autres réseaux) : aucune ressource dans la Data API. Non supporté.",
@@ -102,6 +107,29 @@ pub fn scopes_analytics_ok(scopes: Option<&str>) -> bool {
     let analytics = porte(SCOPE_ANALYTICS) || porte(SCOPE_ANALYTICS_MONETAIRE);
     let lecture = porte(SCOPE_READONLY);
     analytics && lecture
+}
+
+/// Les rapports bulk non monétaires passent avec `yt-analytics.readonly`.
+/// Le Reporting API ne redemande pas `youtube.readonly` (guide d'autorisation,
+/// page datée 2026-11-05) : on garde pourtant le même contrôle que
+/// `reports.query`, pour qu'un vieux jeton reçoive la même erreur.
+pub fn scopes_reporting_ok(scopes: Option<&str>) -> bool {
+    scopes_analytics_ok(scopes)
+}
+
+pub fn scopes_revenu_ok(scopes: Option<&str>) -> bool {
+    scopes.is_some_and(|s| s.split_whitespace().any(|x| x == SCOPE_ANALYTICS_MONETAIRE))
+}
+
+/// Identifiants de types qui portent des revenus ou des performances pub
+/// (channel/content-owner revenue, ad rates). Le reste du catalogue bulk
+/// n'a pas besoin de la portée monétaire.
+pub fn type_rapport_monetaire(id: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    id.contains("revenue")
+        || id.contains("ad_rate")
+        || id.contains("earning")
+        || id.contains("monetary")
 }
 
 /// 403 « insufficient authentication scopes » — le corps ne sort pas de
@@ -1095,8 +1123,309 @@ pub async fn rapport(
     }))
 }
 
+pub const OCTETS_MAX_RAPPORT: usize = 8 * 1024 * 1024;
+pub const LIGNES_RAPPORT_RENDUES: usize = 200;
+
+/// Hôtes sur lesquels on accepte de rejouer le jeton du compte. Un
+/// `downloadUrl` ailleurs n'est pas téléchargé : le Bearer ne sort pas.
+const HOTES_RAPPORT: &[&str] = &[
+    "youtubereporting.googleapis.com",
+    "youtube.googleapis.com",
+    "www.googleapis.com",
+    "storage.googleapis.com",
+];
+
+pub fn url_rapport_autorisee(url: &str) -> bool {
+    let Ok(parse) = url::Url::parse(url) else {
+        return false;
+    };
+    let hote = parse.host_str().unwrap_or("");
+    let hote_ok = HOTES_RAPPORT.contains(&hote) || (cfg!(test) && hote == "127.0.0.1");
+    // En test, le mock est en http sur la boucle locale. Ailleurs : https seul.
+    let scheme_ok = parse.scheme() == "https"
+        || (cfg!(test) && parse.scheme() == "http" && hote == "127.0.0.1");
+    hote_ok && scheme_ok
+}
+
+/// CSV YouTube (en-tête + lignes). Les guillemets doublés sont un guillemet.
+pub fn parser_csv(texte: &str) -> (Vec<String>, Vec<Vec<String>>) {
+    let texte = texte.strip_prefix('\u{feff}').unwrap_or(texte);
+    let mut lignes = Vec::new();
+    let mut courante = String::new();
+    let mut guillemets = false;
+    for c in texte.chars() {
+        if c == '"' {
+            guillemets = !guillemets;
+            courante.push(c);
+        } else if c == '\n' && !guillemets {
+            if courante.ends_with('\r') {
+                courante.pop();
+            }
+            if !courante.is_empty() {
+                lignes.push(std::mem::take(&mut courante));
+            }
+        } else {
+            courante.push(c);
+        }
+    }
+    if !courante.is_empty() && courante != "\r" {
+        if courante.ends_with('\r') {
+            courante.pop();
+        }
+        lignes.push(courante);
+    }
+    let mut champs = lignes.into_iter().map(|l| champs_csv(&l));
+    let colonnes = champs.next().unwrap_or_default();
+    let rangees: Vec<Vec<String>> = champs.collect();
+    (colonnes, rangees)
+}
+
+fn champs_csv(ligne: &str) -> Vec<String> {
+    let mut champs = Vec::new();
+    let mut cur = String::new();
+    let mut guillemets = false;
+    let mut chars = ligne.chars().peekable();
+    while let Some(c) = chars.next() {
+        if guillemets {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    cur.push('"');
+                } else {
+                    guillemets = false;
+                }
+            } else {
+                cur.push(c);
+            }
+        } else if c == '"' && cur.is_empty() {
+            guillemets = true;
+        } else if c == ',' {
+            champs.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    champs.push(cur);
+    champs
+}
+
+fn job_projete(job: &Value) -> Value {
+    json!({
+        "job_id": job.get("id").and_then(Value::as_str).unwrap_or(""),
+        "name": job.get("name").and_then(Value::as_str).unwrap_or(""),
+        "report_type_id": job.get("reportTypeId").and_then(Value::as_str).unwrap_or(""),
+        "create_time": job.get("createTime").and_then(Value::as_str),
+    })
+}
+
+pub async fn lister_types_rapport(
+    base: &str,
+    secret: &Secret,
+    page_token: Option<&str>,
+    page_size: u32,
+    systeme: bool,
+) -> Result<Value, EchecYoutube> {
+    let mut q = vec![
+        ("pageSize".to_owned(), page_size.to_string()),
+        (
+            "includeSystemManaged".to_owned(),
+            if systeme { "true" } else { "false" }.to_owned(),
+        ),
+    ];
+    if let Some(token) = page_token {
+        q.push(("pageToken".into(), token.to_owned()));
+    }
+    let paires = paires_owned(&q);
+    let (_s, corps) =
+        echanger(jeton(http().get(format!("{base}/reportTypes")), secret).query(&paires)).await?;
+    let doc = document(&corps)?;
+    let types = doc
+        .get("reportTypes")
+        .and_then(Value::as_array)
+        .map(|liste| {
+            liste
+                .iter()
+                .map(|t| {
+                    let id = t.get("id").and_then(Value::as_str).unwrap_or("");
+                    json!({
+                        "id": id,
+                        "name": t.get("name").and_then(Value::as_str).unwrap_or(""),
+                        "monetary": type_rapport_monetaire(id),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(json!({
+        "report_types": types,
+        "next_page_token": doc.get("nextPageToken").and_then(Value::as_str),
+    }))
+}
+
+pub async fn creer_job_rapport(
+    base: &str,
+    secret: &Secret,
+    report_type_id: &str,
+    nom: Option<&str>,
+) -> Result<Value, EchecYoutube> {
+    if !id_youtube(report_type_id) {
+        return Err(EchecYoutube::Argument("report_type_id invalide"));
+    }
+    let mut corps = json!({ "reportTypeId": report_type_id });
+    if let Some(nom) = nom {
+        if nom.chars().count() > 100 {
+            return Err(EchecYoutube::Argument("name : 100 caractères maximum"));
+        }
+        corps["name"] = json!(nom);
+    }
+    let (_s, octets) =
+        echanger(jeton(http().post(format!("{base}/jobs")), secret).json(&corps)).await?;
+    Ok(job_projete(&document(&octets)?))
+}
+
+pub async fn lister_jobs_rapport(
+    base: &str,
+    secret: &Secret,
+    page_token: Option<&str>,
+    page_size: u32,
+) -> Result<Value, EchecYoutube> {
+    let mut q = vec![("pageSize".to_owned(), page_size.to_string())];
+    if let Some(token) = page_token {
+        q.push(("pageToken".into(), token.to_owned()));
+    }
+    let paires = paires_owned(&q);
+    let (_s, corps) =
+        echanger(jeton(http().get(format!("{base}/jobs")), secret).query(&paires)).await?;
+    let doc = document(&corps)?;
+    let jobs = doc
+        .get("jobs")
+        .and_then(Value::as_array)
+        .map(|liste| liste.iter().map(job_projete).collect::<Vec<_>>())
+        .unwrap_or_default();
+    Ok(json!({
+        "jobs": jobs,
+        "next_page_token": doc.get("nextPageToken").and_then(Value::as_str),
+    }))
+}
+
+pub async fn supprimer_job_rapport(
+    base: &str,
+    secret: &Secret,
+    job_id: &str,
+) -> Result<Value, EchecYoutube> {
+    if !id_youtube(job_id) {
+        return Err(EchecYoutube::Argument("job_id invalide"));
+    }
+    let (statut, _corps) = echanger(jeton(
+        http().delete(format!("{base}/jobs/{job_id}")),
+        secret,
+    ))
+    .await?;
+    Ok(json!({ "job_id": job_id, "deleted": true, "statut": statut }))
+}
+
+pub async fn lister_rapports_job(
+    base: &str,
+    secret: &Secret,
+    job_id: &str,
+    page_token: Option<&str>,
+    page_size: u32,
+) -> Result<Value, EchecYoutube> {
+    if !id_youtube(job_id) {
+        return Err(EchecYoutube::Argument("job_id invalide"));
+    }
+    let mut q = vec![("pageSize".to_owned(), page_size.to_string())];
+    if let Some(token) = page_token {
+        q.push(("pageToken".into(), token.to_owned()));
+    }
+    let paires = paires_owned(&q);
+    let (_s, corps) =
+        echanger(jeton(http().get(format!("{base}/jobs/{job_id}/reports")), secret).query(&paires))
+            .await?;
+    let doc = document(&corps)?;
+    let rapports = doc
+        .get("reports")
+        .and_then(Value::as_array)
+        .map(|liste| {
+            liste
+                .iter()
+                .map(|r| {
+                    json!({
+                        "report_id": r.get("id").and_then(Value::as_str).unwrap_or(""),
+                        "job_id": r.get("jobId").and_then(Value::as_str).unwrap_or(job_id),
+                        "start_time": r.get("startTime").and_then(Value::as_str),
+                        "end_time": r.get("endTime").and_then(Value::as_str),
+                        "create_time": r.get("createTime").and_then(Value::as_str),
+                        "downloadable": r.get("downloadUrl").and_then(Value::as_str).is_some(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(json!({
+        "reports": rapports,
+        "next_page_token": doc.get("nextPageToken").and_then(Value::as_str),
+    }))
+}
+
+/// `reports.get` puis GET du `downloadUrl` avec le jeton du compte. Le CSV
+/// n'est pas déposé sur `/medias` : cette route est publique et sans auth,
+/// elle sert les octets d'une publication, pas un rapport de chaîne. Le
+/// `digest` est le SHA-256 des octets, la même empreinte que les médias.
+pub async fn telecharger_rapport(
+    base: &str,
+    secret: &Secret,
+    job_id: &str,
+    report_id: &str,
+) -> Result<Value, EchecYoutube> {
+    if !id_youtube(job_id) || !id_youtube(report_id) {
+        return Err(EchecYoutube::Argument("identifiant de rapport invalide"));
+    }
+    let (_s, corps) = echanger(jeton(
+        http().get(format!("{base}/jobs/{job_id}/reports/{report_id}")),
+        secret,
+    ))
+    .await?;
+    let doc = document(&corps)?;
+    let url = doc
+        .get("downloadUrl")
+        .and_then(Value::as_str)
+        .ok_or(EchecYoutube::Plateforme(ErreurPlateforme::Illisible))?;
+    if !url_rapport_autorisee(url) {
+        return Err(EchecYoutube::Argument(
+            "downloadUrl hors des hôtes YouTube Reporting — le jeton n'est pas envoyé",
+        ));
+    }
+    let (_s, octets) = echanger(jeton(http().get(url), secret)).await?;
+    if octets.len() > OCTETS_MAX_RAPPORT {
+        return Err(EchecYoutube::Argument(
+            "rapport au-dessus de 8 Mio — refusé avant d'être rendu",
+        ));
+    }
+    let texte = String::from_utf8(octets)
+        .map_err(|_| EchecYoutube::Plateforme(ErreurPlateforme::Illisible))?;
+    let (colonnes, rangees) = parser_csv(&texte);
+    let total = rangees.len();
+    let tronque = total > LIGNES_RAPPORT_RENDUES;
+    let rendu: Vec<&Vec<String>> = rangees.iter().take(LIGNES_RAPPORT_RENDUES).collect();
+    Ok(json!({
+        "job_id": job_id,
+        "report_id": report_id,
+        "digest": super::empreinte(&texte),
+        "byte_size": texte.len(),
+        "columns": colonnes,
+        "rows": rendu,
+        "row_count": total,
+        "truncated": tronque,
+    }))
+}
+
+fn paires_owned(q: &[(String, String)]) -> Vec<(&str, &str)> {
+    q.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+}
+
 /// Les points officiels, pour les tests qui vérifient le schéma d'URL.
-pub fn points_officiels() -> [&'static str; 11] {
+pub fn points_officiels() -> [&'static str; 12] {
     [
         POINT_CHANNELS,
         POINT_VIDEOS,
@@ -1108,6 +1437,7 @@ pub fn points_officiels() -> [&'static str; 11] {
         POINT_CAPTIONS,
         POINT_CAPTIONS_UPLOAD,
         POINT_ANALYTICS,
+        POINT_REPORTING,
         "https://www.googleapis.com/youtube/v3/captions",
     ]
 }
@@ -1316,7 +1646,8 @@ mod tests {
         for point in points_officiels() {
             assert!(
                 point.starts_with("https://www.googleapis.com/")
-                    || point.starts_with("https://youtubeanalytics.googleapis.com/"),
+                    || point.starts_with("https://youtubeanalytics.googleapis.com/")
+                    || point.starts_with("https://youtubereporting.googleapis.com/"),
                 "{point}"
             );
         }
@@ -1548,6 +1879,177 @@ mod tests {
         let rendu = erreur.to_string();
         assert!(rendu.contains("account_connect_url"));
         assert!(!rendu.contains("TOKEN-NE-DOIT-PAS-FUIR"));
+        assert!(!rendu.contains("jeton-test"));
+    }
+
+    #[test]
+    fn le_csv_garde_une_virgule_entre_guillemets_et_le_revenu_est_nomme() {
+        let (colonnes, lignes) = parser_csv("date,views,titre\n2026-01-01,3,\"un, deux\"\n");
+        assert_eq!(colonnes, vec!["date", "views", "titre"]);
+        assert_eq!(lignes.len(), 1);
+        assert_eq!(lignes[0][2], "un, deux");
+        assert!(type_rapport_monetaire("content_owner_estimated_revenue_a1"));
+        assert!(!type_rapport_monetaire("channel_basic_a3"));
+        assert!(url_rapport_autorisee(
+            "https://youtubereporting.googleapis.com/v1/media/CHANNEL/job/report"
+        ));
+        assert!(!url_rapport_autorisee("https://evil.example/steal"));
+        assert!(!url_rapport_autorisee(
+            "http://youtubereporting.googleapis.com/v1/x"
+        ));
+        assert!(MESSAGE_RECONNEXION_REVENU.contains("account_connect_url"));
+        assert!(!scopes_revenu_ok(Some(SCOPE_ANALYTICS)));
+        assert!(scopes_revenu_ok(Some(SCOPE_ANALYTICS_MONETAIRE)));
+        assert!(!scopes_reporting_ok(None));
+    }
+
+    #[tokio::test]
+    async fn le_reporting_liste_cree_et_telecharge_le_csv_avec_le_jeton() {
+        use axum::extract::State;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::{delete, get, post};
+        use axum::{Json, Router};
+        use std::sync::Mutex;
+
+        let jetons = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let jetons_delete = jetons.clone();
+        let app = Router::new()
+            .route(
+                "/v1/reportTypes",
+                get(|| async {
+                    Json(json!({"reportTypes":[
+                        {"id":"channel_basic_a3","name":"activité"},
+                        {"id":"content_owner_estimated_revenue_a1","name":"revenu"}
+                    ]}))
+                }),
+            )
+            .route(
+                "/v1/jobs",
+                post(|Json(corps): Json<Value>| async move {
+                    Json(json!({
+                        "id": "job1",
+                        "name": corps.get("name").and_then(Value::as_str).unwrap_or(""),
+                        "reportTypeId": corps.get("reportTypeId").and_then(Value::as_str).unwrap_or(""),
+                        "createTime": "2026-11-10T00:00:00Z"
+                    }))
+                })
+                .get(|| async { Json(json!({"jobs":[{"id":"job1","name":"quotidien","reportTypeId":"channel_basic_a3"}]})) }),
+            )
+            .route(
+                "/v1/jobs/{id}",
+                delete(|State(jetons): State<std::sync::Arc<Mutex<Vec<String>>>>, headers: HeaderMap| async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_owned();
+                    jetons.lock().expect("verrou").push(auth);
+                    StatusCode::NO_CONTENT
+                }),
+            )
+            .route(
+                "/v1/jobs/{job}/reports",
+                get(|| async {
+                    Json(json!({"reports":[{
+                        "id": "rep1",
+                        "jobId": "job1",
+                        "startTime": "2026-11-01T00:00:00Z",
+                        "downloadUrl": "present"
+                    }]}))
+                }),
+            )
+            .with_state(jetons_delete);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adresse = listener.local_addr().unwrap();
+        let base_http = format!("http://{adresse}");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let secret = Secret::new("jeton-test");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adresse_csv = listener.local_addr().unwrap();
+        let csv = format!("http://{adresse_csv}/v1/media/rapport.csv");
+        let meta = Router::new()
+            .route(
+                "/v1/jobs/{job}/reports/{report}",
+                get({
+                    let csv = csv.clone();
+                    move || {
+                        let csv = csv.clone();
+                        async move { Json(json!({"id":"rep1","downloadUrl": csv})) }
+                    }
+                }),
+            )
+            .route(
+                "/v1/media/rapport.csv",
+                get(|headers: HeaderMap| async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_owned();
+                    if auth != "Bearer jeton-test" {
+                        return (StatusCode::UNAUTHORIZED, "non".to_owned());
+                    }
+                    (
+                        StatusCode::OK,
+                        "date,views\n2026-11-01,7\n2026-11-02,\"8,5\"\n".to_owned(),
+                    )
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, meta).await.unwrap();
+        });
+        let fichier =
+            telecharger_rapport(&format!("http://{adresse_csv}/v1"), &secret, "job1", "rep1")
+                .await
+                .unwrap();
+        assert_eq!(fichier["columns"][0], "date");
+        assert_eq!(fichier["rows"][0][1], "7");
+        assert_eq!(fichier["rows"][1][1], "8,5");
+        assert_eq!(fichier["row_count"], 2);
+        assert_eq!(fichier["truncated"], false);
+        assert_eq!(fichier["digest"].as_str().unwrap_or("").len(), 64);
+        let base = format!("{base_http}/v1");
+        let types = lister_types_rapport(&base, &secret, None, 20, false)
+            .await
+            .unwrap();
+        assert_eq!(types["report_types"][0]["id"], "channel_basic_a3");
+        assert_eq!(types["report_types"][0]["monetary"], false);
+        assert_eq!(types["report_types"][1]["monetary"], true);
+        let job = creer_job_rapport(&base, &secret, "channel_basic_a3", Some("quotidien"))
+            .await
+            .unwrap();
+        assert_eq!(job["job_id"], "job1");
+        assert_eq!(job["report_type_id"], "channel_basic_a3");
+        let jobs = lister_jobs_rapport(&base, &secret, None, 20).await.unwrap();
+        assert_eq!(jobs["jobs"][0]["job_id"], "job1");
+        let liste = lister_rapports_job(&base, &secret, "job1", None, 20)
+            .await
+            .unwrap();
+        assert_eq!(liste["reports"][0]["downloadable"], true);
+        let supprime = supprimer_job_rapport(&base, &secret, "job1").await.unwrap();
+        assert_eq!(supprime["deleted"], true);
+        let auth = jetons.lock().expect("verrou");
+        assert_eq!(auth[0], "Bearer jeton-test");
+        drop(auth);
+
+        // downloadUrl hors hôtes : le jeton ne part pas.
+        let piege = Router::new().route(
+            "/v1/jobs/{job}/reports/{report}",
+            get(|| async { Json(json!({"id":"rep1","downloadUrl":"https://evil.example/csv"})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adresse = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, piege).await.unwrap();
+        });
+        let erreur = telecharger_rapport(&format!("http://{adresse}/v1"), &secret, "job1", "rep1")
+            .await
+            .expect_err("hôte refusé");
+        let rendu = erreur.to_string();
+        assert!(rendu.contains("hôtes YouTube"));
         assert!(!rendu.contains("jeton-test"));
     }
 }
