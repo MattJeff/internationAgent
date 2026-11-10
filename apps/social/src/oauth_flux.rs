@@ -136,8 +136,7 @@ pub const YOUTUBE_CHANNELS: &str = "https://www.googleapis.com/youtube/v3/channe
 /// `account_connect_url` reste le chemin de re-consentement — pas de
 /// migration de jetons, l'humain re-consent et la ligne de compte se
 /// re-scelle par l'upsert de `connecter_compte`.
-pub const X_SCOPES: &str =
-    "tweet.read tweet.write users.read offline.access dm.read dm.write like.write bookmark.write";
+pub const X_SCOPES: &str = "tweet.read tweet.write users.read offline.access media.write dm.read dm.write like.write bookmark.write";
 /// `w_member_social` : « Post, comment, and like posts on behalf of an
 /// authenticated member » (posts-api, table Permissions). `openid` + `profile` :
 /// requis pour `GET /v2/userinfo`, qui est le SEUL moyen self-serve de savoir
@@ -145,6 +144,10 @@ pub const X_SCOPES: &str =
 /// (sign-in-with-linkedin-v2, produit « Sign In with LinkedIn using OpenID
 /// Connect », sans revue d'app). Relevés le 2026-09-02.
 pub const LINKEDIN_SCOPES: &str = "openid profile w_member_social";
+/// Page organisation, derrière `SOCIAL_LINKEDIN_ORG_POSTING`. Le membre
+/// (`w_member_social`) reste toujours demandé. `w_organization_social` poste
+/// au nom d'une page dont le membre a le rôle.
+pub const LINKEDIN_SCOPES_ORG: &str = "openid profile w_member_social w_organization_social";
 /// Les quatre scopes du chemin « Instagram API with Instagram Login » (tableau
 /// de permissions, developers.facebook.com/docs/instagram-platform, relevé
 /// 2026-09-02) : publier (content_publish), modérer les commentaires
@@ -154,7 +157,7 @@ pub const INSTAGRAM_SCOPES: &str = "instagram_business_basic,instagram_business_
 /// `video.publish` (Direct Post), `video.list` (read_timeline/metriques),
 /// `user.info.basic` (identité) — tiktok-api-scopes, relevé 2026-09-02.
 /// Séparés par des VIRGULES (« comma-separated », oauth-user-access-token).
-pub const TIKTOK_SCOPES: &str = "user.info.basic,video.list,video.publish";
+pub const TIKTOK_SCOPES: &str = "user.info.basic,video.list,video.publish,video.upload";
 /// `youtube.upload` publie ; `youtube.force-ssl` couvre commentaires, likes,
 /// recherche et lectures (commentThreads/insert, videos/rate — relevés
 /// 2026-09-02). Google sépare les scopes par des ESPACES, comme X/LinkedIn.
@@ -319,12 +322,42 @@ pub fn demarrer(
     tenant: TenantId,
     chiffre: &LocalEnvelopeSecretStore,
 ) -> Result<FluxDemarre, ProviderError> {
+    demarrer_interne(plateforme, client_id, redirect_uri, tenant, chiffre, false)
+}
+
+/// Comme [`demarrer`], avec `w_organization_social` en plus des scopes membre.
+/// Réservé au drapeau `SOCIAL_LINKEDIN_ORG_POSTING`.
+pub fn demarrer_page(
+    plateforme: PlateformeOauth,
+    client_id: &str,
+    redirect_uri: &str,
+    tenant: TenantId,
+    chiffre: &LocalEnvelopeSecretStore,
+) -> Result<FluxDemarre, ProviderError> {
+    demarrer_interne(plateforme, client_id, redirect_uri, tenant, chiffre, true)
+}
+
+fn demarrer_interne(
+    plateforme: PlateformeOauth,
+    client_id: &str,
+    redirect_uri: &str,
+    tenant: TenantId,
+    chiffre: &LocalEnvelopeSecretStore,
+    page_linkedin: bool,
+) -> Result<FluxDemarre, ProviderError> {
     let state = aleatoire_b64url(STATE_OCTETS);
     let empreinte = empreinte_state(&state);
 
     let (point, scopes) = match plateforme {
         PlateformeOauth::X => (X_AUTORISATION, X_SCOPES),
-        PlateformeOauth::Linkedin => (LINKEDIN_AUTORISATION, LINKEDIN_SCOPES),
+        PlateformeOauth::Linkedin => (
+            LINKEDIN_AUTORISATION,
+            if page_linkedin {
+                LINKEDIN_SCOPES_ORG
+            } else {
+                LINKEDIN_SCOPES
+            },
+        ),
         PlateformeOauth::Instagram => (INSTAGRAM_AUTORISATION, INSTAGRAM_SCOPES),
         PlateformeOauth::Tiktok => (TIKTOK_AUTORISATION, TIKTOK_SCOPES),
         PlateformeOauth::Youtube => (YOUTUBE_AUTORISATION, YOUTUBE_SCOPES),
@@ -702,6 +735,62 @@ pub async fn identite(
 /// comme handle, et `data.id` — l'id NUMÉRIQUE que `/2/users/{id}/likes`,
 /// `/bookmarks`, `/retweets` et `/mentions` exigent : le username n'y passe
 /// pas.
+/// Organisations que le membre peut publier. `organizationAcls?q=roleAssignee`
+/// (Community Management). On ne garde que les rôles qui postent.
+pub fn organisations_depuis(statut: u16, corps: &[u8]) -> Result<Vec<String>, ErreurPlateforme> {
+    if let Some(erreur) = ErreurPlateforme::depuis_statut(statut) {
+        return Err(erreur);
+    }
+    let document: serde_json::Value =
+        serde_json::from_slice(corps).map_err(|_| ErreurPlateforme::Illisible)?;
+    let elements = document
+        .get("elements")
+        .and_then(|v| v.as_array())
+        .ok_or(ErreurPlateforme::Illisible)?;
+    let mut orgs = Vec::new();
+    for element in elements {
+        let role = element.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role != "ADMINISTRATOR" && role != "CONTENT_ADMIN" {
+            continue;
+        }
+        let Some(urn) = element.get("organization").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if urn.starts_with("urn:li:organization:") {
+            orgs.push(urn.to_owned());
+        }
+    }
+    Ok(orgs)
+}
+
+pub const POINT_ORGANISATIONS: &str =
+    "https://api.linkedin.com/rest/organizationAcls?q=roleAssignee&state=APPROVED";
+
+/// Liste les pages que le membre peut publier. Un échec réseau est une erreur :
+/// l'appelant décide de ne pas faire échouer la connexion du membre pour autant.
+pub async fn lister_organisations(acces: &Secret) -> Result<Vec<String>, ErreurPlateforme> {
+    let reponse = http()
+        .get(POINT_ORGANISATIONS)
+        .bearer_auth(acces.expose_for_transport())
+        .header(
+            "LinkedIn-Version",
+            crate::adapters::linkedin::VERSION_LINKEDIN,
+        )
+        .header(
+            "X-Restli-Protocol-Version",
+            crate::adapters::linkedin::PROTOCOLE_RESTLI,
+        )
+        .send()
+        .await
+        .map_err(|_| ErreurPlateforme::Injoignable)?;
+    let statut = reponse.status().as_u16();
+    let corps = reponse
+        .bytes()
+        .await
+        .map_err(|_| ErreurPlateforme::Injoignable)?;
+    organisations_depuis(statut, &corps)
+}
+
 /// LinkedIn : `{"sub": "782bbtaQ", ...}` → `urn:li:person:{sub}` — `sub` est
 /// « User identifier » (sign-in-with-linkedin-v2) et l'URN d'auteur du Posts
 /// API est `urn:li:person:{id}` (post-api-schema) ; l'URN sert aux deux
@@ -829,6 +918,35 @@ mod tests {
         // openid+profile : le prix de savoir QUI poste (userinfo) — voir la
         // citation sur LINKEDIN_SCOPES.
         assert_eq!(params["scope"], "openid profile w_member_social");
+        let page = demarrer_page(
+            PlateformeOauth::Linkedin,
+            "client-li",
+            "https://social.example/oauth/callback",
+            tenant(),
+            &chiffre(),
+        )
+        .expect("page");
+        let params_page = parametres(&page.authorize_url);
+        assert_eq!(params_page["scope"], LINKEDIN_SCOPES_ORG);
+        assert!(params_page["scope"].contains("w_organization_social"));
+        assert!(params_page["scope"].contains("w_member_social"));
+        let orgs = organisations_depuis(
+            200,
+            br#"{"elements":[
+                {"organization":"urn:li:organization:42","role":"ADMINISTRATOR","state":"APPROVED"},
+                {"organization":"urn:li:organization:7","role":"CONTENT_ADMIN","state":"APPROVED"},
+                {"organization":"urn:li:organization:9","role":"CURATOR","state":"APPROVED"},
+                {"organization":"urn:li:person:nope","role":"ADMINISTRATOR"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            orgs,
+            vec![
+                "urn:li:organization:42".to_owned(),
+                "urn:li:organization:7".to_owned()
+            ]
+        );
         assert!(!params.contains_key("code_challenge"));
         assert!(flux.verifieur_scelle.is_none());
         assert!(params.contains_key("state"));
@@ -1014,7 +1132,9 @@ mod tests {
         // (oauth-user-access-token-management, 2026-09-02).
         assert_eq!(params["client_key"], "clef-tiktok");
         assert!(!params.contains_key("client_id"));
-        assert_eq!(params["scope"], "user.info.basic,video.list,video.publish");
+        assert_eq!(params["scope"], TIKTOK_SCOPES);
+        assert!(params["scope"].contains("video.upload"));
+        assert!(params["scope"].contains("video.publish"));
         assert!(flux.verifieur_scelle.is_none());
     }
 

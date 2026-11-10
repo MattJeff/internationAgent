@@ -170,9 +170,47 @@ pub fn corps_de_publication(
     sondage: Option<&Sondage>,
     made_with_ai: bool,
 ) -> serde_json::Value {
+    corps_avec_reponse(texte, media_ids, sondage, made_with_ai, None)
+}
+
+/// POST JSON et lecture du corps. Le fil de test pointe cette fonction vers
+/// un serveur local ; la publication réelle pointe vers `POINT_PUBLICATION`.
+pub async fn poster_json(
+    url: &str,
+    jeton: &Secret,
+    corps: &serde_json::Value,
+) -> Result<(u16, Vec<u8>), ErreurPlateforme> {
+    let reponse = http()
+        .post(url)
+        .bearer_auth(jeton.expose_for_transport())
+        .json(corps)
+        .send()
+        .await
+        .map_err(|_| ErreurPlateforme::Injoignable)?;
+    let statut = reponse.status().as_u16();
+    let octets = reponse
+        .bytes()
+        .await
+        .map_err(|_| ErreurPlateforme::Injoignable)?
+        .to_vec();
+    Ok((statut, octets))
+}
+
+/// Le même corps, plus `reply.in_reply_to_tweet_id` quand l'élément n'est
+/// pas le premier d'un fil (creation-of-a-post, relevé le 2026-09-02).
+pub fn corps_avec_reponse(
+    texte: &str,
+    media_ids: &[String],
+    sondage: Option<&Sondage>,
+    made_with_ai: bool,
+    en_reponse_a: Option<&str>,
+) -> serde_json::Value {
     let mut corps = json!({ "text": texte });
     if !media_ids.is_empty() {
         corps["media"] = json!({ "media_ids": media_ids });
+    }
+    if let Some(id) = en_reponse_a {
+        corps["reply"] = json!({ "in_reply_to_tweet_id": id });
     }
     if let Some(s) = sondage {
         // Pas de champ question : chez X le texte du post EST la question.
@@ -574,13 +612,8 @@ impl Plateforme for X {
                     .to_owned(),
             );
         }
-        if options.publish_at.is_some() {
-            verdicts.push(
-                "x ne sert pas `publish_at` : aucune planification dans POST /2/tweets \
-                 (creation-of-a-post, relevé le 2026-09-02)"
-                    .to_owned(),
-            );
-        }
+        // `publish_at` n'est pas un champ de POST /2/tweets. La file du
+        // service le tient et poste à l'heure — verdict informatif, pas un refus.
 
         let photos = medias
             .iter()
@@ -652,13 +685,17 @@ impl Plateforme for X {
         let media: Vec<ApercuMedia> = medias.iter().map(apercu_media).collect();
         let alt_texts = medias.iter().filter(|m| m.alt_text.is_some()).count();
         let base = cout_creation_post(texte);
+        let limites_ok = !texte.trim().is_empty()
+            && poids(texte) <= LIMITE_PONDEREE
+            && verdicts.is_empty()
+            && media.iter().all(|m| m.limits_ok);
+        if options.publish_at.is_some() {
+            verdicts.push(super::VERDICT_CRENEAU.to_owned());
+        }
         Apercu {
             rendered_text: texte.to_owned(),
             digest: empreinte_globale(texte, medias, sondage, made_with_ai, options),
-            platform_limits_ok: !texte.trim().is_empty()
-                && poids(texte) <= LIMITE_PONDEREE
-                && verdicts.is_empty()
-                && media.iter().all(|m| m.limits_ok),
+            platform_limits_ok: limites_ok,
             // « Media Metadata $0.005 per request » : un POST par alt_text.
             // L'upload média lui-même n'a aucune ligne de facturation relevée.
             cost_estimate_usd: Some(base + COUT_PAR_ALT_TEXT_USD * alt_texts as f64),
@@ -677,10 +714,34 @@ impl Plateforme for X {
         medias: &[MediaPret],
         sondage: Option<&Sondage>,
         made_with_ai: bool,
-        _options: &OptionsPost,
+        options: &OptionsPost,
     ) -> Result<Publication, ErreurPlateforme> {
-        // `options` : refusé par l'aperçu (C7 le passe avant publier) — un
-        // privacy/publish_at posé ne peut pas arriver ici.
+        self.publier_en_reponse(
+            jeton,
+            handle,
+            texte,
+            medias,
+            sondage,
+            made_with_ai,
+            options,
+            None,
+        )
+        .await
+    }
+
+    async fn publier_en_reponse(
+        &self,
+        jeton: &Secret,
+        handle: &str,
+        texte: &str,
+        medias: &[MediaPret],
+        sondage: Option<&Sondage>,
+        made_with_ai: bool,
+        _options: &OptionsPost,
+        en_reponse_a: Option<&str>,
+    ) -> Result<Publication, ErreurPlateforme> {
+        // `privacy` est refusé par l'aperçu. `publish_at` est retiré par la
+        // file avant cet appel : X ne le sert pas dans POST /2/tweets.
         let mut media_ids = Vec::with_capacity(medias.len());
         for m in medias {
             let media_id = match m.type_detecte {
@@ -698,23 +759,12 @@ impl Plateforme for X {
             }
             media_ids.push(media_id);
         }
-        let reponse = http()
-            .post(POINT_PUBLICATION)
-            .bearer_auth(jeton.expose_for_transport())
-            .json(&corps_de_publication(
-                texte,
-                &media_ids,
-                sondage,
-                made_with_ai,
-            ))
-            .send()
-            .await
-            .map_err(|_| ErreurPlateforme::Injoignable)?;
-        let statut = reponse.status().as_u16();
-        let corps = reponse
-            .bytes()
-            .await
-            .map_err(|_| ErreurPlateforme::Injoignable)?;
+        let (statut, corps) = poster_json(
+            POINT_PUBLICATION,
+            jeton,
+            &corps_avec_reponse(texte, &media_ids, sondage, made_with_ai, en_reponse_a),
+        )
+        .await?;
         publication_depuis(statut, &corps, handle)
     }
 
@@ -1333,6 +1383,8 @@ mod tests {
     const SANS: OptionsPost = OptionsPost {
         privacy: None,
         publish_at: None,
+        placement: None,
+        livraison: None,
     };
 
     fn avec_alt(mut m: MediaPret, alt: &str) -> MediaPret {
@@ -1761,6 +1813,8 @@ mod tests {
         let avec_privacy = OptionsPost {
             privacy: Some(crate::adapters::Privacy::Private),
             publish_at: None,
+            placement: None,
+            livraison: None,
         };
         let apercu = X.apercu("t", &[], None, false, &avec_privacy);
         assert!(!apercu.platform_limits_ok);
@@ -1772,11 +1826,13 @@ mod tests {
         let avec_date = OptionsPost {
             privacy: None,
             publish_at: Some("2026-10-01T09:00:00Z".to_owned()),
+            placement: None,
+            livraison: None,
         };
         let apercu = X.apercu("t", &[], None, false, &avec_date);
-        assert!(!apercu.platform_limits_ok);
+        assert!(apercu.platform_limits_ok, "{:?}", apercu.verdicts);
         assert!(
-            apercu.verdicts.iter().any(|v| v.contains("publish_at")),
+            apercu.verdicts.iter().any(|v| v.contains("file durable")),
             "{:?}",
             apercu.verdicts
         );
@@ -2025,5 +2081,74 @@ mod tests_messagerie {
         ] {
             assert!(point.starts_with("https://"), "{point}");
         }
+    }
+
+    /// Un fil : le second corps porte `in_reply_to_tweet_id` du premier, et
+    /// un 500 au milieu s'arrête sans inventer la suite. Le serveur est local.
+    #[tokio::test]
+    async fn un_fil_http_chaine_les_reponses_et_rapporte_l_echec() {
+        use std::sync::Mutex;
+
+        use axum::extract::State;
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        let recus = std::sync::Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let app = Router::new()
+            .route(
+                "/2/tweets",
+                post(
+                    |State(recus): State<std::sync::Arc<Mutex<Vec<serde_json::Value>>>>,
+                     Json(corps): Json<serde_json::Value>| async move {
+                        let n = {
+                            let mut g = recus.lock().expect("verrou");
+                            g.push(corps);
+                            g.len()
+                        };
+                        if n >= 3 {
+                            return (
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({"title": "unavailable"})),
+                            );
+                        }
+                        (
+                            axum::http::StatusCode::CREATED,
+                            Json(json!({"data": {"id": format!("id-{n}")}})),
+                        )
+                    },
+                ),
+            )
+            .with_state(recus.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adresse = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let url = format!("http://{adresse}/2/tweets");
+        let jeton = Secret::new("jeton-test");
+        let mut precedent = None;
+        let mut publies = Vec::new();
+        for texte in ["un", "deux", "trois"] {
+            let corps = corps_avec_reponse(texte, &[], None, false, precedent.as_deref());
+            let (statut, octets) = poster_json(&url, &jeton, &corps).await.unwrap();
+            match publication_depuis(statut, &octets, "compte") {
+                Ok(p) => {
+                    precedent = Some(p.id_plateforme.clone());
+                    publies.push(p.id_plateforme);
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(publies, vec!["id-1".to_owned(), "id-2".to_owned()]);
+        let g = recus.lock().expect("verrou");
+        assert_eq!(
+            g.len(),
+            3,
+            "le troisième part et échoue, le quatrième n'existe pas"
+        );
+        assert!(g[0].get("reply").is_none());
+        assert_eq!(g[1]["reply"]["in_reply_to_tweet_id"], "id-1");
+        assert_eq!(g[2]["reply"]["in_reply_to_tweet_id"], "id-2");
+        assert_eq!(g[0]["text"], "un");
     }
 }

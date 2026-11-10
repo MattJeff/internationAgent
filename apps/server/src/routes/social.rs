@@ -98,6 +98,7 @@ use agentos_app::mcp::Fleet;
 use agentos_app::mocks::ProviderError;
 use agentos_domain::action::McpTool;
 use agentos_domain::ids::Slug;
+use agentos_store::audit::AuditActor;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -124,12 +125,19 @@ const SERVEUR: &str = "social";
 /// `post_publish` chez lui est `post-publish` ici. Cette liste est la surface
 /// entière — le test anti-contact-privé la crible, et rien d'une requête ne
 /// peut l'agrandir.
-const OUTILS: [&str; 5] = [
+const OUTILS: &[&str] = &[
     "accounts-list",
     "account-connect-url",
     "post-preview",
     "post-publish",
     "posts-list",
+    "thread-preview",
+    "thread-publish",
+    "calendar-list",
+    "schedule-post",
+    "schedule-cancel",
+    "submit-for-approval",
+    "approval-decide",
 ];
 
 /// Ce module.
@@ -140,6 +148,14 @@ pub fn router(fleets: Fleets) -> Router {
         .route("/v1/social/preview", post(preview))
         // Deux verbes, un chemin : publier, et relire ce qui est parti.
         .route("/v1/social/posts", post(publish).get(posts))
+        .route("/v1/social/threads/preview", post(thread_preview))
+        .route("/v1/social/threads", post(thread_publish))
+        .route("/v1/social/calendar", get(calendar).post(calendar_create))
+        .route("/v1/social/calendar/move", post(calendar_move))
+        .route("/v1/social/calendar/cancel", post(calendar_cancel))
+        .route("/v1/social/approvals", post(approval_propose))
+        // Humain seulement : absent de la table d'outils des employés.
+        .route("/v1/social/approvals/decide", post(approval_decide))
         .with_state(fleets)
 }
 
@@ -283,6 +299,117 @@ async fn posts(
     appeler(&fleets, &principal, OUTILS[4], arguments).await
 }
 
+/// `POST /v1/social/threads/preview` — l'empreinte du fil entier.
+async fn thread_preview(
+    State(fleets): State<Fleets>,
+    principal: Principal,
+    crate::error::JsonBody(body): crate::error::JsonBody<Value>,
+) -> Result<Json<Value>, ApiError> {
+    appeler(&fleets, &principal, OUTILS[5], objet(body)?).await
+}
+
+/// `POST /v1/social/threads` — publier un fil, une clé pour toute la chaîne.
+async fn thread_publish(
+    State(fleets): State<Fleets>,
+    principal: Principal,
+    crate::error::JsonBody(body): crate::error::JsonBody<Value>,
+) -> Result<Json<Value>, ApiError> {
+    appeler(&fleets, &principal, OUTILS[6], objet(body)?).await
+}
+
+/// `?account_id=&from=&to=` du calendrier.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Calendrier {
+    account_id: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+}
+
+/// `GET /v1/social/calendar` — créneaux et files d'attente.
+async fn calendar(
+    State(fleets): State<Fleets>,
+    principal: Principal,
+    Query(q): Query<Calendrier>,
+) -> Result<Json<Value>, ApiError> {
+    let mut arguments = serde_json::Map::new();
+    if let Some(id) = q.account_id {
+        arguments.insert("account_id".to_owned(), json!(id));
+    }
+    if let Some(from) = q.from {
+        arguments.insert("from".to_owned(), json!(from));
+    }
+    if let Some(to) = q.to {
+        arguments.insert("to".to_owned(), json!(to));
+    }
+    appeler(&fleets, &principal, OUTILS[7], Value::Object(arguments)).await
+}
+
+/// `POST /v1/social/calendar` — poser un créneau (en attente par défaut).
+async fn calendar_create(
+    State(fleets): State<Fleets>,
+    principal: Principal,
+    crate::error::JsonBody(body): crate::error::JsonBody<Value>,
+) -> Result<Json<Value>, ApiError> {
+    appeler(&fleets, &principal, OUTILS[8], objet(body)?).await
+}
+
+/// `POST /v1/social/calendar/move` — déplacer un créneau.
+async fn calendar_move(
+    State(fleets): State<Fleets>,
+    principal: Principal,
+    crate::error::JsonBody(body): crate::error::JsonBody<Value>,
+) -> Result<Json<Value>, ApiError> {
+    appeler(&fleets, &principal, OUTILS[9], objet(body)?).await
+}
+
+/// `POST /v1/social/calendar/cancel` — retirer un créneau.
+async fn calendar_cancel(
+    State(fleets): State<Fleets>,
+    principal: Principal,
+    crate::error::JsonBody(body): crate::error::JsonBody<Value>,
+) -> Result<Json<Value>, ApiError> {
+    appeler(&fleets, &principal, OUTILS[9], objet(body)?).await
+}
+
+/// `POST /v1/social/approvals` — soumettre, sans rien publier.
+async fn approval_propose(
+    State(fleets): State<Fleets>,
+    principal: Principal,
+    crate::error::JsonBody(body): crate::error::JsonBody<Value>,
+) -> Result<Json<Value>, ApiError> {
+    appeler(&fleets, &principal, OUTILS[10], objet(body)?).await
+}
+
+/// `POST /v1/social/approvals/decide` — approuver, refuser ou éditer.
+///
+/// Pas un outil d'employé : la table MCP du produit ne déclare pas ce chemin.
+/// Et pas n'importe quelle clé non plus : seul le rôle approbateur décide.
+async fn approval_decide(
+    State(fleets): State<Fleets>,
+    principal: Principal,
+    crate::error::JsonBody(body): crate::error::JsonBody<Value>,
+) -> Result<Json<Value>, ApiError> {
+    approbateur(&principal.actor)?;
+    appeler(&fleets, &principal, OUTILS[11], objet(body)?).await
+}
+
+/// La règle de `routes::approvals`, lue de la même façon : le rôle d'une clé
+/// est son étiquette, et seule `approver` publie ce qu'un employé a proposé.
+/// Sans ce contrôle, toute clé du locataire — un terminal, un assistant tiers
+/// à qui l'on a confié une clé de pilotage — approuvait et faisait partir un
+/// post public.
+fn approbateur(actor: &AuditActor) -> Result<(), ApiError> {
+    if super::approvals::held_role(actor) != Some(agentos_app::gate::APPROVER_ROLE) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "role_required",
+            "this credential does not hold the role this approval requires",
+        ));
+    }
+    Ok(())
+}
+
 /// Les arguments d'un outil sont un objet. Un tableau ou une chaîne est une
 /// requête que ce client ne sait pas faire, et le dire ici épargne un
 /// aller-retour réseau.
@@ -302,6 +429,20 @@ fn objet(body: Value) -> Result<Value, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Seule la clé `approver` décide d'une publication ; une clé de pilotage
+    /// à une autre étiquette, ou le système, est refusée avant tout appel.
+    #[test]
+    fn seul_le_role_approbateur_decide_d_une_publication() {
+        assert!(approbateur(&AuditActor::Operator("approver".to_owned())).is_ok());
+        for etiquette in ["friday", "ops", "owner", "session-1"] {
+            assert!(
+                approbateur(&AuditActor::Operator(etiquette.to_owned())).is_err(),
+                "la clé `{etiquette}` a pu approuver une publication"
+            );
+        }
+        assert!(approbateur(&AuditActor::System).is_err());
+    }
 
     /// Les interdits, et pour chacun un nom hostile qui doit le déclencher.
     /// La même liste que `apps/social/src/mcp.rs` : un interdit qui diverge

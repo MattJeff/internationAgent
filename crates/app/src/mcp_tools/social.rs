@@ -120,8 +120,23 @@ fn contenu() -> Value {
         },
         "publish_at": {
             "type": "string",
-            "description": "ISO 8601, YouTube seul (`status.publishAt`, qui force `private` \
-                            d'ici là). Refus nommé ailleurs.",
+            "description": "ISO 8601 (RFC 3339). La file durable du service publie à cette \
+                            heure sur tous les réseaux. YouTube ne reçoit plus `status.publishAt` : \
+                            la vidéo part à l'heure dite, avec la visibilité demandée.",
+        },
+        "placement": {
+            "type": "string",
+            "enum": ["feed", "story", "reel"],
+            "description": "Instagram. `story` publie un conteneur STORIES sans légende. \
+                            `reel` force un Reel. Absent : image, Reel ou carrousel selon les octets.",
+        },
+        "delivery": {
+            "type": "string",
+            "enum": ["publish", "draft"],
+            "description": "TikTok. `publish` poste (scope video.publish). `draft` envoie la \
+                            vidéo en brouillon (scope video.upload) : le créateur la finalise \
+                            dans l'application. Absent : publish. Une app non auditée retombe \
+                            sur SELF_ONLY.",
         },
     })
 }
@@ -280,7 +295,179 @@ pub fn tools() -> Vec<ToolDef> {
             raw_body: None,
             risk: Risk::Read,
         },
+        ToolDef {
+            name: "social_calendar_list",
+            title: "Le calendrier des posts de ce locataire",
+            description: "Les créneaux, les posts en attente d'approbation et ce qui est déjà \
+                          parti, pour un compte et une plage de dates optionnels. À appeler \
+                          pour voir ce qui attend un humain avant d'en proposer un autre. Un \
+                          404 `no_social_binding` veut dire que l'agrégateur n'est pas branché.",
+            method: Method::Get,
+            path: "/v1/social/calendar",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "account_id": {"type": "string"},
+                    "from": {"type": "string", "description": "RFC 3339, borne incluse."},
+                    "to": {"type": "string", "description": "RFC 3339, borne incluse."},
+                },
+            }),
+            query: &["account_id", "from", "to"],
+            raw_body: None,
+            risk: Risk::Read,
+        },
+        ToolDef {
+            name: "social_calendar_create",
+            title: "Un créneau en attente d'approbation",
+            description: "Pose un post ou un fil à une heure RFC 3339. Par défaut le statut \
+                          est `pending_approval` : rien ne part tant qu'un humain n'a pas \
+                          approuvé. À utiliser pour programmer ; `social_approval_propose` \
+                          est le même geste sans heure obligatoire. `publish_at` est obligatoire.",
+            method: Method::Post,
+            path: "/v1/social/calendar",
+            schema: json!({
+                "type": "object",
+                "properties": contenu_programme(),
+                "required": ["idempotency_key", "account_id", "publish_at"],
+            }),
+            query: &[],
+            raw_body: None,
+            risk: Risk::Write,
+        },
+        ToolDef {
+            name: "social_calendar_set",
+            title: "Un créneau déplacé",
+            description: "Change l'heure d'un créneau encore `scheduled` ou `pending_approval`. \
+                          L'identifiant vient de `social_calendar_list`. Un créneau déjà publié \
+                          ne se déplace pas : la réponse le dit.",
+            method: Method::Post,
+            path: "/v1/social/calendar/move",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "scheduled_id": {"type": "string"},
+                    "publish_at": {"type": "string", "description": "Nouvelle heure, RFC 3339."},
+                },
+                "required": ["scheduled_id", "publish_at"],
+            }),
+            query: &[],
+            raw_body: None,
+            risk: Risk::Write,
+        },
+        ToolDef {
+            name: "social_calendar_remove",
+            title: "Un créneau retiré",
+            description: "Annule un créneau qui n'est pas encore publié. L'identifiant vient \
+                          de `social_calendar_list`. Un créneau en cours de publication ou déjà \
+                          en ligne ne s'annule pas par ici.",
+            method: Method::Post,
+            path: "/v1/social/calendar/cancel",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "scheduled_id": {"type": "string"},
+                },
+                "required": ["scheduled_id"],
+            }),
+            query: &[],
+            raw_body: None,
+            risk: Risk::Destructive,
+        },
+        ToolDef {
+            name: "social_thread_preview_get",
+            title: "Le fil tel qu'il partirait",
+            description: "L'aperçu de chaque élément, dans l'ordre, et une empreinte qui couvre \
+                          tout le fil. À appeler avant `social_thread_publish` ou \
+                          `social_approval_propose` quand le contenu est une suite de posts X. \
+                          Les autres réseaux n'ont pas de fil : un post suffit.",
+            method: Method::Post,
+            path: "/v1/social/threads/preview",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "account_id": {"type": "string"},
+                    "posts": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 25,
+                        "items": {"type": "object"},
+                    },
+                },
+                "required": ["account_id", "posts"],
+            }),
+            query: &[],
+            raw_body: None,
+            risk: Risk::Read,
+        },
+        ToolDef {
+            name: "social_thread_publish",
+            title: "Un fil publié",
+            description: "Publie un fil X comme une seule opération. `idempotency_key` couvre \
+                          toute la chaîne : un rejeu ne renvoie pas les éléments déjà en ligne, \
+                          et un échec au milieu est rapporté élément par élément. Les employés \
+                          passent par `social_approval_propose` ; cet outil publie tout de suite.",
+            method: Method::Post,
+            path: "/v1/social/threads",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "idempotency_key": {"type": "string"},
+                    "account_id": {"type": "string"},
+                    "posts": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 25,
+                        "items": {"type": "object"},
+                    },
+                    "publish_at": {"type": "string"},
+                    "expected_media_digests": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["idempotency_key", "account_id", "posts"],
+            }),
+            query: &[],
+            raw_body: None,
+            risk: Risk::Destructive,
+        },
+        ToolDef {
+            name: "social_approval_propose",
+            title: "Un post en attente d'approbation",
+            description: "Crée un post ou un fil au statut `pending_approval`. Rien n'est \
+                          publié : un humain approuve par la route d'opérateur, qui n'est pas \
+                          un outil de cette table. C'est le chemin par défaut d'un employé. \
+                          `social_post_publish` et `social_thread_publish`, eux, publient tout de suite.",
+            method: Method::Post,
+            path: "/v1/social/approvals",
+            schema: json!({
+                "type": "object",
+                "properties": contenu_programme(),
+                "required": ["idempotency_key", "account_id"],
+            }),
+            query: &[],
+            raw_body: None,
+            risk: Risk::Write,
+        },
     ]
+}
+
+/// Le corps d'un créneau ou d'une soumission : un post (`text`) ou un fil (`posts`).
+fn contenu_programme() -> Value {
+    let mut properties = contenu();
+    let object = properties.as_object_mut().expect("un objet");
+    object.insert("idempotency_key".to_owned(), json!({"type": "string"}));
+    object.insert(
+        "posts".to_owned(),
+        json!({
+            "type": "array",
+            "description": "Un fil X : 2 à 25 éléments `{text, media?}`. Absent : un post, et `text` est obligatoire.",
+            "minItems": 2,
+            "maxItems": 25,
+            "items": {"type": "object"},
+        }),
+    );
+    properties
 }
 
 #[cfg(test)]
@@ -352,10 +539,14 @@ mod tests {
             if outil.method == Method::Get {
                 assert!(outil.risk.read_only(), "{}", outil.name);
             }
+            let destructif = matches!(
+                outil.name,
+                "social_post_publish" | "social_thread_publish" | "social_calendar_remove"
+            );
             assert_eq!(
                 outil.risk.destructive(),
-                outil.name == "social_post_publish",
-                "{} : seul publier engage l'entreprise devant un tiers",
+                destructif,
+                "{} : publier ou annuler un créneau engage, le reste non",
                 outil.name
             );
         }
@@ -379,5 +570,20 @@ mod tests {
             assert!(required.contains(&champ.to_owned()), "{champ}");
         }
         assert!(publish.properties().contains(&"expected_media_digests"));
+    }
+
+    /// Approuver n'est pas un outil que le modèle voit. La route existe pour
+    /// un humain ; elle est exclue de la couverture des outils pour cette raison.
+    #[test]
+    fn approuver_n_est_pas_un_outil_employe() {
+        for outil in tools() {
+            assert!(
+                !outil.path.contains("decide"),
+                "{} expose la décision humaine",
+                outil.name
+            );
+            assert!(!outil.name.ends_with("_approve"), "{}", outil.name);
+            assert!(!outil.name.ends_with("_reject"), "{}", outil.name);
+        }
     }
 }
