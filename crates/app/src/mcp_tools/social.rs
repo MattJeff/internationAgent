@@ -216,12 +216,12 @@ pub fn tools() -> Vec<ToolDef> {
                     "platform": {
                         "type": "string",
                         "enum": ["x", "linkedin", "instagram", "tiktok", "youtube", "instagram_reels", "facebook_page", "threads"],
-                        "description": "instagram est le connecteur historique (SOCIAL_META_*). \
-                                        instagram_reels, facebook_page et threads sont le second \
-                                        connecteur Meta (META2_APP_* et META2_THREADS_APP_*), \
-                                        pour les comptes professionnels des utilisateurs. \
-                                        Ils restent en mode testeur tant que la revue d'app \
-                                        n'est pas passée.",
+                        "description": "instagram est le connecteur historique (SOCIAL_META_*, Instagram Login). \
+                                        instagram_reels et facebook_page partagent UN consentement \
+                                        Facebook Login for Business (META2_APP_* et META2_FB_CONFIG_ID) : \
+                                        la Page et le compte Instagram professionnel qui y est lié. \
+                                        threads est l'app Threads (META2_THREADS_APP_*). \
+                                        Mode testeur tant que la revue n'est pas passée.",
                     },
                 },
                 "required": ["platform"],

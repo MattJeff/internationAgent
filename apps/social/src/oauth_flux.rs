@@ -162,15 +162,20 @@ pub const TIKTOK_SCOPES: &str = "user.info.basic,video.list,video.publish,video.
 /// recherche et lectures (commentThreads/insert, videos/rate — relevés
 /// 2026-09-02). Google sépare les scopes par des ESPACES, comme X/LinkedIn.
 pub const YOUTUBE_SCOPES: &str = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.force-ssl";
-/// Second connecteur Meta, app distincte (`META2_APP_*`). Deux portées, celles
-/// que le code appelle : identifier le compte, publier un Reel. Pas de
-/// messages — le connecteur historique garde `INSTAGRAM_SCOPES`.
-/// Relevées le 2026-11-10 (Instagram API with Instagram Login).
-pub const INSTAGRAM_REELS_SCOPES: &str =
-    "instagram_business_basic,instagram_business_content_publish";
-/// Facebook Login pour les Pages. Relevées le 2026-11-10
-/// (reels-publishing, « Before You Start »).
-pub const FACEBOOK_PAGE_SCOPES: &str = "pages_show_list,pages_manage_posts,pages_read_engagement";
+/// Permissions à cocher dans la configuration Facebook Login for Business
+/// (`META2_FB_CONFIG_ID`). Elles ne partent pas dans `scope` : le `config_id`
+/// les remplace. `instagram_business_*` est le produit « Instagram Login »,
+/// indisponible sur une app neuve (« Invalid platform app »).
+/// `instagram_manage_comments` et `instagram_manage_messages` ne sont pas
+/// dans cette liste : le code ne les appelle pas.
+/// Relevées le 2026-11-10.
+pub const META2_PERMISSIONS_CONFIG: &[&str] = &[
+    "pages_show_list",
+    "pages_manage_posts",
+    "pages_read_engagement",
+    "instagram_basic",
+    "instagram_content_publish",
+];
 /// Threads API. Relevées le 2026-11-10.
 pub const THREADS_SCOPES: &str = "threads_basic,threads_content_publish";
 
@@ -198,10 +203,11 @@ pub enum PlateformeOauth {
     Instagram,
     Tiktok,
     Youtube,
-    /// Instagram Login sur l'app `META2_*`. Mêmes points que `Instagram`,
-    /// autres portées, autres comptes.
+    /// Reel via Facebook Login for Business (même dialogue que `FacebookPage`).
+    /// Publication sur `graph.facebook.com/{ig-user-id}/media`, pas sur
+    /// `instagram.com`.
     InstagramReels,
-    /// Facebook Login, puis un jeton de Page par Page.
+    /// Facebook Login for Business, puis un jeton de Page par Page.
     FacebookPage,
     /// Threads API, app `META2_THREADS_*`.
     Threads,
@@ -351,7 +357,15 @@ pub fn demarrer(
     tenant: TenantId,
     chiffre: &LocalEnvelopeSecretStore,
 ) -> Result<FluxDemarre, ProviderError> {
-    demarrer_interne(plateforme, client_id, redirect_uri, tenant, chiffre, false)
+    demarrer_interne(
+        plateforme,
+        client_id,
+        redirect_uri,
+        tenant,
+        chiffre,
+        false,
+        None,
+    )
 }
 
 /// Comme [`demarrer`], avec `w_organization_social` en plus des scopes membre.
@@ -363,7 +377,47 @@ pub fn demarrer_page(
     tenant: TenantId,
     chiffre: &LocalEnvelopeSecretStore,
 ) -> Result<FluxDemarre, ProviderError> {
-    demarrer_interne(plateforme, client_id, redirect_uri, tenant, chiffre, true)
+    demarrer_interne(
+        plateforme,
+        client_id,
+        redirect_uri,
+        tenant,
+        chiffre,
+        true,
+        None,
+    )
+}
+
+/// Facebook Login for Business, pour `facebook_page` et `instagram_reels`.
+///
+/// `config_id` remplace `scope` (`override_default_response_type=true` pour
+/// obtenir un code, pas un jeton implicite). Même URL pour les deux
+/// plateformes : un consentement relie la Page et le compte Instagram
+/// professionnel qui y est lié.
+/// <https://developers.facebook.com/docs/facebook-login/facebook-login-for-business>,
+/// relevé le 2026-11-10.
+pub fn demarrer_facebook_business(
+    plateforme: PlateformeOauth,
+    client_id: &str,
+    config_id: &str,
+    redirect_uri: &str,
+    tenant: TenantId,
+    chiffre: &LocalEnvelopeSecretStore,
+) -> Result<FluxDemarre, ProviderError> {
+    demarrer_interne(
+        plateforme,
+        client_id,
+        redirect_uri,
+        tenant,
+        chiffre,
+        false,
+        Some(config_id),
+    )
+}
+
+/// Un id de configuration Meta est une suite de chiffres.
+pub fn config_id_meta2_valide(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 32 && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn demarrer_interne(
@@ -373,6 +427,7 @@ fn demarrer_interne(
     tenant: TenantId,
     chiffre: &LocalEnvelopeSecretStore,
     page_linkedin: bool,
+    config_id: Option<&str>,
 ) -> Result<FluxDemarre, ProviderError> {
     let state = aleatoire_b64url(STATE_OCTETS);
     let empreinte = empreinte_state(&state);
@@ -390,8 +445,11 @@ fn demarrer_interne(
         PlateformeOauth::Instagram => (INSTAGRAM_AUTORISATION, INSTAGRAM_SCOPES),
         PlateformeOauth::Tiktok => (TIKTOK_AUTORISATION, TIKTOK_SCOPES),
         PlateformeOauth::Youtube => (YOUTUBE_AUTORISATION, YOUTUBE_SCOPES),
-        PlateformeOauth::InstagramReels => (INSTAGRAM_AUTORISATION, INSTAGRAM_REELS_SCOPES),
-        PlateformeOauth::FacebookPage => (FACEBOOK_AUTORISATION, FACEBOOK_PAGE_SCOPES),
+        // Les deux plateformes du second connecteur Meta : le même dialogue
+        // Facebook. Pas de `scope` ici — il vit dans la configuration.
+        PlateformeOauth::InstagramReels | PlateformeOauth::FacebookPage => {
+            (FACEBOOK_AUTORISATION, "")
+        }
         PlateformeOauth::Threads => (THREADS_AUTORISATION, THREADS_SCOPES),
     };
     // TikTok nomme son identifiant client `client_key` — le seul des cinq
@@ -405,12 +463,26 @@ fn demarrer_interne(
     // `Url` et pas `format!` : les scopes ont des espaces, un client_id est
     // une valeur opaque du fournisseur — la raison exacte de `oauth::start`.
     let mut url = Url::parse(point).expect("littéral https statique");
-    url.query_pairs_mut()
-        .append_pair("response_type", "code")
-        .append_pair(nom_client, client_id)
-        .append_pair("redirect_uri", redirect_uri)
-        .append_pair("scope", scopes)
-        .append_pair("state", &state);
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("response_type", "code")
+            .append_pair(nom_client, client_id)
+            .append_pair("redirect_uri", redirect_uri);
+        if matches!(
+            plateforme,
+            PlateformeOauth::FacebookPage | PlateformeOauth::InstagramReels
+        ) {
+            if let Some(config) = config_id {
+                query
+                    .append_pair("config_id", config)
+                    .append_pair("override_default_response_type", "true");
+            }
+        } else {
+            query.append_pair("scope", scopes);
+        }
+        query.append_pair("state", &state);
+    }
     if plateforme == PlateformeOauth::Youtube {
         // Sans `access_type=offline` Google n'émet pas de refresh token, et
         // sans `prompt=consent` il ne le ré-émet qu'au PREMIER consentement de
@@ -536,11 +608,11 @@ pub async fn echanger(
     );
     let jeton = poster_jeton(plateforme, client_id, client_secret, &corps).await?;
     match plateforme {
-        PlateformeOauth::Instagram | PlateformeOauth::InstagramReels => {
+        PlateformeOauth::Instagram => {
             // Le jeton de api.instagram.com/oauth/access_token est court ;
             // `ig_exchange_token` le troque contre le jeton long « valid for
             // 60 days » (long-lived-tokens, relevé 2026-09-02). C'est le long
-            // qu'on scelle.
+            // qu'on scelle. Le second connecteur n'emprunte PAS ce chemin.
             let long = obtenir_jeton_en_get(
                 INSTAGRAM_JETON_LONG,
                 &[
@@ -566,7 +638,7 @@ pub async fn echanger(
             .await?;
             Ok(copie_en_rafraichissement(long))
         }
-        PlateformeOauth::FacebookPage => {
+        PlateformeOauth::FacebookPage | PlateformeOauth::InstagramReels => {
             // Court → long (`fb_exchange_token`, ~60 jours). Le jeton de Page
             // qu'on scelle ensuite est dérivé de CELUI-CI et n'expire pas
             // (get-long-lived, relevé le 2026-11-10). On ne copie pas ce jeton
@@ -631,10 +703,15 @@ pub async fn rafraichir(
     rafraichissement: &Secret,
 ) -> Result<JetonEmis, ErreurPlateforme> {
     match plateforme {
-        PlateformeOauth::Linkedin | PlateformeOauth::FacebookPage => {
+        PlateformeOauth::Linkedin
+        | PlateformeOauth::FacebookPage
+        | PlateformeOauth::InstagramReels => {
+            // Le jeton de Page (et celui scellé pour le Reel lié) ne se
+            // rafraîchit pas : il est dérivé du jeton utilisateur long.
+            // Un 401 se répare par un nouveau consentement.
             Err(ErreurPlateforme::RafraichissementIndisponible)
         }
-        PlateformeOauth::Instagram | PlateformeOauth::InstagramReels => {
+        PlateformeOauth::Instagram => {
             // Le jeton long se rafraîchit LUI-MÊME (`sealed_refresh` en porte
             // la copie) — exige un jeton « at least 24 hours old » ET encore
             // valide (refresh_access_token, relevé 2026-09-02). C'est pour ce
@@ -722,8 +799,8 @@ async fn poster_jeton(
     let point = match plateforme {
         PlateformeOauth::X => X_JETON,
         PlateformeOauth::Linkedin => LINKEDIN_JETON,
-        PlateformeOauth::Instagram | PlateformeOauth::InstagramReels => INSTAGRAM_JETON,
-        PlateformeOauth::FacebookPage => FACEBOOK_JETON,
+        PlateformeOauth::Instagram => INSTAGRAM_JETON,
+        PlateformeOauth::FacebookPage | PlateformeOauth::InstagramReels => FACEBOOK_JETON,
         PlateformeOauth::Threads => THREADS_JETON,
         PlateformeOauth::Tiktok => TIKTOK_JETON,
         PlateformeOauth::Youtube => YOUTUBE_JETON,
@@ -794,10 +871,10 @@ pub async fn identite(
     let (point, query): (&str, &[(&str, &str)]) = match plateforme {
         PlateformeOauth::X => (X_ME, &[]),
         PlateformeOauth::Linkedin => (LINKEDIN_USERINFO, &[]),
-        PlateformeOauth::Instagram | PlateformeOauth::InstagramReels => {
-            (INSTAGRAM_ME, &[("fields", "user_id,username")])
+        PlateformeOauth::Instagram => (INSTAGRAM_ME, &[("fields", "user_id,username")]),
+        PlateformeOauth::FacebookPage | PlateformeOauth::InstagramReels => {
+            (FACEBOOK_ME, &[("fields", "id,name")])
         }
-        PlateformeOauth::FacebookPage => (FACEBOOK_ME, &[("fields", "id,name")]),
         PlateformeOauth::Threads => (THREADS_ME, &[("fields", "id,username")]),
         PlateformeOauth::Tiktok => (TIKTOK_USERINFO, &[("fields", "open_id,display_name")]),
         PlateformeOauth::Youtube => (YOUTUBE_CHANNELS, &[("part", "snippet"), ("mine", "true")]),
@@ -884,18 +961,28 @@ fn id_page(id: &str) -> bool {
     !id.is_empty() && id.len() <= 32 && id.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Compte Instagram professionnel lié à une Page
+/// (`instagram_business_account`). Pas le produit Instagram Login.
+pub struct InstagramLie {
+    pub id: String,
+    /// Nom d'utilisateur, pour l'écran de retour. Le handle en base est `id`.
+    pub username: String,
+}
+
 /// Une Page que le membre peut publier. Pas de `Debug` : `jeton` est le
 /// jeton de Page, il ne doit pas finir dans un log.
 pub struct PageFacebook {
     pub id: String,
     pub nom: String,
     pub jeton: Secret,
+    pub instagram: Option<InstagramLie>,
 }
 
-/// `GET /me/accounts?fields=id,name,access_token,tasks`. On ne garde que les
-/// Pages dont la tâche est CREATE_CONTENT ou MANAGE (reels-publishing :
-/// « app user who can perform the CREATE_CONTENT task »). Sans tableau
-/// `tasks`, on garde la Page : le champ est parfois omis.
+/// `GET /me/accounts?fields=id,name,access_token,tasks,instagram_business_account{id,username}`.
+/// On ne garde que les Pages dont la tâche est CREATE_CONTENT ou MANAGE.
+/// Sans tableau `tasks`, on garde la Page : le champ est parfois omis.
+/// `instagram_business_account` est le compte professionnel lié à la Page.
+/// Absent = pas de ligne `instagram_reels` pour cette Page.
 pub fn pages_depuis(
     statut: u16,
     corps: &[u8],
@@ -928,10 +1015,22 @@ pub fn pages_depuis(
             }
         }
         let nom = element.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+        let instagram = element.get("instagram_business_account").and_then(|ig| {
+            let id_ig = ig.get("id").and_then(|v| v.as_str())?;
+            let username = ig.get("username").and_then(|v| v.as_str()).unwrap_or("");
+            if !id_page(id_ig) {
+                return None;
+            }
+            Some(InstagramLie {
+                id: id_ig.to_owned(),
+                username: username.to_owned(),
+            })
+        });
         pages.push(PageFacebook {
             id: id.to_owned(),
             nom: nom.to_owned(),
             jeton: Secret::new(jeton),
+            instagram,
         });
     }
     let suivant = document
@@ -956,7 +1055,13 @@ pub async fn lister_pages(acces: &Secret) -> Result<Vec<PageFacebook>, ErreurPla
         let mut requete = http()
             .get(FACEBOOK_PAGES)
             .bearer_auth(acces.expose_for_transport())
-            .query(&[("fields", "id,name,access_token,tasks"), ("limit", "50")]);
+            .query(&[
+                (
+                    "fields",
+                    "id,name,access_token,tasks,instagram_business_account{id,username}",
+                ),
+                ("limit", "50"),
+            ]);
         if let Some(apres) = &curseur {
             requete = requete.query(&[("after", apres.as_str())]);
         }
@@ -1010,13 +1115,13 @@ pub fn identite_depuis(
         // `{"user_id": "...", "username": "..."}` (ig-user, relevé 2026-09-02).
         // Le username est le handle humain ; `user_id` est l'id que les
         // chemins `/{ig-user-id}/media` exigent.
-        PlateformeOauth::Instagram | PlateformeOauth::InstagramReels => {
-            Ok((champ("/username")?, champ("/user_id")?))
+        PlateformeOauth::Instagram => Ok((champ("/username")?, champ("/user_id")?)),
+        // `GET graph.facebook.com/me?fields=id,name`. L'id est le sujet de
+        // la suppression. Les lignes scellées sont les Pages et les comptes
+        // Instagram liés, pas cet utilisateur.
+        PlateformeOauth::FacebookPage | PlateformeOauth::InstagramReels => {
+            Ok((champ("/name")?, champ("/id")?))
         }
-        // `GET /me?fields=id,name` — l'id est le sujet de la suppression,
-        // le nom n'est que le message du callback. Les comptes scellés sont
-        // les Pages, pas cet utilisateur.
-        PlateformeOauth::FacebookPage => Ok((champ("/name")?, champ("/id")?)),
         // `GET graph.threads.net/v1.0/me?fields=id,username`.
         PlateformeOauth::Threads => Ok((champ("/username")?, champ("/id")?)),
         // `GET /v2/user/info/` enveloppe sous `data.user` (get-user-info,
@@ -1369,26 +1474,14 @@ mod tests {
         // de VERSION_GRAPH qui oublie ces URL casse le test.
         assert!(FACEBOOK_AUTORISATION.contains(crate::adapters::instagram::VERSION_GRAPH));
         assert!(FACEBOOK_JETON.contains(crate::adapters::instagram::VERSION_GRAPH));
-        for (pf, scopes, hote) in [
-            (
-                PlateformeOauth::InstagramReels,
-                INSTAGRAM_REELS_SCOPES,
-                INSTAGRAM_AUTORISATION,
-            ),
-            (
-                PlateformeOauth::FacebookPage,
-                FACEBOOK_PAGE_SCOPES,
-                FACEBOOK_AUTORISATION,
-            ),
-            (
-                PlateformeOauth::Threads,
-                THREADS_SCOPES,
-                THREADS_AUTORISATION,
-            ),
+        for pf in [
+            PlateformeOauth::InstagramReels,
+            PlateformeOauth::FacebookPage,
         ] {
-            let flux = demarrer(
+            let flux = demarrer_facebook_business(
                 pf,
                 "app-2",
+                "1234567890",
                 "https://social-local.orizn.app/oauth/callback",
                 tenant(),
                 &chiffre(),
@@ -1396,31 +1489,54 @@ mod tests {
             .expect("démarrage");
             let params = parametres(&flux.authorize_url);
             assert!(
-                flux.authorize_url.starts_with(hote),
+                flux.authorize_url.starts_with(FACEBOOK_AUTORISATION),
                 "{}",
                 flux.authorize_url
             );
-            assert_eq!(params["scope"], scopes);
+            assert!(!flux.authorize_url.contains("instagram.com"));
+            assert!(!flux.authorize_url.contains("instagram_business"));
+            assert!(!params.contains_key("scope"), "config_id remplace scope");
+            assert_eq!(params["config_id"], "1234567890");
+            assert_eq!(params["override_default_response_type"], "true");
+            assert_eq!(params["response_type"], "code");
             assert_eq!(
                 params["redirect_uri"],
                 "https://social-local.orizn.app/oauth/callback"
             );
             assert!(flux.verifieur_scelle.is_none(), "pas de PKCE documenté");
-            assert!(params.contains_key("state"));
         }
-        // Pas les portées du connecteur historique (messages, commentaires).
-        assert!(!INSTAGRAM_REELS_SCOPES.contains("manage_messages"));
-        assert!(!INSTAGRAM_REELS_SCOPES.contains("manage_comments"));
+        let threads = demarrer(
+            PlateformeOauth::Threads,
+            "app-threads",
+            "https://social-local.orizn.app/oauth/callback",
+            tenant(),
+            &chiffre(),
+        )
+        .expect("threads");
+        assert!(threads.authorize_url.starts_with(THREADS_AUTORISATION));
+        assert_eq!(parametres(&threads.authorize_url)["scope"], THREADS_SCOPES);
+        // La configuration ne demande pas commentaires ni messages : le code
+        // ne les appelle pas. Le connecteur historique, lui, les garde.
+        assert!(!META2_PERMISSIONS_CONFIG.contains(&"instagram_manage_comments"));
+        assert!(!META2_PERMISSIONS_CONFIG.contains(&"instagram_manage_messages"));
+        assert!(!META2_PERMISSIONS_CONFIG.contains(&"ads_management"));
+        assert!(!META2_PERMISSIONS_CONFIG.contains(&"ads_read"));
+        assert!(META2_PERMISSIONS_CONFIG.contains(&"instagram_basic"));
+        assert!(META2_PERMISSIONS_CONFIG.contains(&"instagram_content_publish"));
+        assert!(META2_PERMISSIONS_CONFIG.contains(&"pages_manage_posts"));
         assert!(
             INSTAGRAM_SCOPES.contains("instagram_business_manage_messages"),
             "le connecteur historique garde ses portées"
         );
+        assert!(config_id_meta2_valide("1234567890"));
+        assert!(!config_id_meta2_valide(""));
+        assert!(!config_id_meta2_valide("cfg-1"));
     }
 
     #[test]
     fn les_pages_se_lisent_sans_garder_un_jeton_dans_l_erreur() {
         let corps = br#"{"data":[
-            {"id":"111","name":"Clip","access_token":"JETON-PAGE","tasks":["CREATE_CONTENT"]},
+            {"id":"111","name":"Clip","access_token":"JETON-PAGE","tasks":["CREATE_CONTENT"],"instagram_business_account":{"id":"17841405822304914","username":"cliponit"}},
             {"id":"222","name":"Lecture","access_token":"AUTRE","tasks":["ANALYZE"]},
             {"id":"333","name":"Sans tache","access_token":"JETON-3"}
         ],"paging":{"cursors":{"after":"CURSEUR_1"}}}"#;
@@ -1429,6 +1545,10 @@ mod tests {
         assert_eq!(pages[0].id, "111");
         assert_eq!(pages[0].nom, "Clip");
         assert_eq!(pages[0].jeton.expose_for_transport(), "JETON-PAGE");
+        let ig = pages[0].instagram.as_ref().expect("compte lié");
+        assert_eq!(ig.id, "17841405822304914");
+        assert_eq!(ig.username, "cliponit");
+        assert!(pages[1].instagram.is_none());
         assert_eq!(pages[1].id, "333");
         assert_eq!(suivant.as_deref(), Some("CURSEUR_1"));
         let limite = br#"{"error":{"message":"access_token=NE-DOIT-PAS-FUITER","code":32}}"#;
@@ -1446,10 +1566,10 @@ mod tests {
         let ig = identite_depuis(
             PlateformeOauth::InstagramReels,
             200,
-            br#"{"user_id":"17841405822304914","username":"cliponit"}"#,
+            br#"{"id":"99","name":"Ada"}"#,
         )
         .unwrap();
-        assert_eq!(ig, ("cliponit".into(), "17841405822304914".into()));
+        assert_eq!(ig, ("Ada".into(), "99".into()));
         let fb = identite_depuis(
             PlateformeOauth::FacebookPage,
             200,

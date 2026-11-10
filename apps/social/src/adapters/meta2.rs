@@ -2,14 +2,15 @@
 //!
 //! Trois plateformes, trois jeux de portées, relevés le 2026-11-10 :
 //!
-//! * **`instagram_reels`** — Instagram API with Instagram Login
-//!   (<https://developers.facebook.com/docs/instagram-platform/content-publishing>).
-//!   Conteneur `POST /{ig-user-id}/media` (`media_type=REELS`, `video_url`
-//!   publique), puis `GET /{id}?fields=status_code` jusqu'à `FINISHED`, puis
-//!   `POST /{ig-user-id}/media_publish`. Le permalink vient de
-//!   `GET /{ig-media-id}?fields=permalink`. Portées :
-//!   `instagram_business_basic`, `instagram_business_content_publish`.
-//! * **`facebook_page`** — Facebook Login, jeton de Page
+//! * **`instagram_reels`** — même Facebook Login for Business que la Page
+//!   (pas « Instagram Login » : indisponible, « Invalid platform app »).
+//!   Le compte professionnel est `instagram_business_account` sur la Page.
+//!   Publication sur `graph.facebook.com` :
+//!   `POST /{ig-user-id}/media` (`media_type=REELS`, `video_url`), attente
+//!   de `status_code=FINISHED`, puis `POST /{ig-user-id}/media_publish`.
+//!   Jeton de Page. Permissions : `instagram_basic`,
+//!   `instagram_content_publish`.
+//! * **`facebook_page`** — Facebook Login for Business, jeton de Page
 //!   (<https://developers.facebook.com/docs/video-api/guides/reels-publishing>,
 //!   feed / photos / videos). Portées : `pages_show_list`,
 //!   `pages_manage_posts`, `pages_read_engagement`. Texte → `POST /feed`,
@@ -42,7 +43,6 @@ use crate::medias::DepotMedias;
 const VERSION_GRAPH: &str = super::instagram::VERSION_GRAPH;
 const VERSION_THREADS: &str = "v1.0";
 
-pub const GRAPHE_INSTAGRAM: &str = "https://graph.instagram.com";
 pub const GRAPHE_FACEBOOK: &str = "https://graph.facebook.com";
 pub const GRAPHE_THREADS: &str = "https://graph.threads.net";
 pub const RUPLOAD: &str = "https://rupload.facebook.com";
@@ -359,7 +359,7 @@ pub struct InstagramReels {
 impl InstagramReels {
     pub fn nouvel(ctx: &ContexteAdaptateurs) -> Self {
         Self {
-            socle: Socle::prod(ctx, GRAPHE_INSTAGRAM, RUPLOAD, VERSION_GRAPH),
+            socle: Socle::prod(ctx, GRAPHE_FACEBOOK, RUPLOAD, VERSION_GRAPH),
         }
     }
 
@@ -409,7 +409,12 @@ impl Plateforme for InstagramReels {
         options: &OptionsPost,
     ) -> Apercu {
         let mut refus = Vec::new();
-        let mut infos = vec![CITE_IG_100.to_owned(), CITE_TESTEURS.to_owned()];
+        let mut infos = vec![
+            CITE_IG_100.to_owned(),
+            CITE_TESTEURS.to_owned(),
+            "compte Instagram professionnel lié à la Page (instagram_business_account) — le jeton est celui de la Page, l'hôte est graph.facebook.com"
+                .to_owned(),
+        ];
         refuser_communs(options, sondage, &mut refus, &mut infos);
         if texte.chars().count() > CARACTERES_LEGENDE_IG {
             refus.push(format!(
@@ -473,13 +478,18 @@ impl Plateforme for InstagramReels {
     async fn publier(
         &self,
         jeton: &Secret,
-        _handle: &str,
+        handle: &str,
         texte: &str,
         medias: &[MediaPret],
         sondage: Option<&Sondage>,
         made_with_ai: bool,
         options: &OptionsPost,
     ) -> Result<Publication, ErreurPlateforme> {
+        // Le handle est l'id Instagram (chiffres). Le jeton est celui de la
+        // Page : `/me` serait la Page, pas le compte Instagram.
+        if !id_graphique(handle) {
+            return Err(ErreurPlateforme::Refus { statut: 400 });
+        }
         let vu = self.apercu(texte, medias, sondage, made_with_ai, options);
         if hors_limites(&vu) {
             return Err(ErreurPlateforme::Refus { statut: 400 });
@@ -497,7 +507,13 @@ impl Plateforme for InstagramReels {
         if made_with_ai {
             params.push(paire("is_ai_generated", "true"));
         }
-        let conteneur = id_de(&self.socle.poster("me/media", jeton, &params).await?, "id")?;
+        let conteneur = id_de(
+            &self
+                .socle
+                .poster(&format!("{handle}/media"), jeton, &params)
+                .await?,
+            "id",
+        )?;
         self.socle
             .attendre_code(jeton, &conteneur, "status_code")
             .await?;
@@ -505,7 +521,7 @@ impl Plateforme for InstagramReels {
             &self
                 .socle
                 .poster(
-                    "me/media_publish",
+                    &format!("{handle}/media_publish"),
                     jeton,
                     &[paire("creation_id", &conteneur)],
                 )
@@ -1392,7 +1408,7 @@ mod tests {
         let pub_ = ig
             .publier(
                 &jeton,
-                "compte",
+                "17841405822304914",
                 "légende",
                 &[media],
                 None,
@@ -1410,6 +1426,8 @@ mod tests {
         assert!(journal.contains("is_ai_generated"), "{journal}");
         assert!(journal.contains("creation_id"), "{journal}");
         assert!(journal.contains("media_publish"), "{journal}");
+        assert!(journal.contains("/17841405822304914/media"), "{journal}");
+        assert!(!journal.contains("/me/media"), "{journal}");
         assert!(!journal.contains("client.example"));
         assert!(depot.servir(&digest).is_none(), "le dépôt est retiré");
     }
@@ -1421,7 +1439,7 @@ mod tests {
         let err = ig
             .publier(
                 &jeton(),
-                "compte",
+                "17841405822304914",
                 "légende",
                 &[video(b"x")],
                 None,

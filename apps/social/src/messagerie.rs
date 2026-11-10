@@ -845,6 +845,7 @@ mod tests {
             oauth_google: None,
             oauth_meta2: None,
             oauth_threads: None,
+            meta2_fb_config_id: None,
             linkedin_org: false,
             approval_ttl_hours: 72,
             depot: Arc::new(medias::DepotMedias::new()),

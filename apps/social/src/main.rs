@@ -123,6 +123,10 @@ async fn main() -> anyhow::Result<()> {
         // injoignables à la connexion. N'écrase pas SOCIAL_META_*.
         oauth_meta2: credentiels_env("META2_APP_ID", "META2_APP_SECRET"),
         oauth_threads: credentiels_env("META2_THREADS_APP_ID", "META2_THREADS_APP_SECRET"),
+        meta2_fb_config_id: std::env::var("META2_FB_CONFIG_ID")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty()),
         linkedin_org: drapeau_env("SOCIAL_LINKEDIN_ORG_POSTING"),
         approval_ttl_hours: std::env::var("SOCIAL_APPROVAL_TTL_HOURS")
             .ok()
@@ -134,6 +138,12 @@ async fn main() -> anyhow::Result<()> {
         // (LinkedIn : linkedin::refus_messagerie).
         adaptateurs_messagerie: adapters::adaptateurs_messagerie(&ctx),
     });
+
+    if etat.oauth_meta2.is_some() && etat.meta2_fb_config_id.is_none() {
+        tracing::warn!(
+            "META2_APP_* est posé sans META2_FB_CONFIG_ID — instagram_reels et facebook_page ne démarrent pas de dialogue"
+        );
+    }
 
     let ouvrier = etat.clone();
     tokio::spawn(async move {
@@ -365,7 +375,7 @@ async fn retour_oauth(
         Ok(j) => j,
         Err(e) => return refus(&e.to_string()),
     };
-    if plateforme == "facebook_page" {
+    if plateforme == "facebook_page" || plateforme == "instagram_reels" {
         return finir_facebook(&etat, tenant, tenant_id, jeton).await;
     }
     let (handle, id_plateforme) = match oauth_flux::identite(pf, &jeton.acces).await {
@@ -388,9 +398,9 @@ async fn retour_oauth(
             .ok()
     });
     // L'heure de mort annoncee du jeton : c'est elle que le
-    // rafraichissement PROACTIF (Instagram, Reels, Threads) lit.
+    // rafraichissement PROACTIF (Instagram historique, Threads) lit.
     let duree = Some(jeton.duree_s as i64);
-    let enregistre = if plateforme == "instagram_reels" || plateforme == "threads" {
+    let enregistre = if plateforme == "threads" {
         store::connecter_compte_sujet(
             &etat.pool,
             tenant,
@@ -473,9 +483,11 @@ async fn retour_oauth(
     .into_response()
 }
 
-/// Facebook Login : on ne scelle PAS le jeton utilisateur. Chaque Page avec
-/// le droit de publier devient une ligne `facebook_page`, jeton de Page,
-/// `meta_user_id` = l'utilisateur qui a consenti (suppression de données).
+/// Un seul consentement Facebook Login for Business. On ne scelle PAS le
+/// jeton utilisateur. Chaque Page devient une ligne `facebook_page`. Si
+/// `instagram_business_account` est là, une ligne `instagram_reels` reçoit
+/// le même jeton de Page, avec l'id Instagram comme handle.
+/// `meta_user_id` est l'utilisateur Facebook (suppression de données).
 async fn finir_facebook(
     etat: &mcp::Etat,
     tenant: uuid::Uuid,
@@ -531,14 +543,56 @@ async fn finir_facebook(
         .await
         .is_ok()
         {
-            noms.push(meta_conformite::echapper(&page.nom));
+            let mut ligne = meta_conformite::echapper(&page.nom);
+            if let Some(ig) = &page.instagram {
+                let Ok(scelle_ig) = oauth_flux::sceller_jeton(
+                    &etat.chiffreur,
+                    tenant_id,
+                    "instagram_reels",
+                    &ig.id,
+                    &page.jeton,
+                ) else {
+                    noms.push(format!("{ligne} (Instagram non scellé)"));
+                    continue;
+                };
+                if store::connecter_compte_sujet(
+                    &etat.pool,
+                    tenant,
+                    "instagram_reels",
+                    &ig.id,
+                    Some(&ig.id),
+                    &scelle_ig,
+                    None,
+                    None,
+                    Some(&user_id),
+                )
+                .await
+                .is_ok()
+                {
+                    let qui = if ig.username.is_empty() {
+                        ig.id.clone()
+                    } else {
+                        format!("@{}", ig.username)
+                    };
+                    ligne.push_str(&format!(
+                        " + Instagram {} ({})",
+                        meta_conformite::echapper(&qui),
+                        meta_conformite::echapper(&ig.id)
+                    ));
+                } else {
+                    ligne.push_str(" (Instagram non enregistré)");
+                }
+            } else {
+                ligne.push_str(" (pas de compte Instagram professionnel lié)");
+            }
+            noms.push(ligne);
         }
     }
     if noms.is_empty() {
         return refus("les Pages n'ont pas pu être enregistrées");
     }
     Html(format!(
-        "<p>Pages Facebook connectées pour {} : {}. Vous pouvez fermer cet onglet.</p>",
+        "<p>Comptes connectés pour {} : {}. Vous pouvez fermer cet onglet.</p>",
         meta_conformite::echapper(&nom),
         noms.join(", ")
     ))
@@ -682,6 +736,7 @@ mod tests {
             oauth_google: None,
             oauth_meta2: None,
             oauth_threads: None,
+            meta2_fb_config_id: None,
             linkedin_org: false,
             approval_ttl_hours: 72,
             depot: Arc::new(medias::DepotMedias::new()),
@@ -845,6 +900,7 @@ mod tests {
                 client_secret: agentos_providers::Secret::new(secret),
             }),
             oauth_threads: None,
+            meta2_fb_config_id: None,
             linkedin_org: false,
             approval_ttl_hours: 72,
             depot: Arc::new(medias::DepotMedias::new()),

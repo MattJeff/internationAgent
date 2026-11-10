@@ -60,6 +60,10 @@ pub struct Etat {
     pub oauth_meta2: Option<CredentielsClient>,
     /// App Threads (`META2_THREADS_*`). Absente = plateforme `threads` désactivée.
     pub oauth_threads: Option<CredentielsClient>,
+    /// Id de configuration Facebook Login for Business (`META2_FB_CONFIG_ID`).
+    /// Chiffres, pas un secret. Sans lui, `instagram_reels` et `facebook_page`
+    /// ne démarrent pas de dialogue.
+    pub meta2_fb_config_id: Option<String>,
     /// `SOCIAL_LINKEDIN_ORG_POSTING` : demande `w_organization_social` et
     /// enregistre une ligne de compte par page, en plus du membre.
     pub linkedin_org: bool,
@@ -112,6 +116,7 @@ impl Etat {
 /// Le préfixe des variables d'environnement à citer quand OAuth n'est pas
 /// configuré. `instagram` reste `SOCIAL_META` : le second connecteur ne le
 /// réutilise pas.
+#[cfg(test)]
 pub(crate) fn prefixe_oauth(plateforme: &str) -> String {
     match plateforme {
         "instagram" => "SOCIAL_META".to_owned(),
@@ -119,6 +124,24 @@ pub(crate) fn prefixe_oauth(plateforme: &str) -> String {
         "instagram_reels" | "facebook_page" => "META2_APP".to_owned(),
         "threads" => "META2_THREADS_APP".to_owned(),
         autre => format!("SOCIAL_{}", autre.to_uppercase()),
+    }
+}
+
+/// La phrase montrée quand la connexion est refusée avant le navigateur.
+/// Les noms sont les vrais : `META2_APP_ID`, pas `META2_APP_CLIENT_ID`.
+pub(crate) fn explication_oauth(plateforme: &str) -> String {
+    match plateforme {
+        "instagram" => "poser SOCIAL_META_CLIENT_ID et SOCIAL_META_CLIENT_SECRET".to_owned(),
+        "youtube" => "poser SOCIAL_GOOGLE_CLIENT_ID et SOCIAL_GOOGLE_CLIENT_SECRET".to_owned(),
+        "instagram_reels" | "facebook_page" => {
+            "poser META2_APP_ID, META2_APP_SECRET et META2_FB_CONFIG_ID".to_owned()
+        }
+        "threads" => "poser META2_THREADS_APP_ID et META2_THREADS_APP_SECRET".to_owned(),
+        autre => format!(
+            "poser SOCIAL_{}_CLIENT_ID et SOCIAL_{}_CLIENT_SECRET",
+            autre.to_uppercase(),
+            autre.to_uppercase()
+        ),
     }
 }
 
@@ -797,15 +820,45 @@ async fn connecter(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Err
     // l'echange du retour echouerait de toute facon. Les VRAIS noms de
     // variables — la derivation SOCIAL_{PLATFORM}_* mentirait pour instagram
     // (l'app client vit chez Meta) et youtube (chez Google).
-    let prefixe = prefixe_oauth(plateforme);
     let Some((pf, credentiels)) = etat.oauth(plateforme) else {
         return Err(Erreur::nouvelle(
             "oauth_non_configure",
             format!(
-                "pas de credentials client pour `{plateforme}` — poser {prefixe}_CLIENT_ID et {prefixe}_CLIENT_SECRET"
+                "pas de credentials client pour `{plateforme}` — {}",
+                explication_oauth(plateforme)
             ),
         ));
     };
+    if matches!(plateforme, "instagram_reels" | "facebook_page") {
+        let Some(config) = etat
+            .meta2_fb_config_id
+            .as_deref()
+            .filter(|s| oauth_flux::config_id_meta2_valide(s))
+        else {
+            return Err(Erreur::nouvelle(
+                "oauth_non_configure",
+                "META2_FB_CONFIG_ID est obligatoire (Facebook Login for Business). Sans config_id le dialogue Instagram Login renvoie Invalid platform app",
+            ));
+        };
+        let flux = oauth_flux::demarrer_facebook_business(
+            pf,
+            &credentiels.client_id,
+            config,
+            &etat.redirect_uri(),
+            TenantId::from_uuid(tenant),
+            &etat.chiffreur,
+        )
+        .map_err(|_| Erreur::nouvelle("scellement", "le flux n'a pas pu etre scelle"))?;
+        store::creer_attente_oauth(
+            &etat.pool,
+            &oauth_flux::hex(&flux.empreinte_state),
+            tenant,
+            plateforme,
+            flux.verifieur_scelle.as_deref(),
+        )
+        .await?;
+        return Ok(json!({ "authorization_url": flux.authorize_url }));
+    }
 
     // oauth_flux fabrique le state (32 octets d'OS), le defi PKCE (X) et
     // l'URL ; seul le SHA-256 du state atterrit en base — la table ne permet
@@ -1232,10 +1285,10 @@ pub(crate) fn doit_rafraichir(
     maintenant_epoch: i64,
 ) -> bool {
     const SEPT_JOURS_S: i64 = 7 * 24 * 3600;
-    // Instagram historique, Reels (même ig_refresh_token) et Threads
-    // (th_refresh_token) : le jeton long meurt pour de bon s'il expire.
-    // Le jeton de Page Facebook, lui, n'expire pas.
-    matches!(plateforme, "instagram" | "instagram_reels" | "threads")
+    // Instagram historique (`ig_refresh_token`) et Threads
+    // (`th_refresh_token`) : le jeton long meurt pour de bon s'il expire.
+    // Le Reel du second connecteur scelle un jeton de Page, qui n'expire pas.
+    matches!(plateforme, "instagram" | "threads")
         && expire_epoch.is_some_and(|expire| expire < maintenant_epoch + SEPT_JOURS_S)
 }
 
@@ -2234,6 +2287,7 @@ mod tests {
             oauth_google: None,
             oauth_meta2: None,
             oauth_threads: None,
+            meta2_fb_config_id: None,
             linkedin_org: false,
             approval_ttl_hours: 72,
             depot: Arc::new(medias::DepotMedias::new()),
@@ -2605,14 +2659,16 @@ mod tests {
         assert!(!doit_rafraichir("instagram", None, maintenant));
         // Les autres plateformes ont un refresh token qui survit au jeton :
         // leur chemin est 401 -> refresh, jamais le proactif.
-        for autre in ["x", "linkedin", "tiktok", "youtube", "facebook_page"] {
+        for autre in [
+            "x",
+            "linkedin",
+            "tiktok",
+            "youtube",
+            "facebook_page",
+            "instagram_reels",
+        ] {
             assert!(!doit_rafraichir(autre, Some(maintenant - 1), maintenant));
         }
-        assert!(doit_rafraichir(
-            "instagram_reels",
-            Some(maintenant - 1),
-            maintenant
-        ));
         assert!(doit_rafraichir("threads", Some(maintenant - 1), maintenant));
         assert!(!doit_rafraichir(
             "threads",
@@ -2628,5 +2684,9 @@ mod tests {
         assert_eq!(prefixe_oauth("facebook_page"), "META2_APP");
         assert_eq!(prefixe_oauth("threads"), "META2_THREADS_APP");
         assert_ne!(prefixe_oauth("instagram"), prefixe_oauth("instagram_reels"));
+        let phrase = explication_oauth("instagram_reels");
+        assert!(phrase.contains("META2_FB_CONFIG_ID"));
+        assert!(!phrase.contains("SOCIAL_META"));
+        assert!(!phrase.contains("instagram_business"));
     }
 }
