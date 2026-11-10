@@ -98,6 +98,7 @@ use agentos_app::mcp::Fleet;
 use agentos_app::mocks::ProviderError;
 use agentos_domain::action::McpTool;
 use agentos_domain::ids::Slug;
+use agentos_store::audit::AuditActor;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -383,12 +384,30 @@ async fn approval_propose(
 /// `POST /v1/social/approvals/decide` — approuver, refuser ou éditer.
 ///
 /// Pas un outil d'employé : la table MCP du produit ne déclare pas ce chemin.
+/// Et pas n'importe quelle clé non plus : seul le rôle approbateur décide.
 async fn approval_decide(
     State(fleets): State<Fleets>,
     principal: Principal,
     crate::error::JsonBody(body): crate::error::JsonBody<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    approbateur(&principal.actor)?;
     appeler(&fleets, &principal, OUTILS[11], objet(body)?).await
+}
+
+/// La règle de `routes::approvals`, lue de la même façon : le rôle d'une clé
+/// est son étiquette, et seule `approver` publie ce qu'un employé a proposé.
+/// Sans ce contrôle, toute clé du locataire — un terminal, un assistant tiers
+/// à qui l'on a confié une clé de pilotage — approuvait et faisait partir un
+/// post public.
+fn approbateur(actor: &AuditActor) -> Result<(), ApiError> {
+    if super::approvals::held_role(actor) != Some(agentos_app::gate::APPROVER_ROLE) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "role_required",
+            "this credential does not hold the role this approval requires",
+        ));
+    }
+    Ok(())
 }
 
 /// Les arguments d'un outil sont un objet. Un tableau ou une chaîne est une
@@ -410,6 +429,20 @@ fn objet(body: Value) -> Result<Value, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Seule la clé `approver` décide d'une publication ; une clé de pilotage
+    /// à une autre étiquette, ou le système, est refusée avant tout appel.
+    #[test]
+    fn seul_le_role_approbateur_decide_d_une_publication() {
+        assert!(approbateur(&AuditActor::Operator("approver".to_owned())).is_ok());
+        for etiquette in ["friday", "ops", "owner", "session-1"] {
+            assert!(
+                approbateur(&AuditActor::Operator(etiquette.to_owned())).is_err(),
+                "la clé `{etiquette}` a pu approuver une publication"
+            );
+        }
+        assert!(approbateur(&AuditActor::System).is_err());
+    }
 
     /// Les interdits, et pour chacun un nom hostile qui doit le déclencher.
     /// La même liste que `apps/social/src/mcp.rs` : un interdit qui diverge

@@ -444,7 +444,7 @@ côté des cinq outils produit d'origine :
 
 * `social_calendar_list`, `social_calendar_create`, `social_calendar_set`,
   `social_calendar_remove` — file Postgres `social_scheduled` (migration
-  `0007_file_et_fils.sql`), worker, rejeu par `idempotency_key` ;
+  0007 du service, dans `apps/social/migrations/`), worker, rejeu par `idempotency_key` ;
 * `social_thread_preview_get`, `social_thread_publish` — fil X, échec partiel,
   pas de double envoi au rejeu ;
 * `social_approval_propose` — statut `pending_approval`. Rien ne part.
