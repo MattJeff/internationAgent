@@ -576,7 +576,7 @@ Puis les routes, toutes sous la clé du locataire :
 
 ```
 GET  /v1/social/accounts
-POST /v1/social/accounts/connect   # {"platform":"x|linkedin|instagram|tiktok|youtube"}
+POST /v1/social/accounts/connect   # {"platform":"x|linkedin|instagram|tiktok|youtube|instagram_reels|facebook_page|threads"}
 POST /v1/social/preview
 POST /v1/social/posts              # idempotency_key obligatoire
 GET  /v1/social/posts?limit=<1..200>

@@ -123,6 +123,35 @@ pub async fn connecter_compte(
     sealed_refresh: Option<&[u8]>,
     duree_s: Option<i64>,
 ) -> sqlx::Result<Uuid> {
+    connecter_compte_sujet(
+        pool,
+        tenant,
+        platform,
+        handle,
+        platform_user_id,
+        sealed_token,
+        sealed_refresh,
+        duree_s,
+        None,
+    )
+    .await
+}
+
+/// Comme [`connecter_compte`], avec le sujet Meta (`meta_user_id`) pour la
+/// suppression de données. `None` ne l'efface pas à la reconnexion
+/// (COALESCE). Le connecteur historique passe `None`.
+#[allow(clippy::too_many_arguments)]
+pub async fn connecter_compte_sujet(
+    pool: &PgPool,
+    tenant: Uuid,
+    platform: &str,
+    handle: &str,
+    platform_user_id: Option<&str>,
+    sealed_token: &[u8],
+    sealed_refresh: Option<&[u8]>,
+    duree_s: Option<i64>,
+    meta_user_id: Option<&str>,
+) -> sqlx::Result<Uuid> {
     let ligne = sqlx::query(
         // COALESCE sur platform_user_id : une reconnexion qui ne le porterait
         // pas n'efface jamais un id deja connu — le meme argument que le
@@ -130,16 +159,19 @@ pub async fn connecter_compte(
         // token_expires_at = now() + duree_s : l'heure de mort du jeton frais.
         // NULL quand la duree est inconnue — et une reconnexion ECRASE (pas de
         // COALESCE ici) : le jeton est neuf, son ancienne heure de mort ment.
+        // meta_user_id : NULL entrant ne remplace pas un sujet déjà connu.
         "INSERT INTO social_accounts \
              (id, tenant_id, platform, handle, platform_user_id, sealed_token, sealed_refresh, \
-              token_expires_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8)) \
+              token_expires_at, meta_user_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8), $9) \
          ON CONFLICT (tenant_id, platform, handle) \
          DO UPDATE SET sealed_token = EXCLUDED.sealed_token, \
                        sealed_refresh = EXCLUDED.sealed_refresh, \
                        platform_user_id = COALESCE(EXCLUDED.platform_user_id, \
                                                    social_accounts.platform_user_id), \
                        token_expires_at = EXCLUDED.token_expires_at, \
+                       meta_user_id = COALESCE(EXCLUDED.meta_user_id, \
+                                               social_accounts.meta_user_id), \
                        status = 'connected' \
          RETURNING id",
     )
@@ -151,9 +183,77 @@ pub async fn connecter_compte(
     .bind(sealed_token)
     .bind(sealed_refresh)
     .bind(duree_s.map(|s| s as f64))
+    .bind(meta_user_id)
     .fetch_one(pool)
     .await?;
     Ok(ligne.get("id"))
+}
+
+/// Révoque les jetons du second connecteur pour un utilisateur Meta.
+/// `plateformes` borne l'app (instagram_reels + facebook_page, ou threads).
+/// `instagram` n'y passe pas : le connecteur historique reste.
+pub async fn revoquer_sujet_meta(
+    pool: &PgPool,
+    sujet: &str,
+    plateformes: &[&str],
+) -> sqlx::Result<i64> {
+    let plateformes: Vec<String> = plateformes.iter().map(|s| (*s).to_owned()).collect();
+    let lignes = sqlx::query(
+        "UPDATE social_accounts \
+         SET status = 'revoked', sealed_token = NULL, sealed_refresh = NULL \
+         WHERE meta_user_id = $1 AND platform = ANY($2::text[]) \
+         RETURNING id",
+    )
+    .bind(sujet)
+    .bind(&plateformes)
+    .fetch_all(pool)
+    .await?;
+    Ok(lignes.len() as i64)
+}
+
+pub struct SuppressionMeta {
+    pub code: String,
+    pub app: String,
+    pub comptes: i32,
+    pub quand: String,
+}
+
+pub async fn noter_suppression_meta(
+    pool: &PgPool,
+    code: &str,
+    app: &str,
+    comptes: i32,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO social_meta_deletions (confirmation_code, app, accounts_revoked) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind(code)
+    .bind(app)
+    .bind(comptes)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn lire_suppression_meta(
+    pool: &PgPool,
+    code: &str,
+) -> sqlx::Result<Option<SuppressionMeta>> {
+    let ligne = sqlx::query(
+        "SELECT confirmation_code, app, accounts_revoked, \
+                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS quand \
+         FROM social_meta_deletions WHERE confirmation_code = $1",
+    )
+    .bind(code)
+    .fetch_optional(pool)
+    .await?;
+    Ok(ligne.map(|l| SuppressionMeta {
+        code: l.get("confirmation_code"),
+        app: l.get("app"),
+        comptes: l.get("accounts_revoked"),
+        quand: l.get("quand"),
+    }))
 }
 
 /// Rescelle les jetons d'un compte après un rafraîchissement réussi.

@@ -182,9 +182,9 @@ Les cinq, chaque limite citée et datée dans son adaptateur :
 Les médias (phase médias) : photos, vidéo, sondages, et documents PDF côté
 LinkedIn, dans les ARGUMENTS de `post_preview`/`post_publish` — table
 versions bumpées 1 → 2 (médias) → 3 (IG/TikTok/YouTube) → 4 (fils,
-calendrier, approbation). Les Pages Facebook et le réseau Threads restent
-hors périmètre (revues à déposer — liste ci-dessous). Les fils X, eux, sont
-dans l'éditeur.
+calendrier, approbation) → 5 (`instagram_reels`, `facebook_page`, `threads`).
+Ces trois noms sont le **second connecteur Meta** (runbook plus bas). Ils
+ne remplacent pas `instagram`. Les fils X, eux, sont dans l'éditeur.
 
 ## La seconde surface — `/mcp/messagerie`
 
@@ -370,6 +370,164 @@ liste qu'on relit pour rien :
   API call » avant de soumettre, screencasts, et « Business Verification is
   required to get Advanced Access » (access-levels, rejoué le 2026-09-02).
   Gratuit. **Délai : non publié par la doc.**
+
+### Second connecteur Meta — ClipOnIt (`instagram_reels`, `facebook_page`, `threads`)
+
+Une **autre** app Meta que celle de `SOCIAL_META_*`. Le connecteur
+`instagram` (comptes déjà en base, variables, portées `instagram_business_*`,
+y compris les messages) ne change pas. Il reste sur « Instagram API with
+Instagram Login ». L'app ClipOnIt **968832959273380** n'a pas ce produit :
+il est indisponible pour une app neuve, et `instagram.com/oauth/authorize`
+avec `instagram_business_*` répond **Invalid platform app**.
+
+Ici, un utilisateur ClipOnIt connecte **ses** Pages et le compte Instagram
+professionnel **lié à chaque Page**, plus éventuellement **son** profil
+Threads (autre app, **2410252106173441**). Plusieurs comptes par tenant :
+la clé reste `(tenant, platform, handle)`.
+
+| Plateforme | Activée si | Dialogue |
+|---|---|---|
+| `facebook_page` et `instagram_reels` | `META2_APP_ID`, `META2_APP_SECRET` et `META2_FB_CONFIG_ID` | le même Facebook Login for Business (`config_id`, pas de `scope` dans l'URL) |
+| `threads` | `META2_THREADS_APP_ID` et `META2_THREADS_APP_SECRET` | Threads OAuth, `threads.net` |
+
+`account_connect_url` avec `facebook_page` **ou** `instagram_reels` ouvre
+le même dialogue. Au retour, une ligne `facebook_page` par Page (handle =
+id de Page, jeton de Page) et, si la Page a un
+`instagram_business_account`, une ligne `instagram_reels` (handle = id
+Instagram, **le même jeton de Page**). Publier un Reel :
+`POST https://graph.facebook.com/v27.0/{ig-user-id}/media` (`media_type=REELS`,
+`video_url` = `GET /medias/{digest}`), attente de `status_code=FINISHED`,
+puis `/{ig-user-id}/media_publish`. Pas `graph.instagram.com`, pas `/me`
+(avec un jeton de Page, `/me` est la Page).
+
+**Prérequis.** Le compte Instagram est un compte **professionnel** (Business
+ou Creator) **lié à la Page**. Un compte personnel, ou un compte
+professionnel non lié, n'apparaît pas : la Page est quand même connectée,
+et l'écran de retour le dit.
+
+Les identifiants d'app sont publics. Les secrets restent dans
+l'environnement. `META2_FB_CONFIG_ID` est l'id numérique de la
+configuration, pas un secret. Une variable absente désactive ce qu'elle
+porte : sans `META2_FB_CONFIG_ID`, les deux plateformes Facebook refusent
+`account_connect_url` au lieu d'envoyer quelqu'un sur un dialogue qui
+échoue.
+
+`SOCIAL_PUBLIC_URL` doit être `https://social-local.orizn.app` pour que
+l'URI de redirection soit exactement
+`https://social-local.orizn.app/oauth/callback`. Meta tire les médias sur
+`GET /medias/{digest}`.
+
+#### Ce qu'il faut retirer de l'app ClipOnIt
+
+Oui : retirer les artefacts « Instagram API with Instagram Login ».
+
+* Produit Instagram Login, s'il a été ajouté.
+* Redirect enregistré pour `https://www.instagram.com/oauth/authorize`.
+* Permissions `instagram_business_*`.
+
+Rien de tout cela ne sert cette app. Le redirect
+`https://social-local.orizn.app/oauth/callback` reste, mais **seulement**
+dans Facebook Login for Business → Valid OAuth Redirect URIs, et à part
+sur l'app Threads. L'autre app Meta, celle de `SOCIAL_META_*`, garde
+Instagram Login : ne pas y toucher.
+
+#### Réglages communs
+
+* **App domains** : `cliponit.app`, `social-local.orizn.app`.
+* **Site URL** : `https://cliponit.app`.
+* **Privacy Policy URL** : `https://cliponit.app/privacy`.
+* **Terms of Service URL** : `https://cliponit.app/terms`.
+* **Deauthorize** : `https://social-local.orizn.app/meta/deauthorize`
+  (Threads : `https://social-local.orizn.app/meta/threads/deauthorize`).
+* **Data deletion** : `https://social-local.orizn.app/meta/data-deletion`
+  (Threads : `https://social-local.orizn.app/meta/threads/data-deletion`).
+  La page de statut est
+  `https://social-local.orizn.app/meta/deletion-status?code=…`.
+  Le `signed_request` est vérifié avec le secret de cette app. Les lignes
+  `instagram` (connecteur historique) ne sont pas révoquées.
+
+#### Configuration Facebook Login for Business
+
+Créer une configuration. Coller son id dans `META2_FB_CONFIG_ID`.
+
+* **Token type : User access token.** Pas un system-user token. Le system
+  user ne poste que sur les actifs déjà possédés par KAIROS SAS dans le
+  Business Manager. Ici chaque utilisateur ClipOnIt connecte **sa** Page.
+* **Assets à cocher : Pages, et Instagram accounts.** L'utilisateur choisit
+  ses Pages au login. Le compte Instagram n'est pas un second dialogue :
+  c'est le professionnel déjà lié à la Page, lu ensuite via
+  `instagram_business_account`.
+* **Assets à laisser décochés :** Ad accounts, Catalogs, WhatsApp, Apps.
+* **Permissions, exactement celles-ci, rien d'autre :**
+  * `pages_show_list`
+  * `pages_manage_posts`
+  * `pages_read_engagement`
+  * `instagram_basic`
+  * `instagram_content_publish`
+* **Ne pas ajouter :** `ads_management`, `ads_read`,
+  `instagram_manage_comments`, `instagram_manage_messages`,
+  `instagram_manage_insights`, `business_management`, ni aucun
+  `instagram_business_*`. Commentaires et messages sont optionnels pour
+  plus tard : le code ne les appelle pas, les demander ferait refuser la
+  revue.
+
+Le dialogue est
+`https://www.facebook.com/v27.0/dialog/oauth` avec `config_id`,
+`response_type=code` et `override_default_response_type=true`. Pas de
+paramètre `scope`.
+
+#### Permissions à soumettre en App Review, et le film
+
+Même liste que la configuration. Un appel réel, puis un screencast.
+Compte testeur : rôle sur l'app, rôle `CREATE_CONTENT` ou `MANAGE` sur la
+Page, compte Instagram professionnel lié à cette Page.
+
+1. **`pages_show_list`** — `account_connect_url` (`facebook_page` ou
+   `instagram_reels`, c'est le même URL). Le film montre le consentement
+   puis `accounts_list` : une ligne par Page. C'est `GET /me/accounts`.
+2. **`pages_manage_posts`** — sur la ligne `facebook_page` : un texte, une
+   photo, une vidéo, puis une vidéo avec `placement=reel`. Le film montre
+   chaque post sur la Page.
+3. **`pages_read_engagement`** — le permalink vient de `permalink_url`, et
+   `post_metrics` montre réactions, commentaires, partages.
+4. **`instagram_basic`** — le même consentement a créé la ligne
+   `instagram_reels` (id Instagram, nom `@…` sur l'écran de retour). Le
+   film s'arrête sur `accounts_list`. C'est le champ
+   `instagram_business_account`.
+5. **`instagram_content_publish`** — `post_preview` d'une vidéo MP4, puis
+   `post_publish` avec la même clé et les `expected_media_digests`, sur le
+   compte `instagram_reels`. Le film montre le Reel et le permalink.
+6. **`threads_basic`** et **`threads_content_publish`** — connexion
+   `platform=threads`, puis un texte et une vidéo. Le film montre le post
+   sur Threads.
+
+Optionnelles, **pas** dans la configuration tant que le code ne les appelle
+pas : `instagram_manage_comments`, `instagram_manage_messages`.
+
+#### Business Verification — KAIROS SAS
+
+L'accès au-delà des rôles de l'app exige la vérification. Business Manager
+→ Security Center.
+
+* Nom légal au registre : **KAIROS SAS**.
+* Pays, adresse, téléphone et `https://cliponit.app` : les reprendre sur
+  l'extrait **Kbis** récent.
+* Pièces habituelles : Kbis, un document d'adresse au nom de KAIROS SAS,
+  vérification DNS de `cliponit.app`. Lier l'app **968832959273380** et
+  l'app Threads **2410252106173441** à ce Business Manager.
+
+#### Avant la revue
+
+* Development : seuls les rôles de l'app (admin, développeur, testeur)
+  passent le dialogue. Un utilisateur ClipOnIt quelconque est refusé.
+  C'est attendu. Il n'y a pas d'invitation « Instagram Tester » sur ce
+  produit : le testeur Facebook doit gérer la Page, et l'Instagram
+  professionnel doit y être lié.
+* Plafonds cités par l'aperçu : 100 posts API Instagram / 24 h (sous-code
+  2207042, quota vivant `content_publishing_limit`), 30 Reels de Page /
+  24 h, 250 posts Threads / 24 h. `limite_publication`, sans recopier le
+  corps Graph.
+* Passer l'app en Live après la revue et la vérification.
 
 ### TikTok — jour un en Sandbox, puis l'audit qui lève SELF_ONLY
 
