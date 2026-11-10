@@ -85,6 +85,10 @@ pub(crate) async fn passer(etat: &mcp::Etat) -> Result<(), Erreur> {
     };
     match executer(etat, &ligne).await {
         Ok(valeur) => {
+            if ligne.kind == "youtube" {
+                store::marquer_file_resultat(&etat.pool, ligne.id, &valeur).await?;
+                return Ok(());
+            }
             let etat_pub = valeur
                 .get("status")
                 .and_then(Value::as_str)
@@ -135,6 +139,8 @@ pub(crate) async fn executer(etat: &mcp::Etat, ligne: &LigneFile) -> Result<Valu
     }
     if ligne.kind == "thread" {
         mcp::publier_fil(etat, ligne.tenant_id, &args, true).await
+    } else if ligne.kind == "youtube" {
+        crate::youtube_outils::executer_depuis_la_file(etat, ligne).await
     } else {
         mcp::publier_depuis_la_file(etat, ligne.tenant_id, &args).await
     }

@@ -68,9 +68,10 @@ d'un tiers.
 ## Le contrat des outils d'éditeur
 
 Les six outils d'origine restent. La table v4 (phase 1, novembre 2026) en
-ajoute pour les fils, le calendrier et l'approbation. `approval_decide` est
-sur le service pour la route opérateur ; il n'est pas dans la table des
-employés.
+ajoute pour les fils, le calendrier et l'approbation. La table v5 ajoute la
+gestion YouTube (chaîne, vidéos, playlists, commentaires, sous-titres,
+Analytics) — la liste est plus bas. `approval_decide` est sur le service
+pour la route opérateur ; il n'est pas dans la table des employés.
 
 | Outil | Entrée | Sortie |
 |---|---|---|
@@ -87,6 +88,45 @@ employés.
 | `schedule_cancel` | `{ scheduled_id, publish_at? }` | annule, ou déplace si `publish_at` est posé |
 | `submit_for_approval` | post ou fil | `pending_approval`. Rien ne part |
 | `approval_decide` | `{ scheduled_id, decision: approve\|reject\|edit }` | humain seulement |
+
+### YouTube — gestion de chaîne (table v5)
+
+Un outil par compte déjà connecté (`account_id`, le même que pour publier).
+Les écritures exigent `idempotency_key`. Suppressions, changements de
+visibilité (`privacy`, `publish_at`) et modération de commentaires ne
+parlent pas à YouTube : elles posent une ligne `pending_approval`, et
+`approval_decide` les joue. Le reste part tout de suite.
+
+| Outil | Rôle |
+|---|---|
+| `youtube_channel_get` | description, mots-clés, pays, langue, bande-annonce |
+| `youtube_channel_update` | fusionne `brandingSettings` (l'API remplace toute la partie) |
+| `youtube_video_update` | titre, description, tags, catégorie, `made_for_kids` |
+| `youtube_video_visibility` | `privacy` / `publish_at` — approbation |
+| `youtube_video_delete` | suppression — approbation |
+| `youtube_playlists_list` / `youtube_playlist_create` / `youtube_playlist_update` | playlists |
+| `youtube_playlist_visibility` / `youtube_playlist_delete` | visibilité et suppression — approbation |
+| `youtube_playlist_items_list` / `youtube_playlist_item_add` / `youtube_playlist_item_reorder` | éléments |
+| `youtube_playlist_item_remove` | retrait — approbation |
+| `youtube_comments_list` | fils d'une vidéo, ou de toute la chaîne si `video_id` est absent |
+| `youtube_comment_create` | commentaire (`video_id`) ou suite (`parent_id`) |
+| `youtube_comment_moderate` | `heldForReview` / `published` / `rejected` — approbation |
+| `youtube_comment_delete` | suppression — approbation |
+| `youtube_captions_list` / `youtube_caption_upload` / `youtube_caption_download` | sous-titres |
+| `youtube_caption_delete` | suppression — approbation |
+| `youtube_analytics_report` | vues, watch time, abonnés gagnés/perdus, par dates, chaîne ou vidéo |
+
+Les miroirs employé sont `social_youtube_*` (`docs/SOCIAL_APPS_SETUP.md`).
+
+**Non supporté, et non simulé** : les liens de la section À propos, les posts
+Communauté, l'édition de la bannière. `youtube_channel_update` préserve
+`brandingSettings.image` pour ne pas effacer une bannière déjà en place ; il
+n'en pose pas une nouvelle.
+
+Un compte connecté avant la v5 n'a pas `youtube.readonly` ni
+`yt-analytics.readonly`. `youtube_analytics_report` répond
+`scopes_insuffisants` et demande un passage par `account_connect_url`. Les
+autres appels Data API, couverts par `youtube.force-ssl`, continuent.
 
 Transport : `POST /mcp` (JSON-RPC 2.0 : `initialize`, `tools/list`,
 `tools/call`), `GET /livez`. Auth : `Authorization: Bearer <jeton par
@@ -182,7 +222,7 @@ Les cinq, chaque limite citée et datée dans son adaptateur :
 Les médias (phase médias) : photos, vidéo, sondages, et documents PDF côté
 LinkedIn, dans les ARGUMENTS de `post_preview`/`post_publish` — table
 versions bumpées 1 → 2 (médias) → 3 (IG/TikTok/YouTube) → 4 (fils,
-calendrier, approbation). Les Pages Facebook et le réseau Threads restent
+calendrier, approbation) → 5 (gestion de chaîne YouTube et Analytics). Les Pages Facebook et le réseau Threads restent
 hors périmètre (revues à déposer — liste ci-dessous). Les fils X, eux, sont
 dans l'éditeur.
 
@@ -396,14 +436,23 @@ liste qu'on relit pour rien :
 ### Google/YouTube — jour un en Testing, DEUX verrous INDÉPENDANTS
 
 * **Portail** : https://console.cloud.google.com.
-* **Jour un** : projet + YouTube Data API v3 + écran de consentement
-  (external), le fondateur en test user. ATTENTION : en Testing « a
-  publishing status of "Testing" is issued a refresh token expiring in
-  7 days » (oauth2, rejoué le 2026-09-02) — reconnexion hebdomadaire jusqu'à
-  la vérification. Autre limite citée en dur dans `oauth_flux.rs` : 100
-  refresh tokens par compte Google et par client_id, le plus ancien meurt en
-  silence. Poser `SOCIAL_GOOGLE_CLIENT_ID` / `SOCIAL_GOOGLE_CLIENT_SECRET`
-  (GOOGLE et pas YOUTUBE : l'app cliente vit chez Google).
+* **Jour un** : projet + YouTube Data API v3 + **YouTube Analytics API**
+  + écran de consentement (external), le fondateur en test user. ATTENTION :
+  en Testing « a publishing status of "Testing" is issued a refresh token
+  expiring in 7 days » (oauth2, rejoué le 2026-09-02) — reconnexion
+  hebdomadaire jusqu'à la vérification. Autre limite citée en dur dans
+  `oauth_flux.rs` : 100 refresh tokens par compte Google et par client_id,
+  le plus ancien meurt en silence. Poser `SOCIAL_GOOGLE_CLIENT_ID` /
+  `SOCIAL_GOOGLE_CLIENT_SECRET` (GOOGLE et pas YOUTUBE : l'app cliente vit
+  chez Google).
+* **Portées demandées** (espaces, relevé le 2026-11-10) :
+  `youtube.upload`, `youtube.force-ssl`, `youtube.readonly`,
+  `yt-analytics.readonly`. `reports.query` exige `youtube.readonly` par son
+  nom (« API requests to this method now require access to the
+  `youtube.readonly` scope », page datée 2026-10-15) en plus de
+  `yt-analytics.readonly` pour les métriques d'activité. Le geste opérateur
+  (activer l'API, redémarrer, reconnecter les deux chaînes) est dans
+  `docs/SOCIAL_APPS_SETUP.md`.
 * **Verrou 1 — la vérification OAuth** (passage en production + scopes
   sensibles) : lève l'écran « unverified app » et le cap de 100 utilisateurs.
 * **Verrou 2 — l'audit YouTube**

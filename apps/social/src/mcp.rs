@@ -113,13 +113,24 @@ impl Etat {
 /// v4 (phase 1) : fils X, calendrier, approbation. Les six outils d'origine
 /// gardent leurs champs ; `placement` et `delivery` s'ajoutent, optionnels.
 /// `publish_at` est honoré partout par la file durable.
-pub const VERSION_TABLE: &str = "4";
+/// v5 : gestion YouTube (chaîne, vidéos, playlists, commentaires, captions,
+/// Analytics). Les suppressions, la visibilité et la modération passent par
+/// la file d'approbation.
+pub const VERSION_TABLE: &str = "5";
 
 /// La table d'éditeur. Le pin SHA-256 du runtime la fige : tout ajout bumpe
 /// [`VERSION_TABLE`]. `approval_decide` est un outil du service pour que la
 /// route opérateur puisse l'appeler ; il n'est pas recopié dans la table des
 /// employés (`crates/app/src/mcp_tools/social.rs`).
 pub fn description_outils() -> Value {
+    let mut outils = description_base();
+    if let Some(liste) = outils.as_array_mut() {
+        liste.extend(crate::youtube_outils::descriptions());
+    }
+    outils
+}
+
+fn description_base() -> Value {
     json!([
         {
             "name": "accounts_list",
@@ -740,6 +751,9 @@ async fn appeler_outil(
         "schedule_cancel" => annuler_outil(etat, tenant, args).await,
         "submit_for_approval" => programmer_outil(etat, tenant, args, false).await,
         "approval_decide" => decider_outil(etat, tenant, args).await,
+        nom if crate::youtube_outils::est_outil(nom) => {
+            crate::youtube_outils::appeler(etat, tenant, nom, args).await
+        }
         "posts_list" => {
             let limite = args
                 .get("limit")
@@ -1189,6 +1203,7 @@ async fn jeton_rafraichi(
         &sealed_token,
         sealed_refresh.as_deref(),
         Some(emis.duree_s as i64),
+        emis.scopes.as_deref(),
     )
     .await
     .ok()?;
@@ -1806,6 +1821,12 @@ async fn decider_outil(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value,
                     "on n'édite qu'une ligne en attente",
                 ));
             }
+            if actuelle.kind == "youtube" {
+                return Err(Erreur::nouvelle(
+                    "approbation_figee",
+                    "une action YouTube ne s'édite pas : la refuser et la resoumettre",
+                ));
+            }
             let mut payload = actuelle.payload.clone();
             if let Some(objet) = payload.as_object_mut() {
                 for cle in [
@@ -1845,10 +1866,13 @@ async fn decider_outil(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value,
             // Dû maintenant : le worker pourrait le prendre. On le poste ici
             // pour que l'humain voie le résultat de son clic.
             let mut immediate = ligne;
+            let kind = immediate.kind.clone();
             immediate.status = "publishing".to_owned();
             match file::executer(etat, &immediate).await {
                 Ok(valeur) => {
-                    if let Some(post_id) = valeur
+                    if kind == "youtube" {
+                        store::marquer_file_resultat(&etat.pool, id, &valeur).await?;
+                    } else if let Some(post_id) = valeur
                         .get("post_id")
                         .and_then(|v| v.as_str())
                         .and_then(|s| Uuid::parse_str(s).ok())
@@ -1984,25 +2008,32 @@ mod tests {
     }
 
     #[test]
-    fn la_table_expose_exactement_les_six_outils_convenus() {
-        assert_eq!(
-            noms_de_la_table(),
-            [
-                "accounts_list",
-                "account_connect_url",
-                "post_preview",
-                "post_publish",
-                "post_metrics",
-                "posts_list",
-                "thread_preview",
-                "thread_publish",
-                "calendar_list",
-                "schedule_post",
-                "schedule_cancel",
-                "submit_for_approval",
-                "approval_decide",
-            ]
+    fn la_table_expose_les_outils_convenus() {
+        let mut attendus = [
+            "accounts_list",
+            "account_connect_url",
+            "post_preview",
+            "post_publish",
+            "post_metrics",
+            "posts_list",
+            "thread_preview",
+            "thread_publish",
+            "calendar_list",
+            "schedule_post",
+            "schedule_cancel",
+            "submit_for_approval",
+            "approval_decide",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        attendus.extend(
+            crate::youtube_outils::descriptions()
+                .iter()
+                .filter_map(|o| o["name"].as_str())
+                .map(str::to_owned),
         );
+        assert_eq!(noms_de_la_table(), attendus);
     }
 
     // -- Le test de version : changer un schema sans bumper echoue. ---------
@@ -2036,6 +2067,11 @@ mod tests {
         (
             "4",
             "6fafe523394acc902b86150208403d169c242e705da30e2b64b500cde568f9c7",
+        ),
+        // v5 : gestion YouTube. L'empreinte est figée au premier passage vert.
+        (
+            "5",
+            "dcbb78859ac58e51ac68a8cd4ba8ce018e8aa458ec69725899b2606b19451dd2",
         ),
     ];
 
@@ -2176,6 +2212,7 @@ mod tests {
             "agent_test",
             None,
             &scelle,
+            None,
             None,
             None,
         )

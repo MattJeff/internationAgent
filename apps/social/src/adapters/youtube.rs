@@ -37,8 +37,9 @@
 //!
 //! Restes nommés (pas de stub) : la reprise d'upload (`bytes */TOTAL`) —
 //! ponytail: échec net + rejeu par clé d'idempotence, la reprise mi-vol
-//! viendra si les uploads réels cassent ; captions.insert (400 unités,
-//! docs/captions/insert) — aucun argument d'outil ne la porte.
+//! viendra si les uploads réels cassent. La gestion de chaîne (chaîne,
+//! vidéos, playlists, commentaires, captions, Analytics) vit dans
+//! `youtube_gestion` — captions.insert y est câblé, plus ici en reste.
 
 use agentos_providers::Secret;
 use async_trait::async_trait;

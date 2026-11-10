@@ -34,6 +34,10 @@ pub struct CompteScelle {
     /// une fonction pure sur deux nombres. None = inconnue (compte d'avant
     /// 0006) : pas de rafraîchissement proactif, le chemin 401 fait foi.
     pub token_expires_epoch: Option<i64>,
+    /// Portées accordées au consentement (`scope` du point de jeton).
+    /// None = compte connecté avant 0008 : les outils qui exigent une portée
+    /// ajoutée depuis (Analytics YouTube) renvoient vers account_connect_url.
+    pub oauth_scopes: Option<String>,
 }
 
 /// Une ligne de social_posts, telle que les outils la rendent.
@@ -90,7 +94,8 @@ pub async fn compte_scelle(
 ) -> sqlx::Result<Option<CompteScelle>> {
     let ligne = sqlx::query(
         "SELECT id, platform, handle, platform_user_id, sealed_token, sealed_refresh, \
-                EXTRACT(EPOCH FROM token_expires_at)::bigint AS token_expires_epoch \
+                EXTRACT(EPOCH FROM token_expires_at)::bigint AS token_expires_epoch, \
+                oauth_scopes \
          FROM social_accounts WHERE id = $1 AND tenant_id = $2",
     )
     .bind(compte)
@@ -105,13 +110,14 @@ pub async fn compte_scelle(
         sealed_token: l.get("sealed_token"),
         sealed_refresh: l.get("sealed_refresh"),
         token_expires_epoch: l.get("token_expires_epoch"),
+        oauth_scopes: l.get("oauth_scopes"),
     }))
 }
 
 /// Connecte (ou reconnecte) un compte. L'upsert est ce qui permet a l'AAD de
 /// porter le handle : la ligne survit a la reconnexion, le scellement aussi.
-// Huit paramètres plats pour un INSERT plat : les grouper dans une struct ne
-// ferait que déplacer les mêmes huit noms — le SQL en dessous est la vérité.
+// Paramètres plats pour un INSERT plat : les grouper dans une struct ne
+// ferait que déplacer les mêmes noms — le SQL en dessous est la vérité.
 #[allow(clippy::too_many_arguments)]
 pub async fn connecter_compte(
     pool: &PgPool,
@@ -122,24 +128,27 @@ pub async fn connecter_compte(
     sealed_token: &[u8],
     sealed_refresh: Option<&[u8]>,
     duree_s: Option<i64>,
+    oauth_scopes: Option<&str>,
 ) -> sqlx::Result<Uuid> {
     let ligne = sqlx::query(
         // COALESCE sur platform_user_id : une reconnexion qui ne le porterait
         // pas n'efface jamais un id deja connu — le meme argument que le
-        // refresh token dans resceller_jetons.
+        // refresh token dans resceller_jetons. Pareil pour oauth_scopes :
+        // un flux qui ne les rapporte pas ne vide pas celles qu'on a.
         // token_expires_at = now() + duree_s : l'heure de mort du jeton frais.
         // NULL quand la duree est inconnue — et une reconnexion ECRASE (pas de
         // COALESCE ici) : le jeton est neuf, son ancienne heure de mort ment.
         "INSERT INTO social_accounts \
              (id, tenant_id, platform, handle, platform_user_id, sealed_token, sealed_refresh, \
-              token_expires_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8)) \
+              token_expires_at, oauth_scopes) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8), $9) \
          ON CONFLICT (tenant_id, platform, handle) \
          DO UPDATE SET sealed_token = EXCLUDED.sealed_token, \
                        sealed_refresh = EXCLUDED.sealed_refresh, \
                        platform_user_id = COALESCE(EXCLUDED.platform_user_id, \
                                                    social_accounts.platform_user_id), \
                        token_expires_at = EXCLUDED.token_expires_at, \
+                       oauth_scopes = COALESCE(EXCLUDED.oauth_scopes, social_accounts.oauth_scopes), \
                        status = 'connected' \
          RETURNING id",
     )
@@ -151,6 +160,7 @@ pub async fn connecter_compte(
     .bind(sealed_token)
     .bind(sealed_refresh)
     .bind(duree_s.map(|s| s as f64))
+    .bind(oauth_scopes)
     .fetch_one(pool)
     .await?;
     Ok(ligne.get("id"))
@@ -169,14 +179,17 @@ pub async fn resceller_jetons(
     sealed_token: &[u8],
     sealed_refresh: Option<&[u8]>,
     duree_s: Option<i64>,
+    oauth_scopes: Option<&str>,
 ) -> sqlx::Result<()> {
     sqlx::query(
         // Meme COALESCE pour l'heure de mort que pour le refresh : une duree
         // absente ne remplace pas une heure connue par NULL — mais une duree
-        // connue ecrase, le jeton vient d'etre re-emis.
+        // connue ecrase, le jeton vient d'etre re-emis. Les portées aussi :
+        // un refresh qui ne les répète pas ne les efface pas.
         "UPDATE social_accounts \
          SET sealed_token = $3, sealed_refresh = COALESCE($4, sealed_refresh), \
-             token_expires_at = COALESCE(now() + make_interval(secs => $5), token_expires_at) \
+             token_expires_at = COALESCE(now() + make_interval(secs => $5), token_expires_at), \
+             oauth_scopes = COALESCE($6, oauth_scopes) \
          WHERE id = $1 AND tenant_id = $2",
     )
     .bind(compte)
@@ -184,6 +197,7 @@ pub async fn resceller_jetons(
     .bind(sealed_token)
     .bind(sealed_refresh)
     .bind(duree_s.map(|s| s as f64))
+    .bind(oauth_scopes)
     .execute(pool)
     .await?;
     Ok(())
@@ -435,6 +449,8 @@ pub struct LigneFile {
     pub status: String,
     pub attempts: i32,
     pub post_id: Option<Uuid>,
+    /// Réponse d'une action YouTube déjà jouée, pour le rejeu de la clé.
+    pub result: Option<serde_json::Value>,
 }
 
 fn ligne_file(l: &sqlx::postgres::PgRow) -> LigneFile {
@@ -450,11 +466,14 @@ fn ligne_file(l: &sqlx::postgres::PgRow) -> LigneFile {
         status: l.get("status"),
         attempts: l.get("attempts"),
         post_id: l.get("post_id"),
+        result: l.get("result"),
     }
 }
 
+const COLS_FILE: &str = "id, tenant_id, account_id, idempotency_key, kind, payload, \
+     digest, publish_at, status, attempts, post_id, result";
 const SELECT_FILE: &str = "SELECT id, tenant_id, account_id, idempotency_key, kind, payload, \
-     digest, publish_at, status, attempts, post_id FROM social_scheduled";
+     digest, publish_at, status, attempts, post_id, result FROM social_scheduled";
 
 /// Création, ou rejeu de la même clé et du même digest.
 pub enum PoseFile {
@@ -485,7 +504,7 @@ pub async fn poser_file(
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
          ON CONFLICT (tenant_id, idempotency_key) DO NOTHING \
          RETURNING {cols}",
-        cols = "id, tenant_id, account_id, idempotency_key, kind, payload, digest, publish_at, status, attempts, post_id"
+        cols = "id, tenant_id, account_id, idempotency_key, kind, payload, digest, publish_at, status, attempts, post_id, result"
     )))
     .bind(Uuid::now_v7())
     .bind(tenant)
@@ -578,7 +597,7 @@ pub async fn prendre_echeance(pool: &PgPool) -> sqlx::Result<Option<LigneFile>> 
              FOR UPDATE SKIP LOCKED \
              LIMIT 1 \
          ) RETURNING {cols}",
-        cols = "id, tenant_id, account_id, idempotency_key, kind, payload, digest, publish_at, status, attempts, post_id"
+        cols = "id, tenant_id, account_id, idempotency_key, kind, payload, digest, publish_at, status, attempts, post_id, result"
     )))
     .fetch_optional(pool)
     .await?;
@@ -595,6 +614,42 @@ pub async fn marquer_file_publiee(pool: &PgPool, id: Uuid, post_id: Uuid) -> sql
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Une action YouTube jouée : pas de ligne `social_posts`, la réponse tient
+/// dans `result` pour le rejeu.
+pub async fn marquer_file_resultat(
+    pool: &PgPool,
+    id: Uuid,
+    resultat: &serde_json::Value,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE social_scheduled SET status = 'published', result = $2, updated_at = now() \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(resultat)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Reprend une action YouTube `failed` pour un rejeu de la même clé.
+pub async fn relancer_action_echouee(
+    pool: &PgPool,
+    tenant: Uuid,
+    id: Uuid,
+) -> sqlx::Result<Option<LigneFile>> {
+    let ligne = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE social_scheduled SET status = 'publishing', updated_at = now() \
+         WHERE id = $1 AND tenant_id = $2 AND status = 'failed' \
+         RETURNING {COLS_FILE}"
+    )))
+    .bind(id)
+    .bind(tenant)
+    .fetch_optional(pool)
+    .await?;
+    Ok(ligne.as_ref().map(ligne_file))
 }
 
 /// Recule la ligne. `reprendre` faux = tentatives épuisées, statut `failed`.
@@ -635,7 +690,7 @@ pub async fn decider_file(
              next_attempt_at = COALESCE(publish_at, now()), updated_at = now() \
          WHERE id = $1 AND tenant_id = $2 AND status = 'pending_approval' \
          RETURNING {cols}",
-        cols = "id, tenant_id, account_id, idempotency_key, kind, payload, digest, publish_at, status, attempts, post_id"
+        cols = "id, tenant_id, account_id, idempotency_key, kind, payload, digest, publish_at, status, attempts, post_id, result"
     )))
     .bind(id)
     .bind(tenant)
@@ -657,7 +712,7 @@ pub async fn editer_file(
         "UPDATE social_scheduled SET payload = $3, digest = $4, updated_at = now() \
          WHERE id = $1 AND tenant_id = $2 AND status = 'pending_approval' \
          RETURNING {cols}",
-        cols = "id, tenant_id, account_id, idempotency_key, kind, payload, digest, publish_at, status, attempts, post_id"
+        cols = "id, tenant_id, account_id, idempotency_key, kind, payload, digest, publish_at, status, attempts, post_id, result"
     )))
     .bind(id)
     .bind(tenant)
@@ -678,7 +733,7 @@ pub async fn annuler_file(
          WHERE id = $1 AND tenant_id = $2 \
            AND status IN ('scheduled', 'pending_approval') \
          RETURNING {cols}",
-        cols = "id, tenant_id, account_id, idempotency_key, kind, payload, digest, publish_at, status, attempts, post_id"
+        cols = "id, tenant_id, account_id, idempotency_key, kind, payload, digest, publish_at, status, attempts, post_id, result"
     )))
     .bind(id)
     .bind(tenant)
@@ -699,7 +754,7 @@ pub async fn reprogrammer_file(
          WHERE id = $1 AND tenant_id = $2 \
            AND status IN ('scheduled', 'pending_approval') \
          RETURNING {cols}",
-        cols = "id, tenant_id, account_id, idempotency_key, kind, payload, digest, publish_at, status, attempts, post_id"
+        cols = "id, tenant_id, account_id, idempotency_key, kind, payload, digest, publish_at, status, attempts, post_id, result"
     )))
     .bind(id)
     .bind(tenant)
