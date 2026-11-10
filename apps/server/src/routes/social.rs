@@ -138,6 +138,35 @@ const OUTILS: &[&str] = &[
     "schedule-cancel",
     "submit-for-approval",
     "approval-decide",
+    "youtube-channel-get",
+    "youtube-channel-update",
+    "youtube-video-update",
+    "youtube-video-visibility",
+    "youtube-video-delete",
+    "youtube-playlists-list",
+    "youtube-playlist-create",
+    "youtube-playlist-update",
+    "youtube-playlist-visibility",
+    "youtube-playlist-delete",
+    "youtube-playlist-items-list",
+    "youtube-playlist-item-add",
+    "youtube-playlist-item-reorder",
+    "youtube-playlist-item-remove",
+    "youtube-comments-list",
+    "youtube-comment-create",
+    "youtube-comment-moderate",
+    "youtube-comment-delete",
+    "youtube-captions-list",
+    "youtube-caption-upload",
+    "youtube-caption-download",
+    "youtube-caption-delete",
+    "youtube-analytics-report",
+    "youtube-report-types-list",
+    "youtube-reporting-job-create",
+    "youtube-reporting-jobs-list",
+    "youtube-reporting-job-delete",
+    "youtube-reporting-reports-list",
+    "youtube-reporting-report-get",
 ];
 
 /// Ce module.
@@ -156,6 +185,86 @@ pub fn router(fleets: Fleets) -> Router {
         .route("/v1/social/approvals", post(approval_propose))
         // Humain seulement : absent de la table d'outils des employés.
         .route("/v1/social/approvals/decide", post(approval_decide))
+        .route(
+            "/v1/social/youtube/channel",
+            get(yt_channel_get).post(yt_channel_update),
+        )
+        .route(
+            "/v1/social/youtube/playlists",
+            get(yt_playlists_list).post(yt_playlist_create),
+        )
+        .route(
+            "/v1/social/youtube/playlists/update",
+            post(yt_playlist_update),
+        )
+        .route(
+            "/v1/social/youtube/playlists/visibility",
+            post(yt_playlist_visibility),
+        )
+        .route(
+            "/v1/social/youtube/playlists/delete",
+            post(yt_playlist_delete),
+        )
+        .route(
+            "/v1/social/youtube/playlist-items",
+            get(yt_items_list).post(yt_item_add),
+        )
+        .route(
+            "/v1/social/youtube/playlist-items/reorder",
+            post(yt_item_reorder),
+        )
+        .route(
+            "/v1/social/youtube/playlist-items/remove",
+            post(yt_item_remove),
+        )
+        .route("/v1/social/youtube/videos/update", post(yt_video_update))
+        .route(
+            "/v1/social/youtube/videos/visibility",
+            post(yt_video_visibility),
+        )
+        .route("/v1/social/youtube/videos/delete", post(yt_video_delete))
+        .route(
+            "/v1/social/youtube/comments",
+            get(yt_comments_list).post(yt_comment_create),
+        )
+        .route(
+            "/v1/social/youtube/comments/moderate",
+            post(yt_comment_moderate),
+        )
+        .route(
+            "/v1/social/youtube/comments/delete",
+            post(yt_comment_delete),
+        )
+        .route(
+            "/v1/social/youtube/captions",
+            get(yt_captions_list).post(yt_caption_upload),
+        )
+        .route(
+            "/v1/social/youtube/captions/download",
+            get(yt_caption_download),
+        )
+        .route(
+            "/v1/social/youtube/captions/delete",
+            post(yt_caption_delete),
+        )
+        .route("/v1/social/youtube/analytics", get(yt_analytics))
+        .route("/v1/social/youtube/report-types", get(yt_report_types))
+        .route(
+            "/v1/social/youtube/reporting-jobs",
+            get(yt_reporting_jobs).post(yt_reporting_job_create),
+        )
+        .route(
+            "/v1/social/youtube/reporting-jobs/delete",
+            post(yt_reporting_job_delete),
+        )
+        .route(
+            "/v1/social/youtube/reporting-reports",
+            get(yt_reporting_reports),
+        )
+        .route(
+            "/v1/social/youtube/reporting-reports/get",
+            get(yt_reporting_report),
+        )
         .with_state(fleets)
 }
 
@@ -413,6 +522,137 @@ fn approbateur(actor: &AuditActor) -> Result<(), ApiError> {
 /// Les arguments d'un outil sont un objet. Un tableau ou une chaîne est une
 /// requête que ce client ne sait pas faire, et le dire ici épargne un
 /// aller-retour réseau.
+fn args_query(q: &std::collections::HashMap<String, String>, cles: &[&str]) -> Value {
+    let mut arguments = serde_json::Map::new();
+    for cle in cles {
+        if let Some(valeur) = q.get(*cle) {
+            arguments.insert((*cle).to_owned(), json!(valeur));
+        }
+    }
+    Value::Object(arguments)
+}
+
+macro_rules! post_yt {
+    ($nom:ident, $outil:literal) => {
+        async fn $nom(
+            State(fleets): State<Fleets>,
+            principal: Principal,
+            crate::error::JsonBody(body): crate::error::JsonBody<Value>,
+        ) -> Result<Json<Value>, ApiError> {
+            appeler(&fleets, &principal, $outil, objet(body)?).await
+        }
+    };
+}
+
+macro_rules! get_yt {
+    ($nom:ident, $outil:literal, $($cle:literal),* $(,)?) => {
+        async fn $nom(
+            State(fleets): State<Fleets>,
+            principal: Principal,
+            Query(q): Query<std::collections::HashMap<String, String>>,
+        ) -> Result<Json<Value>, ApiError> {
+            appeler(&fleets, &principal, $outil, args_query(&q, &[$($cle),*])).await
+        }
+    };
+}
+
+post_yt!(yt_channel_update, "youtube-channel-update");
+post_yt!(yt_playlist_create, "youtube-playlist-create");
+post_yt!(yt_playlist_update, "youtube-playlist-update");
+post_yt!(yt_playlist_visibility, "youtube-playlist-visibility");
+post_yt!(yt_playlist_delete, "youtube-playlist-delete");
+post_yt!(yt_item_add, "youtube-playlist-item-add");
+post_yt!(yt_item_reorder, "youtube-playlist-item-reorder");
+post_yt!(yt_item_remove, "youtube-playlist-item-remove");
+post_yt!(yt_video_update, "youtube-video-update");
+post_yt!(yt_video_visibility, "youtube-video-visibility");
+post_yt!(yt_video_delete, "youtube-video-delete");
+post_yt!(yt_comment_create, "youtube-comment-create");
+post_yt!(yt_comment_moderate, "youtube-comment-moderate");
+post_yt!(yt_comment_delete, "youtube-comment-delete");
+post_yt!(yt_caption_upload, "youtube-caption-upload");
+post_yt!(yt_caption_delete, "youtube-caption-delete");
+post_yt!(yt_reporting_job_create, "youtube-reporting-job-create");
+post_yt!(yt_reporting_job_delete, "youtube-reporting-job-delete");
+
+get_yt!(yt_channel_get, "youtube-channel-get", "account_id");
+get_yt!(
+    yt_playlists_list,
+    "youtube-playlists-list",
+    "account_id",
+    "page_token",
+    "max_results"
+);
+get_yt!(
+    yt_items_list,
+    "youtube-playlist-items-list",
+    "account_id",
+    "playlist_id",
+    "page_token",
+    "max_results"
+);
+get_yt!(
+    yt_comments_list,
+    "youtube-comments-list",
+    "account_id",
+    "video_id",
+    "page_token",
+    "max_results"
+);
+get_yt!(
+    yt_captions_list,
+    "youtube-captions-list",
+    "account_id",
+    "video_id"
+);
+get_yt!(
+    yt_caption_download,
+    "youtube-caption-download",
+    "account_id",
+    "caption_id",
+    "format"
+);
+get_yt!(
+    yt_analytics,
+    "youtube-analytics-report",
+    "account_id",
+    "start_date",
+    "end_date",
+    "video_id",
+    "metrics",
+    "dimensions"
+);
+get_yt!(
+    yt_report_types,
+    "youtube-report-types-list",
+    "account_id",
+    "page_token",
+    "max_results",
+    "include_system_managed"
+);
+get_yt!(
+    yt_reporting_jobs,
+    "youtube-reporting-jobs-list",
+    "account_id",
+    "page_token",
+    "max_results"
+);
+get_yt!(
+    yt_reporting_reports,
+    "youtube-reporting-reports-list",
+    "account_id",
+    "job_id",
+    "page_token",
+    "max_results"
+);
+get_yt!(
+    yt_reporting_report,
+    "youtube-reporting-report-get",
+    "account_id",
+    "job_id",
+    "report_id"
+);
+
 fn objet(body: Value) -> Result<Value, ApiError> {
     if body.is_object() {
         Ok(body)

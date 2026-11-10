@@ -175,7 +175,7 @@ pub fn tools() -> Vec<ToolDef> {
         })
     };
 
-    vec![
+    let mut outils = vec![
         ToolDef {
             name: "social_accounts_list",
             title: "Les comptes sociaux branchés",
@@ -449,7 +449,9 @@ pub fn tools() -> Vec<ToolDef> {
             raw_body: None,
             risk: Risk::Write,
         },
-    ]
+    ];
+    outils.extend(super::social_youtube::tools());
+    outils
 }
 
 /// Le corps d'un créneau ou d'une soumission : un post (`text`) ou un fil (`posts`).
@@ -542,7 +544,7 @@ mod tests {
             let destructif = matches!(
                 outil.name,
                 "social_post_publish" | "social_thread_publish" | "social_calendar_remove"
-            );
+            ) || super::super::social_youtube::est_destructif(outil.name);
             assert_eq!(
                 outil.risk.destructive(),
                 destructif,

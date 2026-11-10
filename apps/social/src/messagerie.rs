@@ -565,7 +565,7 @@ mod tests {
         // La v3 du chantier IG/TikTok/YouTube reste dans l'historique des
         // empreintes. La dernière ligne est la table courante : si elle
         // bouge sans bump, `mcp::la_table_ne_change_pas_sans_bumper` tombe.
-        assert_eq!(mcp::VERSION_TABLE, "4");
+        assert_eq!(mcp::VERSION_TABLE, "6");
         let calculee = empreinte(&mcp::description_outils().to_string());
         assert_ne!(
             calculee, "c157ded060cf557fbf68c1166b34b71a438c46022e54d3e6c132123b33023e78",
@@ -822,7 +822,7 @@ mod tests {
             .unwrap();
             comptes.push(
                 crate::store::connecter_compte(
-                    &pool, tenant, plateforme, handle, id, &scelle, None, None,
+                    &pool, tenant, plateforme, handle, id, &scelle, None, None, None,
                 )
                 .await
                 .unwrap(),
@@ -985,6 +985,7 @@ mod tests {
             "agent_sans_id",
             None,
             &scelle,
+            None,
             None,
             None,
         )

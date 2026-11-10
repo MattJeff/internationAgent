@@ -159,9 +159,27 @@ pub const INSTAGRAM_SCOPES: &str = "instagram_business_basic,instagram_business_
 /// Séparés par des VIRGULES (« comma-separated », oauth-user-access-token).
 pub const TIKTOK_SCOPES: &str = "user.info.basic,video.list,video.publish,video.upload";
 /// `youtube.upload` publie ; `youtube.force-ssl` couvre commentaires, likes,
-/// recherche et lectures (commentThreads/insert, videos/rate — relevés
-/// 2026-09-02). Google sépare les scopes par des ESPACES, comme X/LinkedIn.
-pub const YOUTUBE_SCOPES: &str = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.force-ssl";
+/// recherche, lectures et les écritures de gestion (chaîne, playlists,
+/// captions — relevés 2026-09-02).
+///
+/// Analytics, relevé le 2026-11-10 sur
+/// developers.google.com/youtube/analytics/reference/reports/query
+/// (page datée 2026-10-15) : « API requests to this method now require
+/// access to the `youtube.readonly` scope », et les métriques d'activité
+/// (vues, watch time) passent par `yt-analytics.readonly`. Les deux sont
+/// demandés en plus : un jeton d'avant (upload + force-ssl seuls) n'a pas
+/// le droit d'appeler `reports.query`. Google sépare les scopes par des
+/// ESPACES, comme X/LinkedIn.
+pub const YOUTUBE_SCOPE_READONLY: &str = "https://www.googleapis.com/auth/youtube.readonly";
+pub const YOUTUBE_SCOPE_ANALYTICS: &str = "https://www.googleapis.com/auth/yt-analytics.readonly";
+/// Rapports de revenu du Reporting API. Les autres rapports bulk passent
+/// avec `yt-analytics.readonly` seul (authorization guide, page datée
+/// 2026-11-05 : « Any request that retrieves earnings or ad performance
+/// metrics must use this scope »). On le demande pour qu'un
+/// `account_connect_url` suffise le jour où le type de rapport est monétaire.
+pub const YOUTUBE_SCOPE_MONETAIRE: &str =
+    "https://www.googleapis.com/auth/yt-analytics-monetary.readonly";
+pub const YOUTUBE_SCOPES: &str = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.force-ssl https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/yt-analytics.readonly https://www.googleapis.com/auth/yt-analytics-monetary.readonly";
 
 /// Mêmes largeurs que `oauth.rs` : 32 octets d'OS pour le `state` (256 bits
 /// contre qui regarde les flux passer), 32 pour le vérifieur (le minimum de
@@ -205,6 +223,10 @@ pub struct JetonEmis {
     /// est un SHOULD de RFC 6749, et prendre le silence pour « éternel » est
     /// le bug que `oauth.rs` documente. LinkedIn annonce 60 jours, X 2 heures.
     pub duree_s: u64,
+    /// La chaîne `scope` du point de jeton, quand il en rend une. Google la
+    /// rend toujours : c'est elle qui dit si un compte YouTube a les portées
+    /// Analytics, ou s'il faut renvoyer l'humain sur `account_connect_url`.
+    pub scopes: Option<String>,
 }
 
 /// Le hachage que l'écrivain et le lecteur du `state` partagent.
@@ -387,7 +409,11 @@ fn demarrer_interne(
         // (web-server flow, relevé 2026-09-02).
         url.query_pairs_mut()
             .append_pair("access_type", "offline")
-            .append_pair("prompt", "consent");
+            .append_pair("prompt", "consent")
+            // Reconnexion : garder les portées déjà accordées tout en
+            // ajoutant Analytics (incremental auth, « include_granted_scopes »,
+            // developers.google.com/identity/protocols/oauth2/web-server).
+            .append_pair("include_granted_scopes", "true");
     }
 
     let verifieur_scelle = match plateforme {
@@ -692,6 +718,11 @@ pub fn jeton_depuis(statut: u16, corps: &[u8]) -> Result<JetonEmis, ErreurPlatef
             .get("expires_in")
             .and_then(|v| v.as_u64())
             .unwrap_or(3600),
+        scopes: document
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
     })
 }
 
@@ -1027,9 +1058,11 @@ mod tests {
         assert_eq!(jeton.acces.expose_for_transport(), "AQUvlL");
         assert_eq!(jeton.duree_s, 5_184_000);
         assert!(jeton.rafraichissement.is_some());
+        assert_eq!(jeton.scopes.as_deref(), Some("w_member_social"));
         // Sans expires_in : une heure, jamais « éternel ».
         let muet = jeton_depuis(200, br#"{"access_token":"a"}"#).expect("access seul");
         assert_eq!(muet.duree_s, 3600);
+        assert!(muet.scopes.is_none());
     }
 
     #[tokio::test]
@@ -1154,7 +1187,11 @@ mod tests {
         // la citation vit sur le code qui les pose.
         assert_eq!(params["access_type"], "offline");
         assert_eq!(params["prompt"], "consent");
+        assert_eq!(params["include_granted_scopes"], "true");
         assert_eq!(params["scope"], YOUTUBE_SCOPES);
+        assert!(params["scope"].contains(YOUTUBE_SCOPE_READONLY));
+        assert!(params["scope"].contains(YOUTUBE_SCOPE_ANALYTICS));
+        assert!(params["scope"].contains(YOUTUBE_SCOPE_MONETAIRE));
         assert!(flux.verifieur_scelle.is_none());
     }
 

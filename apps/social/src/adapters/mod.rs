@@ -18,6 +18,7 @@ pub mod linkedin;
 pub mod tiktok;
 pub mod x;
 pub mod youtube;
+pub mod youtube_gestion;
 
 /// Un média téléchargé, vetté et empreinté par medias.rs. Les octets sont EN
 /// MEMOIRE : le plafond absolu du téléchargeur (512 MiB) le permet.

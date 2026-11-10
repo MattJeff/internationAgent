@@ -99,6 +99,7 @@ pub mod contenu;
 pub mod croissance;
 pub mod exploitation;
 pub mod social;
+pub mod social_youtube;
 pub mod societe;
 
 /// Tous les outils de ce déploiement, dans l'ordre où un lecteur les découvre.

@@ -36,6 +36,7 @@ pub mod messagerie;
 pub mod oauth_flux;
 pub mod store;
 pub mod tenants;
+pub mod youtube_outils;
 
 /// Les migrations embarquees : la base se pose toute seule au demarrage, comme
 /// pour le runtime — un binaire qui exige un `psql -f` manuel est un binaire
@@ -384,6 +385,7 @@ async fn retour_oauth(
         // L'heure de mort annoncee du jeton : c'est elle que le
         // rafraichissement PROACTIF d'Instagram (mcp::jeton_frais) lit.
         Some(jeton.duree_s as i64),
+        jeton.scopes.as_deref(),
     )
     .await
     .is_err()
@@ -423,6 +425,7 @@ async fn retour_oauth(
                         &scelle_org,
                         refresh_org.as_deref(),
                         Some(jeton.duree_s as i64),
+                        jeton.scopes.as_deref(),
                     )
                     .await
                     .is_ok()
