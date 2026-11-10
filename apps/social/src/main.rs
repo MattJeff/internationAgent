@@ -194,6 +194,7 @@ fn routeur(etat: Arc<mcp::Etat>) -> Router {
         .route("/mcp", post(poste_mcp))
         .route("/mcp/messagerie", post(poste_mcp_messagerie))
         .route("/livez", get(|| async { "ok" }))
+        .route("/", get(accueil))
         .route("/oauth/callback", get(retour_oauth))
         .route("/medias/{digest}", get(servir_media))
         .route("/meta/data-deletion", post(suppression_meta2))
@@ -202,6 +203,19 @@ fn routeur(etat: Arc<mcp::Etat>) -> Router {
         .route("/meta/threads/deauthorize", post(desautorisation_threads))
         .route("/meta/deletion-status", get(statut_suppression))
         .with_state(etat)
+}
+
+/// GET / — page d'accueil minimale : elle ne porte que la balise de
+/// verification de domaine que Meta vient lire (SOCIAL_META_DOMAIN_VERIFICATION).
+/// Sans la variable, ou si elle sort de l'alphanumerique : 404 comme avant.
+async fn accueil() -> Response {
+    match std::env::var("SOCIAL_META_DOMAIN_VERIFICATION") {
+        Ok(v) if !v.is_empty() && v.len() <= 100 && v.bytes().all(|b| b.is_ascii_alphanumeric()) => Html(format!(
+            "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"facebook-domain-verification\" content=\"{v}\" /><title>social</title></head><body></body></html>"
+        ))
+        .into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// GET /medias/{digest} — la route publique des modeles « pull ».
