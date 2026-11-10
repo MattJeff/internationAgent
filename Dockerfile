@@ -75,7 +75,8 @@ COPY . .
 # belt; this is the braces, because the failure is silent and ships.
 RUN set -eux; \
     find crates apps -name '*.rs' -exec touch {} +; \
-    cargo build --release --locked -p agentos-server --bin agentos-server
+    cargo build --release --locked -p agentos-server --bin agentos-server; \
+    cargo build --release --locked -p agentos-social --bin agentos-social
 
 # ---------------------------------------------------------------------------
 # Stage 2: run
@@ -106,6 +107,7 @@ RUN useradd --system --uid 10001 --user-group --no-create-home agentos
 USER 10001:10001
 
 COPY --from=build /src/target/release/agentos-server /usr/local/bin/agentos-server
+COPY --from=build /src/target/release/agentos-social /usr/local/bin/agentos-social
 
 # Matches DEFAULT_BIND in apps/server/src/config.rs. Documentation, not a
 # firewall — the process still binds whatever APP_BIND says.

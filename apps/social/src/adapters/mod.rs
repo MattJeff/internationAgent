@@ -118,22 +118,85 @@ impl Privacy {
     }
 }
 
-/// Les deux champs optionnels de la table v3 qui n'entrent ni dans le texte
-/// ni dans `Sondage` : la visibilité, et la date de publication différée
-/// (ISO 8601, YouTube seul). L'exception assumée du plan figé : `apercu` et
-/// `publier` les reçoivent en paramètre — un fait de plateforme (le
-/// privacy_level REQUIS de TikTok) l'impose.
+/// Où Instagram pose le média. Absent = le comportement d'avant la phase 1
+/// (image, Reel ou carrousel selon les octets). `story` = conteneur STORIES,
+/// sans champ `caption`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    Flux,
+    Story,
+    Reel,
+}
+
+impl Placement {
+    pub fn depuis(mot: &str) -> Option<Self> {
+        match mot {
+            "feed" => Some(Self::Flux),
+            "story" => Some(Self::Story),
+            "reel" => Some(Self::Reel),
+            _ => None,
+        }
+    }
+
+    pub fn nom(self) -> &'static str {
+        match self {
+            Self::Flux => "feed",
+            Self::Story => "story",
+            Self::Reel => "reel",
+        }
+    }
+}
+
+/// TikTok : `publish` = Direct Post (`video.publish`) ; `draft` = brouillon
+/// d'upload (`video.upload`, le créateur finalise dans l'application).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Livraison {
+    Publier,
+    Brouillon,
+}
+
+impl Livraison {
+    pub fn depuis(mot: &str) -> Option<Self> {
+        match mot {
+            "publish" => Some(Self::Publier),
+            "draft" => Some(Self::Brouillon),
+            _ => None,
+        }
+    }
+
+    pub fn nom(self) -> &'static str {
+        match self {
+            Self::Publier => "publish",
+            Self::Brouillon => "draft",
+        }
+    }
+}
+
+/// Phrase stable des aperçus : `publish_at` n'est plus un refus. La file
+/// durable du service publie à l'heure, sur toutes les plateformes.
+pub const VERDICT_CRENEAU: &str = "publish_at est honoré par la file durable du service (social_scheduled), \
+     pas par l'API de la plateforme : le post part à l'heure dite";
+
+/// Les champs optionnels qui n'entrent ni dans le texte ni dans `Sondage`.
+/// `privacy` et `publish_at` sont la table v3. `placement` et `livraison`
+/// (phase 1) n'entrent dans l'empreinte QUE s'ils sont posés — des options
+/// vides gardent le digest d'avant.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OptionsPost {
     pub privacy: Option<Privacy>,
     pub publish_at: Option<String>,
+    pub placement: Option<Placement>,
+    pub livraison: Option<Livraison>,
 }
 
 impl OptionsPost {
     /// Vrai quand rien n'est demandé — le cas de TOUS les posts d'avant la
     /// table v3, dont l'empreinte ne doit pas bouger (compat C3).
     pub fn est_vide(&self) -> bool {
-        self.privacy.is_none() && self.publish_at.is_none()
+        self.privacy.is_none()
+            && self.publish_at.is_none()
+            && self.placement.is_none()
+            && self.livraison.is_none()
     }
 }
 
@@ -212,6 +275,27 @@ pub trait Plateforme: Send + Sync {
         made_with_ai: bool,
         options: &OptionsPost,
     ) -> Result<Publication, ErreurPlateforme>;
+
+    /// Un élément de fil. Le défaut refuse la réponse : seul X chaîne
+    /// `reply.in_reply_to_tweet_id`. `en_reponse_a` vide délègue à `publier`.
+    #[allow(clippy::too_many_arguments)]
+    async fn publier_en_reponse(
+        &self,
+        jeton: &Secret,
+        handle: &str,
+        texte: &str,
+        medias: &[MediaPret],
+        sondage: Option<&Sondage>,
+        made_with_ai: bool,
+        options: &OptionsPost,
+        en_reponse_a: Option<&str>,
+    ) -> Result<Publication, ErreurPlateforme> {
+        if en_reponse_a.is_some() {
+            return Err(ErreurPlateforme::Refus { statut: 400 });
+        }
+        self.publier(jeton, handle, texte, medias, sondage, made_with_ai, options)
+            .await
+    }
 
     /// `Ok(None)` quand la plateforme ne sert pas de métriques pour ce type de
     /// compte — dire « pas de données » au lieu de rendre des zéros qui
@@ -643,7 +727,21 @@ pub fn empreinte_globale(
     if let Some(quand) = &options.publish_at {
         composantes.push(format!("publish_at:{}", empreinte(quand)));
     }
+    // Phase 1 : un placement ou une livraison différent est un autre
+    // contreseing. Absent = le digest d'avant, à l'octet.
+    if let Some(p) = options.placement {
+        composantes.push(format!("placement:{}", p.nom()));
+    }
+    if let Some(l) = options.livraison {
+        composantes.push(format!("delivery:{}", l.nom()));
+    }
     empreinte(&composantes.join("\n"))
+}
+
+/// L'empreinte d'un fil : les empreintes d'éléments, dans l'ordre, jointes.
+/// Distincte de l'empreinte d'un post seul, même s'il n'y a qu'un élément.
+pub fn empreinte_fil(digests: &[String]) -> String {
+    empreinte(&digests.join("\n"))
 }
 
 /// Envoie et lit (statut, corps) — le corps ne finit jamais dans une erreur,
@@ -728,6 +826,8 @@ mod tests {
     const SANS: OptionsPost = OptionsPost {
         privacy: None,
         publish_at: None,
+        placement: None,
+        livraison: None,
     };
 
     #[test]
@@ -787,14 +887,20 @@ mod tests {
         let publique = OptionsPost {
             privacy: Some(Privacy::Public),
             publish_at: None,
+            placement: None,
+            livraison: None,
         };
         let privee = OptionsPost {
             privacy: Some(Privacy::Private),
             publish_at: None,
+            placement: None,
+            livraison: None,
         };
         let differee = OptionsPost {
             privacy: None,
             publish_at: Some("2026-10-01T09:00:00Z".to_owned()),
+            placement: None,
+            livraison: None,
         };
         let nu = empreinte_globale("texte", &[], None, false, &SANS);
         let avec_public = empreinte_globale("texte", &[], None, false, &publique);

@@ -34,8 +34,8 @@
 //!   within albums (children) »).
 //! * Limite : « Instagram accounts are limited to 100 API-published posts
 //!   within a 24-hour moving period. » (content-publishing, 2026-09-02).
-//! * Version Graph courante : v26.0 (changelog Graph API, 2026-07-29, relevé
-//!   le 2026-09-02).
+//! * Version Graph : v27.0 (phase 1, novembre 2026 ; v26.0 relevée le
+//!   2026-09-02).
 //! * Messagerie : `POST graph.instagram.com/<v>/me/messages`, corps
 //!   `{recipient: {id: IGSID}, message: {text}}`, scopes
 //!   instagram_business_basic + instagram_business_manage_messages ; « Your
@@ -44,9 +44,9 @@
 //!   n'initie pas ; divulgation d'automatisation obligatoire
 //!   (policy-overview, 2026-09-02).
 //!
-//! Restes nommés (pas de stub) : STORIES (exigerait un champ de placement
-//! dans la table — l'API les sert) ; ratio/pixels non vérifiables aux octets
-//! sans parseur JPEG.
+//! Stories : `media_type=STORIES`, sans champ `caption` (ig-user/media). Le
+//! placement `story` de la table phase 1 choisit ce conteneur. Ratio et
+//! pixels restent non vérifiables aux octets sans parseur JPEG.
 
 use std::sync::Arc;
 
@@ -64,9 +64,9 @@ use crate::medias::DepotMedias;
 /// graph.instagram.com — « All endpoints can be accessed via the
 /// graph.instagram.com host » (messaging-api, relevé le 2026-09-02).
 pub const BASE_GRAPH: &str = "https://graph.instagram.com";
-/// La version Graph courante : v26.0, publiée le 2026-07-29 (changelog Graph
-/// API, relevé le 2026-09-02). UN endroit à bumper quand Meta l'éteindra.
-pub const VERSION_GRAPH: &str = "v26.0";
+/// La version Graph : v27.0 (phase 1, novembre 2026). v26.0 avait été relevée
+/// le 2026-09-02. UN endroit à bumper quand Meta l'éteindra.
+pub const VERSION_GRAPH: &str = "v27.0";
 
 /// « 8 MB maximum » image (ig-user/media, relevé le 2026-09-02) — lecture
 /// décimale, la plus stricte pour un maximum.
@@ -105,7 +105,7 @@ pub const CITATION_AVANT_REVUE: &str = "avant l'Advanced Access, seuls les compt
      requested from app users who have a role on the requesting app » (access-levels, \
      relevé le 2026-09-02)";
 
-/// Un chemin Graph versionné : `https://graph.instagram.com/v26.0/{chemin}`.
+/// Un chemin Graph versionné : `https://graph.instagram.com/v27.0/{chemin}`.
 pub fn url_graph(chemin: &str) -> String {
     format!("{BASE_GRAPH}/{VERSION_GRAPH}/{chemin}")
 }
@@ -166,6 +166,25 @@ pub fn params_conteneur_reels(
     ];
     if let Some(c) = caption {
         params.push(("caption", c.to_owned()));
+    }
+    if is_ai_generated {
+        params.push(("is_ai_generated", "true".to_owned()));
+    }
+    params
+}
+
+/// Conteneur STORIES. Pas de champ `caption` : l'API ne le sert pas sur ce
+/// `media_type` (ig-user/media). Image → `image_url`, vidéo → `video_url`,
+/// les deux tirées de NOS octets vettés.
+pub fn params_conteneur_story(
+    base: &str,
+    m: &MediaPret,
+    is_ai_generated: bool,
+) -> Vec<(&'static str, String)> {
+    let mut params = vec![("media_type", "STORIES".to_owned())];
+    match m.type_detecte {
+        TypeMedia::Mp4 => params.push(("video_url", url_pull(base, &m.digest))),
+        _ => params.push(("image_url", url_pull(base, &m.digest))),
     }
     if is_ai_generated {
         params.push(("is_ai_generated", "true".to_owned()));
@@ -520,6 +539,28 @@ impl Instagram {
         };
         permalink_depuis(statut, &corps).unwrap_or_else(|| "https://www.instagram.com".to_owned())
     }
+
+    /// `POST /me/media_publish` puis le permalink. Partagé par le fil, le Reel,
+    /// le carrousel et la story.
+    async fn publier_creation(
+        &self,
+        jeton: &Secret,
+        creation_id: &str,
+    ) -> Result<Publication, ErreurPlateforme> {
+        let (statut, corps) = envoyer(
+            http()
+                .post(url_graph("me/media_publish"))
+                .bearer_auth(jeton.expose_for_transport())
+                .form(&params_publish(creation_id)),
+        )
+        .await?;
+        let media_id = id_depuis(statut, &corps)?;
+        let url = self.permalink(jeton, &media_id).await;
+        Ok(Publication {
+            id_plateforme: media_id,
+            url,
+        })
+    }
 }
 
 #[async_trait]
@@ -573,11 +614,24 @@ impl Plateforme for Instagram {
             );
         }
         if options.publish_at.is_some() {
-            refus.push(
-                "instagram ne sert pas `publish_at` : aucune planification dans \
-                 content-publishing (relevé le 2026-09-02)"
+            infos.push(super::VERDICT_CRENEAU.to_owned());
+        }
+        if options.placement == Some(super::Placement::Story) {
+            if medias.len() != 1 {
+                refus.push(
+                    "une story Instagram est UN média (image JPEG ou vidéo), media_type=STORIES \
+                     (ig-user/media)"
+                        .to_owned(),
+                );
+            }
+            infos.push(
+                "story : conteneur STORIES, aucun champ caption — le texte reste dans \
+                 l'empreinte contresignée et n'est pas envoyé à Instagram"
                     .to_owned(),
             );
+        }
+        if options.placement == Some(super::Placement::Reel) && medias.len() != 1 {
+            refus.push("un Reel est une seule vidéo MP4".to_owned());
         }
         infos.push(CITATION_100_POSTS.to_owned());
         infos.push(CITATION_AVANT_REVUE.to_owned());
@@ -609,10 +663,26 @@ impl Plateforme for Instagram {
         medias: &[MediaPret],
         _sondage: Option<&Sondage>,
         made_with_ai: bool,
-        _options: &OptionsPost,
+        options: &OptionsPost,
     ) -> Result<Publication, ErreurPlateforme> {
-        // C7 : l'aperçu (sondage/privacy/publish_at refusés, types refusés)
-        // passe avant publier. Un contournement prend un refus local.
+        // C7 : l'aperçu passe avant publier. `publish_at` est retiré par la
+        // file. Un contournement prend un refus local.
+        if options.placement == Some(super::Placement::Story) {
+            let Some(seul) = medias.first().filter(|_| medias.len() == 1) else {
+                return Err(ErreurPlateforme::Refus { statut: 400 });
+            };
+            if !matches!(seul.type_detecte, TypeMedia::Jpeg | TypeMedia::Mp4) {
+                return Err(ErreurPlateforme::Refus { statut: 400 });
+            }
+            let creation_id = self
+                .conteneur_pull(
+                    jeton,
+                    seul,
+                    &params_conteneur_story(&self.base_publique, seul, made_with_ai),
+                )
+                .await?;
+            return self.publier_creation(jeton, &creation_id).await;
+        }
         let creation_id = match medias {
             [] => return Err(ErreurPlateforme::Refus { statut: 400 }),
             [seul] => match seul.type_detecte {
@@ -631,17 +701,14 @@ impl Plateforme for Instagram {
                     .await?
                 }
                 TypeMedia::Mp4 => {
-                    self.conteneur_pull(
-                        jeton,
-                        seul,
-                        &params_conteneur_reels(
-                            &self.base_publique,
-                            seul,
-                            Some(texte),
-                            made_with_ai,
-                        ),
-                    )
-                    .await?
+                    let params = if options.placement == Some(super::Placement::Reel)
+                        || options.placement.is_none()
+                    {
+                        params_conteneur_reels(&self.base_publique, seul, Some(texte), made_with_ai)
+                    } else {
+                        return Err(ErreurPlateforme::Refus { statut: 400 });
+                    };
+                    self.conteneur_pull(jeton, seul, &params).await?
                 }
                 _ => return Err(ErreurPlateforme::Refus { statut: 400 }),
             },
@@ -690,19 +757,7 @@ impl Plateforme for Instagram {
             }
         };
 
-        let (statut, corps) = envoyer(
-            http()
-                .post(url_graph("me/media_publish"))
-                .bearer_auth(jeton.expose_for_transport())
-                .form(&params_publish(&creation_id)),
-        )
-        .await?;
-        let media_id = id_depuis(statut, &corps)?;
-        let url = self.permalink(jeton, &media_id).await;
-        Ok(Publication {
-            id_plateforme: media_id,
-            url,
-        })
+        self.publier_creation(jeton, &creation_id).await
     }
 
     async fn metriques(
@@ -1047,6 +1102,8 @@ mod tests {
     const SANS: OptionsPost = OptionsPost {
         privacy: None,
         publish_at: None,
+        placement: None,
+        livraison: None,
     };
 
     fn contexte() -> ContexteAdaptateurs {
@@ -1114,6 +1171,16 @@ mod tests {
         // Jamais le resumable : fermé à notre chemin de login (cité).
         assert!(!params.iter().any(|(n, _)| *n == "upload_type"));
         assert!(params.contains(&("is_ai_generated", "true".to_owned())));
+        // Story : STORIES, jamais de caption, image ou vidéo selon les octets.
+        let story = params_conteneur_story("https://social.example", &v, false);
+        assert!(story.contains(&("media_type", "STORIES".to_owned())));
+        assert!(!story.iter().any(|(n, _)| *n == "caption"));
+        assert!(story.iter().any(|(n, _)| *n == "video_url"));
+        let image = media(b"\xFF\xD8\xFF\xE0", TypeMedia::Jpeg);
+        let story_image = params_conteneur_story("https://social.example", &image, true);
+        assert!(story_image.iter().any(|(n, _)| *n == "image_url"));
+        assert!(!story_image.iter().any(|(n, _)| *n == "caption"));
+        assert!(story_image.contains(&("is_ai_generated", "true".to_owned())));
         // Absent quand faux : un champ absent et un champ nul ne sont pas la
         // même requête.
         assert!(
@@ -1293,6 +1360,8 @@ mod tests {
         let avec_privacy = OptionsPost {
             privacy: Some(crate::adapters::Privacy::Public),
             publish_at: None,
+            placement: None,
+            livraison: None,
         };
         assert!(
             !ig.apercu("t", &seul, None, false, &avec_privacy)
@@ -1301,10 +1370,15 @@ mod tests {
         let avec_date = OptionsPost {
             privacy: None,
             publish_at: Some("2026-10-01T09:00:00Z".to_owned()),
+            placement: None,
+            livraison: None,
         };
+        let differe = ig.apercu("t", &seul, None, false, &avec_date);
+        assert!(differe.platform_limits_ok, "{:?}", differe.verdicts);
         assert!(
-            !ig.apercu("t", &seul, None, false, &avec_date)
-                .platform_limits_ok
+            differe.verdicts.iter().any(|v| v.contains("file durable")),
+            "{:?}",
+            differe.verdicts
         );
     }
 
@@ -1419,7 +1493,7 @@ mod tests {
     fn les_urls_sont_versionnees_et_en_https() {
         assert_eq!(
             url_graph("me/media"),
-            "https://graph.instagram.com/v26.0/me/media"
+            "https://graph.instagram.com/v27.0/me/media"
         );
         assert!(url_graph("me").starts_with("https://"));
     }

@@ -252,12 +252,12 @@ pub async fn reclamer(
     }
     match post.status.as_str() {
         "published" => Ok(Reclamation::DejaPublie(post)),
-        // Un echec anterieur se re-reclame — mais par UPDATE conditionnel,
-        // pour qu'un seul des retenteurs concurrents gagne.
-        "failed" => {
+        // Un echec — ou un fil partiel — se re-reclame. Les éléments déjà
+        // publiés restent en base : le rejeu ne les renvoie pas.
+        "failed" | "partial" => {
             let repris = sqlx::query(
                 "UPDATE social_posts SET status = 'pending' \
-                 WHERE id = $1 AND status = 'failed' RETURNING id",
+                 WHERE id = $1 AND status IN ('failed', 'partial') RETURNING id",
             )
             .bind(post.id)
             .fetch_optional(pool)
@@ -416,6 +416,436 @@ pub async fn consommer_attente_oauth(
             l.get("sealed_verifier"),
         )
     }))
+}
+
+// ---------------------------------------------------------------------------
+// File durable : calendrier + approbation
+// ---------------------------------------------------------------------------
+
+/// Une ligne de `social_scheduled`.
+pub struct LigneFile {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub account_id: Uuid,
+    pub idempotency_key: String,
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub digest: String,
+    pub publish_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub status: String,
+    pub attempts: i32,
+    pub post_id: Option<Uuid>,
+}
+
+fn ligne_file(l: &sqlx::postgres::PgRow) -> LigneFile {
+    LigneFile {
+        id: l.get("id"),
+        tenant_id: l.get("tenant_id"),
+        account_id: l.get("account_id"),
+        idempotency_key: l.get("idempotency_key"),
+        kind: l.get("kind"),
+        payload: l.get("payload"),
+        digest: l.get("digest"),
+        publish_at: l.get("publish_at"),
+        status: l.get("status"),
+        attempts: l.get("attempts"),
+        post_id: l.get("post_id"),
+    }
+}
+
+const SELECT_FILE: &str = "SELECT id, tenant_id, account_id, idempotency_key, kind, payload, \
+     digest, publish_at, status, attempts, post_id FROM social_scheduled";
+
+/// Création, ou rejeu de la même clé et du même digest.
+pub enum PoseFile {
+    Nouvelle(LigneFile),
+    Meme(LigneFile),
+}
+
+/// Pose un créneau. La contrainte UNIQUE (tenant, clé) est le rejeu : même
+/// digest → la ligne existante ; digest différent → `Err(())`.
+#[allow(clippy::too_many_arguments)]
+pub async fn poser_file(
+    pool: &PgPool,
+    tenant: Uuid,
+    compte: Uuid,
+    cle: &str,
+    kind: &str,
+    payload: &serde_json::Value,
+    digest: &str,
+    publish_at: Option<chrono::DateTime<chrono::Utc>>,
+    status: &str,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> sqlx::Result<Result<PoseFile, ()>> {
+    let prochaine = publish_at.unwrap_or_else(chrono::Utc::now);
+    let gagne = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO social_scheduled \
+            (id, tenant_id, account_id, idempotency_key, kind, payload, digest, \
+             publish_at, status, next_attempt_at, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+         ON CONFLICT (tenant_id, idempotency_key) DO NOTHING \
+         RETURNING {cols}",
+        cols = "id, tenant_id, account_id, idempotency_key, kind, payload, digest, publish_at, status, attempts, post_id"
+    )))
+    .bind(Uuid::now_v7())
+    .bind(tenant)
+    .bind(compte)
+    .bind(cle)
+    .bind(kind)
+    .bind(payload)
+    .bind(digest)
+    .bind(publish_at)
+    .bind(status)
+    .bind(prochaine)
+    .bind(expires_at)
+    .fetch_optional(pool)
+    .await?;
+    if let Some(l) = gagne {
+        return Ok(Ok(PoseFile::Nouvelle(ligne_file(&l))));
+    }
+    let existante = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "{SELECT_FILE} WHERE tenant_id = $1 AND idempotency_key = $2"
+    )))
+    .bind(tenant)
+    .bind(cle)
+    .fetch_one(pool)
+    .await?;
+    let ligne = ligne_file(&existante);
+    if ligne.digest == digest {
+        Ok(Ok(PoseFile::Meme(ligne)))
+    } else {
+        Ok(Err(()))
+    }
+}
+
+pub async fn file_par_id(pool: &PgPool, tenant: Uuid, id: Uuid) -> sqlx::Result<Option<LigneFile>> {
+    let ligne = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "{SELECT_FILE} WHERE id = $1 AND tenant_id = $2"
+    )))
+    .bind(id)
+    .bind(tenant)
+    .fetch_optional(pool)
+    .await?;
+    Ok(ligne.as_ref().map(ligne_file))
+}
+
+pub async fn file_par_cle(
+    pool: &PgPool,
+    tenant: Uuid,
+    cle: &str,
+) -> sqlx::Result<Option<LigneFile>> {
+    let ligne = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "{SELECT_FILE} WHERE tenant_id = $1 AND idempotency_key = $2"
+    )))
+    .bind(tenant)
+    .bind(cle)
+    .fetch_optional(pool)
+    .await?;
+    Ok(ligne.as_ref().map(ligne_file))
+}
+
+/// Passe `pending_approval` dont l'échéance est dépassée à `expired`.
+pub async fn expirer_file(pool: &PgPool) -> sqlx::Result<u64> {
+    let r = sqlx::query(
+        "UPDATE social_scheduled SET status = 'expired', updated_at = now() \
+         WHERE status = 'pending_approval' AND expires_at IS NOT NULL AND expires_at < now()",
+    )
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+/// Reprend une publication coincée en `publishing` depuis plus de 15 minutes.
+pub async fn reprendre_publishing_perime(pool: &PgPool) -> sqlx::Result<u64> {
+    let r = sqlx::query(
+        "UPDATE social_scheduled SET status = 'scheduled', updated_at = now() \
+         WHERE status = 'publishing' AND updated_at < now() - interval '15 minutes'",
+    )
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+/// Réclame UNE ligne due. `None` = rien à poster.
+pub async fn prendre_echeance(pool: &PgPool) -> sqlx::Result<Option<LigneFile>> {
+    let ligne = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE social_scheduled SET status = 'publishing', updated_at = now() \
+         WHERE id = ( \
+             SELECT id FROM social_scheduled \
+             WHERE status = 'scheduled' AND next_attempt_at <= now() \
+               AND attempts < max_attempts \
+             ORDER BY next_attempt_at \
+             FOR UPDATE SKIP LOCKED \
+             LIMIT 1 \
+         ) RETURNING {cols}",
+        cols = "id, tenant_id, account_id, idempotency_key, kind, payload, digest, publish_at, status, attempts, post_id"
+    )))
+    .fetch_optional(pool)
+    .await?;
+    Ok(ligne.as_ref().map(ligne_file))
+}
+
+pub async fn marquer_file_publiee(pool: &PgPool, id: Uuid, post_id: Uuid) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE social_scheduled SET status = 'published', post_id = $2, updated_at = now() \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(post_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Recule la ligne. `reprendre` faux = tentatives épuisées, statut `failed`.
+pub async fn marquer_file_echec(
+    pool: &PgPool,
+    id: Uuid,
+    reprendre: bool,
+    attendre_s: i64,
+    erreur: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE social_scheduled \
+         SET status = CASE WHEN $2 THEN 'scheduled' ELSE 'failed' END, \
+             attempts = attempts + 1, \
+             next_attempt_at = now() + make_interval(secs => $3), \
+             last_error = $4, updated_at = now() \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(reprendre)
+    .bind(attendre_s as f64)
+    .bind(erreur)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn decider_file(
+    pool: &PgPool,
+    tenant: Uuid,
+    id: Uuid,
+    status: &str,
+    note: Option<&str>,
+) -> sqlx::Result<Option<LigneFile>> {
+    let ligne = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE social_scheduled \
+         SET status = $3, decision_note = $4, \
+             next_attempt_at = COALESCE(publish_at, now()), updated_at = now() \
+         WHERE id = $1 AND tenant_id = $2 AND status = 'pending_approval' \
+         RETURNING {cols}",
+        cols = "id, tenant_id, account_id, idempotency_key, kind, payload, digest, publish_at, status, attempts, post_id"
+    )))
+    .bind(id)
+    .bind(tenant)
+    .bind(status)
+    .bind(note)
+    .fetch_optional(pool)
+    .await?;
+    Ok(ligne.as_ref().map(ligne_file))
+}
+
+pub async fn editer_file(
+    pool: &PgPool,
+    tenant: Uuid,
+    id: Uuid,
+    payload: &serde_json::Value,
+    digest: &str,
+) -> sqlx::Result<Option<LigneFile>> {
+    let ligne = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE social_scheduled SET payload = $3, digest = $4, updated_at = now() \
+         WHERE id = $1 AND tenant_id = $2 AND status = 'pending_approval' \
+         RETURNING {cols}",
+        cols = "id, tenant_id, account_id, idempotency_key, kind, payload, digest, publish_at, status, attempts, post_id"
+    )))
+    .bind(id)
+    .bind(tenant)
+    .bind(payload)
+    .bind(digest)
+    .fetch_optional(pool)
+    .await?;
+    Ok(ligne.as_ref().map(ligne_file))
+}
+
+pub async fn annuler_file(
+    pool: &PgPool,
+    tenant: Uuid,
+    id: Uuid,
+) -> sqlx::Result<Option<LigneFile>> {
+    let ligne = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE social_scheduled SET status = 'cancelled', updated_at = now() \
+         WHERE id = $1 AND tenant_id = $2 \
+           AND status IN ('scheduled', 'pending_approval') \
+         RETURNING {cols}",
+        cols = "id, tenant_id, account_id, idempotency_key, kind, payload, digest, publish_at, status, attempts, post_id"
+    )))
+    .bind(id)
+    .bind(tenant)
+    .fetch_optional(pool)
+    .await?;
+    Ok(ligne.as_ref().map(ligne_file))
+}
+
+pub async fn reprogrammer_file(
+    pool: &PgPool,
+    tenant: Uuid,
+    id: Uuid,
+    quand: chrono::DateTime<chrono::Utc>,
+) -> sqlx::Result<Option<LigneFile>> {
+    let ligne = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE social_scheduled \
+         SET publish_at = $3, next_attempt_at = $3, updated_at = now() \
+         WHERE id = $1 AND tenant_id = $2 \
+           AND status IN ('scheduled', 'pending_approval') \
+         RETURNING {cols}",
+        cols = "id, tenant_id, account_id, idempotency_key, kind, payload, digest, publish_at, status, attempts, post_id"
+    )))
+    .bind(id)
+    .bind(tenant)
+    .bind(quand)
+    .fetch_optional(pool)
+    .await?;
+    Ok(ligne.as_ref().map(ligne_file))
+}
+
+pub async fn lister_file(
+    pool: &PgPool,
+    tenant: Uuid,
+    compte: Option<Uuid>,
+    debut: Option<chrono::DateTime<chrono::Utc>>,
+    fin: Option<chrono::DateTime<chrono::Utc>>,
+) -> sqlx::Result<Vec<LigneFile>> {
+    let lignes = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "{SELECT_FILE} WHERE tenant_id = $1 \
+           AND ($2::uuid IS NULL OR account_id = $2) \
+           AND ($3::timestamptz IS NULL OR publish_at IS NULL OR publish_at >= $3) \
+           AND ($4::timestamptz IS NULL OR publish_at IS NULL OR publish_at <= $4) \
+         ORDER BY COALESCE(publish_at, created_at) LIMIT 200"
+    )))
+    .bind(tenant)
+    .bind(compte)
+    .bind(debut)
+    .bind(fin)
+    .fetch_all(pool)
+    .await?;
+    Ok(lignes.iter().map(ligne_file).collect())
+}
+
+/// Secondes d'attente avant le prochain essai. 30 s, 2 min, 10 min, 30 min, 2 h.
+pub fn delai_reessai(tentative: i32) -> i64 {
+    match tentative {
+        0 | 1 => 30,
+        2 => 120,
+        3 => 600,
+        4 => 1800,
+        _ => 7200,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Éléments d'un fil
+// ---------------------------------------------------------------------------
+
+pub struct ElementFil {
+    pub position: i32,
+    pub text_body: String,
+    pub digest: String,
+    pub media: serde_json::Value,
+    pub media_digests: Vec<String>,
+    pub made_with_ai: bool,
+    pub poll: Option<serde_json::Value>,
+    pub status: String,
+    pub platform_post_id: Option<String>,
+    pub url: Option<String>,
+    pub last_error: Option<String>,
+}
+
+pub async fn poser_elements(
+    pool: &PgPool,
+    post_id: Uuid,
+    elements: &[ElementFil],
+) -> sqlx::Result<()> {
+    for e in elements {
+        sqlx::query(
+            "INSERT INTO social_thread_items \
+                (post_id, position, text_body, digest, media, media_digests, made_with_ai, poll, status) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending') \
+             ON CONFLICT (post_id, position) DO NOTHING",
+        )
+        .bind(post_id)
+        .bind(e.position)
+        .bind(&e.text_body)
+        .bind(&e.digest)
+        .bind(&e.media)
+        .bind(&e.media_digests)
+        .bind(e.made_with_ai)
+        .bind(&e.poll)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+pub async fn elements(pool: &PgPool, post_id: Uuid) -> sqlx::Result<Vec<ElementFil>> {
+    let lignes = sqlx::query(
+        "SELECT position, text_body, digest, media, media_digests, made_with_ai, poll, \
+                status, platform_post_id, url, last_error \
+         FROM social_thread_items WHERE post_id = $1 ORDER BY position",
+    )
+    .bind(post_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(lignes
+        .iter()
+        .map(|l| ElementFil {
+            position: l.get("position"),
+            text_body: l.get("text_body"),
+            digest: l.get("digest"),
+            media: l.get("media"),
+            media_digests: l.get("media_digests"),
+            made_with_ai: l.get("made_with_ai"),
+            poll: l.get("poll"),
+            status: l.get("status"),
+            platform_post_id: l.get("platform_post_id"),
+            url: l.get("url"),
+            last_error: l.get("last_error"),
+        })
+        .collect())
+}
+
+pub async fn marquer_element(
+    pool: &PgPool,
+    post_id: Uuid,
+    position: i32,
+    status: &str,
+    platform_post_id: Option<&str>,
+    url: Option<&str>,
+    erreur: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE social_thread_items \
+         SET status = $3, platform_post_id = COALESCE($4, platform_post_id), \
+             url = COALESCE($5, url), last_error = COALESCE($6, last_error) \
+         WHERE post_id = $1 AND position = $2",
+    )
+    .bind(post_id)
+    .bind(position)
+    .bind(status)
+    .bind(platform_post_id)
+    .bind(url)
+    .bind(erreur)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn marquer_partiel(pool: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("UPDATE social_posts SET status = 'partial' WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

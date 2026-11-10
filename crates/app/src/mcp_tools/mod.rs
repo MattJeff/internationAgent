@@ -222,6 +222,11 @@ mod tests {
                  cet étage-là, donc un outil qui la déclarerait rendrait un 404 nu — voir \
                  `aucun_outil_ne_pointe_sur_un_chemin_de_letage_public`",
             ),
+            (
+                "/v1/social/approvals/decide",
+                "décision humaine : approuver, refuser ou éditer. Les employés soumettent \
+                 via social_approval_propose ; ce chemin n'est pas dans leur table",
+            ),
         ];
         /// Les préfixes qui ne sont pas des verbes de locataire.
         const NOT_A_TENANT_VERB: &[(&str, &str)] = &[
