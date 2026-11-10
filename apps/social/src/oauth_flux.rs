@@ -162,6 +162,28 @@ pub const TIKTOK_SCOPES: &str = "user.info.basic,video.list,video.publish,video.
 /// recherche et lectures (commentThreads/insert, videos/rate — relevés
 /// 2026-09-02). Google sépare les scopes par des ESPACES, comme X/LinkedIn.
 pub const YOUTUBE_SCOPES: &str = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.force-ssl";
+/// Second connecteur Meta, app distincte (`META2_APP_*`). Deux portées, celles
+/// que le code appelle : identifier le compte, publier un Reel. Pas de
+/// messages — le connecteur historique garde `INSTAGRAM_SCOPES`.
+/// Relevées le 2026-11-10 (Instagram API with Instagram Login).
+pub const INSTAGRAM_REELS_SCOPES: &str =
+    "instagram_business_basic,instagram_business_content_publish";
+/// Facebook Login pour les Pages. Relevées le 2026-11-10
+/// (reels-publishing, « Before You Start »).
+pub const FACEBOOK_PAGE_SCOPES: &str = "pages_show_list,pages_manage_posts,pages_read_engagement";
+/// Threads API. Relevées le 2026-11-10.
+pub const THREADS_SCOPES: &str = "threads_basic,threads_content_publish";
+
+/// Même hôte que le connecteur historique : une autre app, le même dialogue.
+pub const FACEBOOK_AUTORISATION: &str = "https://www.facebook.com/v27.0/dialog/oauth";
+pub const FACEBOOK_JETON: &str = "https://graph.facebook.com/v27.0/oauth/access_token";
+pub const FACEBOOK_ME: &str = "https://graph.facebook.com/v27.0/me";
+pub const FACEBOOK_PAGES: &str = "https://graph.facebook.com/v27.0/me/accounts";
+pub const THREADS_AUTORISATION: &str = "https://threads.net/oauth/authorize";
+pub const THREADS_JETON: &str = "https://graph.threads.net/oauth/access_token";
+pub const THREADS_JETON_LONG: &str = "https://graph.threads.net/access_token";
+pub const THREADS_RAFRAICHIR: &str = "https://graph.threads.net/refresh_access_token";
+pub const THREADS_ME: &str = "https://graph.threads.net/v1.0/me";
 
 /// Mêmes largeurs que `oauth.rs` : 32 octets d'OS pour le `state` (256 bits
 /// contre qui regarde les flux passer), 32 pour le vérifieur (le minimum de
@@ -176,6 +198,13 @@ pub enum PlateformeOauth {
     Instagram,
     Tiktok,
     Youtube,
+    /// Instagram Login sur l'app `META2_*`. Mêmes points que `Instagram`,
+    /// autres portées, autres comptes.
+    InstagramReels,
+    /// Facebook Login, puis un jeton de Page par Page.
+    FacebookPage,
+    /// Threads API, app `META2_THREADS_*`.
+    Threads,
 }
 
 /// Ce qu'un flux démarré laisse derrière lui.
@@ -361,6 +390,9 @@ fn demarrer_interne(
         PlateformeOauth::Instagram => (INSTAGRAM_AUTORISATION, INSTAGRAM_SCOPES),
         PlateformeOauth::Tiktok => (TIKTOK_AUTORISATION, TIKTOK_SCOPES),
         PlateformeOauth::Youtube => (YOUTUBE_AUTORISATION, YOUTUBE_SCOPES),
+        PlateformeOauth::InstagramReels => (INSTAGRAM_AUTORISATION, INSTAGRAM_REELS_SCOPES),
+        PlateformeOauth::FacebookPage => (FACEBOOK_AUTORISATION, FACEBOOK_PAGE_SCOPES),
+        PlateformeOauth::Threads => (THREADS_AUTORISATION, THREADS_SCOPES),
     };
     // TikTok nomme son identifiant client `client_key` — le seul des cinq
     // (oauth-user-access-token-management, relevé 2026-09-02). Les scopes,
@@ -460,7 +492,12 @@ pub fn corps_d_echange<'a>(
             ("redirect_uri", redirect_uri),
             ("code_verifier", verifieur.unwrap_or_default()),
         ],
-        PlateformeOauth::Linkedin | PlateformeOauth::Instagram | PlateformeOauth::Youtube => vec![
+        PlateformeOauth::Linkedin
+        | PlateformeOauth::Instagram
+        | PlateformeOauth::InstagramReels
+        | PlateformeOauth::FacebookPage
+        | PlateformeOauth::Threads
+        | PlateformeOauth::Youtube => vec![
             ("grant_type", "authorization_code"),
             ("code", code),
             ("client_id", client_id),
@@ -498,24 +535,55 @@ pub async fn echanger(
         Some(secret_texte),
     );
     let jeton = poster_jeton(plateforme, client_id, client_secret, &corps).await?;
-    if plateforme != PlateformeOauth::Instagram {
-        return Ok(jeton);
+    match plateforme {
+        PlateformeOauth::Instagram | PlateformeOauth::InstagramReels => {
+            // Le jeton de api.instagram.com/oauth/access_token est court ;
+            // `ig_exchange_token` le troque contre le jeton long « valid for
+            // 60 days » (long-lived-tokens, relevé 2026-09-02). C'est le long
+            // qu'on scelle.
+            let long = obtenir_jeton_en_get(
+                INSTAGRAM_JETON_LONG,
+                &[
+                    ("grant_type", "ig_exchange_token"),
+                    ("client_secret", secret_texte),
+                    ("access_token", jeton.acces.expose_for_transport()),
+                ],
+            )
+            .await?;
+            Ok(copie_en_rafraichissement(long))
+        }
+        PlateformeOauth::Threads => {
+            // Même chaîne, grant `th_exchange_token`, 60 jours
+            // (Threads long-lived tokens, relevé le 2026-11-10).
+            let long = obtenir_jeton_en_get(
+                THREADS_JETON_LONG,
+                &[
+                    ("grant_type", "th_exchange_token"),
+                    ("client_secret", secret_texte),
+                    ("access_token", jeton.acces.expose_for_transport()),
+                ],
+            )
+            .await?;
+            Ok(copie_en_rafraichissement(long))
+        }
+        PlateformeOauth::FacebookPage => {
+            // Court → long (`fb_exchange_token`, ~60 jours). Le jeton de Page
+            // qu'on scelle ensuite est dérivé de CELUI-CI et n'expire pas
+            // (get-long-lived, relevé le 2026-11-10). On ne copie pas ce jeton
+            // utilisateur dans `sealed_refresh` : il ne quitte pas le callback.
+            obtenir_jeton_en_get(
+                FACEBOOK_JETON,
+                &[
+                    ("grant_type", "fb_exchange_token"),
+                    ("client_id", client_id),
+                    ("client_secret", secret_texte),
+                    ("fb_exchange_token", jeton.acces.expose_for_transport()),
+                ],
+            )
+            .await
+        }
+        _ => Ok(jeton),
     }
-    // Instagram, second maillon OBLIGATOIRE : le jeton de
-    // api.instagram.com/oauth/access_token est court ; l'échange
-    // `ig_exchange_token` le troque contre le jeton long « valid for 60 days »
-    // (long-lived-tokens, relevé 2026-09-02). C'est le long qu'on scelle —
-    // sceller le court condamnerait le compte à mourir dans l'heure.
-    let long = obtenir_jeton_en_get(
-        INSTAGRAM_JETON_LONG,
-        &[
-            ("grant_type", "ig_exchange_token"),
-            ("client_secret", secret_texte),
-            ("access_token", jeton.acces.expose_for_transport()),
-        ],
-    )
-    .await?;
-    Ok(copie_en_rafraichissement(long))
 }
 
 /// Instagram n'a PAS de refresh_token séparé : le jeton long se rafraîchit
@@ -563,8 +631,10 @@ pub async fn rafraichir(
     rafraichissement: &Secret,
 ) -> Result<JetonEmis, ErreurPlateforme> {
     match plateforme {
-        PlateformeOauth::Linkedin => Err(ErreurPlateforme::RafraichissementIndisponible),
-        PlateformeOauth::Instagram => {
+        PlateformeOauth::Linkedin | PlateformeOauth::FacebookPage => {
+            Err(ErreurPlateforme::RafraichissementIndisponible)
+        }
+        PlateformeOauth::Instagram | PlateformeOauth::InstagramReels => {
             // Le jeton long se rafraîchit LUI-MÊME (`sealed_refresh` en porte
             // la copie) — exige un jeton « at least 24 hours old » ET encore
             // valide (refresh_access_token, relevé 2026-09-02). C'est pour ce
@@ -574,6 +644,19 @@ pub async fn rafraichir(
                 INSTAGRAM_RAFRAICHIR,
                 &[
                     ("grant_type", "ig_refresh_token"),
+                    ("access_token", rafraichissement.expose_for_transport()),
+                ],
+            )
+            .await?;
+            Ok(copie_en_rafraichissement(frais))
+        }
+        PlateformeOauth::Threads => {
+            // `th_refresh_token`, jeton « at least 24 hours old » et encore
+            // valide — même fenêtre proactive que Instagram.
+            let frais = obtenir_jeton_en_get(
+                THREADS_RAFRAICHIR,
+                &[
+                    ("grant_type", "th_refresh_token"),
                     ("access_token", rafraichissement.expose_for_transport()),
                 ],
             )
@@ -639,7 +722,9 @@ async fn poster_jeton(
     let point = match plateforme {
         PlateformeOauth::X => X_JETON,
         PlateformeOauth::Linkedin => LINKEDIN_JETON,
-        PlateformeOauth::Instagram => INSTAGRAM_JETON,
+        PlateformeOauth::Instagram | PlateformeOauth::InstagramReels => INSTAGRAM_JETON,
+        PlateformeOauth::FacebookPage => FACEBOOK_JETON,
+        PlateformeOauth::Threads => THREADS_JETON,
         PlateformeOauth::Tiktok => TIKTOK_JETON,
         PlateformeOauth::Youtube => YOUTUBE_JETON,
     };
@@ -709,7 +794,11 @@ pub async fn identite(
     let (point, query): (&str, &[(&str, &str)]) = match plateforme {
         PlateformeOauth::X => (X_ME, &[]),
         PlateformeOauth::Linkedin => (LINKEDIN_USERINFO, &[]),
-        PlateformeOauth::Instagram => (INSTAGRAM_ME, &[("fields", "user_id,username")]),
+        PlateformeOauth::Instagram | PlateformeOauth::InstagramReels => {
+            (INSTAGRAM_ME, &[("fields", "user_id,username")])
+        }
+        PlateformeOauth::FacebookPage => (FACEBOOK_ME, &[("fields", "id,name")]),
+        PlateformeOauth::Threads => (THREADS_ME, &[("fields", "id,username")]),
         PlateformeOauth::Tiktok => (TIKTOK_USERINFO, &[("fields", "open_id,display_name")]),
         PlateformeOauth::Youtube => (YOUTUBE_CHANNELS, &[("part", "snippet"), ("mine", "true")]),
     };
@@ -791,6 +880,105 @@ pub async fn lister_organisations(acces: &Secret) -> Result<Vec<String>, ErreurP
     organisations_depuis(statut, &corps)
 }
 
+fn id_page(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 32 && id.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Une Page que le membre peut publier. Pas de `Debug` : `jeton` est le
+/// jeton de Page, il ne doit pas finir dans un log.
+pub struct PageFacebook {
+    pub id: String,
+    pub nom: String,
+    pub jeton: Secret,
+}
+
+/// `GET /me/accounts?fields=id,name,access_token,tasks`. On ne garde que les
+/// Pages dont la tâche est CREATE_CONTENT ou MANAGE (reels-publishing :
+/// « app user who can perform the CREATE_CONTENT task »). Sans tableau
+/// `tasks`, on garde la Page : le champ est parfois omis.
+pub fn pages_depuis(
+    statut: u16,
+    corps: &[u8],
+) -> Result<(Vec<PageFacebook>, Option<String>), ErreurPlateforme> {
+    let document = crate::adapters::lire_json(statut, corps)?;
+    let elements = document
+        .get("data")
+        .and_then(|v| v.as_array())
+        .ok_or(ErreurPlateforme::Illisible)?;
+    let mut pages = Vec::new();
+    for element in elements {
+        let Some(id) = element.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !id_page(id) {
+            continue;
+        }
+        let Some(jeton) = element.get("access_token").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if jeton.is_empty() {
+            continue;
+        }
+        if let Some(tasks) = element.get("tasks").and_then(|v| v.as_array()) {
+            let peut = tasks
+                .iter()
+                .any(|t| matches!(t.as_str(), Some("CREATE_CONTENT") | Some("MANAGE")));
+            if !peut {
+                continue;
+            }
+        }
+        let nom = element.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+        pages.push(PageFacebook {
+            id: id.to_owned(),
+            nom: nom.to_owned(),
+            jeton: Secret::new(jeton),
+        });
+    }
+    let suivant = document
+        .pointer("/paging/cursors/after")
+        .and_then(|v| v.as_str())
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= 2048
+                && s.bytes()
+                    .all(|b| b.is_ascii() && !b.is_ascii_whitespace() && b != b'&' && b != b'#')
+        })
+        .map(str::to_owned);
+    Ok((pages, suivant))
+}
+
+/// Liste les Pages. Le curseur `after` repart en query encodée, jamais collé
+/// dans une URL copiée de `paging.next` (cette URL porte souvent le jeton).
+pub async fn lister_pages(acces: &Secret) -> Result<Vec<PageFacebook>, ErreurPlateforme> {
+    let mut curseur: Option<String> = None;
+    let mut toutes = Vec::new();
+    for _ in 0..4 {
+        let mut requete = http()
+            .get(FACEBOOK_PAGES)
+            .bearer_auth(acces.expose_for_transport())
+            .query(&[("fields", "id,name,access_token,tasks"), ("limit", "50")]);
+        if let Some(apres) = &curseur {
+            requete = requete.query(&[("after", apres.as_str())]);
+        }
+        let reponse = requete
+            .send()
+            .await
+            .map_err(|_| ErreurPlateforme::Injoignable)?;
+        let statut = reponse.status().as_u16();
+        let corps = reponse
+            .bytes()
+            .await
+            .map_err(|_| ErreurPlateforme::Injoignable)?;
+        let (pages, suivant) = pages_depuis(statut, &corps)?;
+        toutes.extend(pages);
+        match suivant {
+            Some(c) if curseur.as_deref() != Some(c.as_str()) => curseur = Some(c),
+            _ => break,
+        }
+    }
+    Ok(toutes)
+}
+
 /// LinkedIn : `{"sub": "782bbtaQ", ...}` → `urn:li:person:{sub}` — `sub` est
 /// « User identifier » (sign-in-with-linkedin-v2) et l'URN d'auteur du Posts
 /// API est `urn:li:person:{id}` (post-api-schema) ; l'URN sert aux deux
@@ -822,7 +1010,15 @@ pub fn identite_depuis(
         // `{"user_id": "...", "username": "..."}` (ig-user, relevé 2026-09-02).
         // Le username est le handle humain ; `user_id` est l'id que les
         // chemins `/{ig-user-id}/media` exigent.
-        PlateformeOauth::Instagram => Ok((champ("/username")?, champ("/user_id")?)),
+        PlateformeOauth::Instagram | PlateformeOauth::InstagramReels => {
+            Ok((champ("/username")?, champ("/user_id")?))
+        }
+        // `GET /me?fields=id,name` — l'id est le sujet de la suppression,
+        // le nom n'est que le message du callback. Les comptes scellés sont
+        // les Pages, pas cet utilisateur.
+        PlateformeOauth::FacebookPage => Ok((champ("/name")?, champ("/id")?)),
+        // `GET graph.threads.net/v1.0/me?fields=id,username`.
+        PlateformeOauth::Threads => Ok((champ("/username")?, champ("/id")?)),
         // `GET /v2/user/info/` enveloppe sous `data.user` (get-user-info,
         // relevé 2026-09-02) ; `open_id` est l'identifiant de TOUS les
         // endpoints Content Posting/Display.
@@ -1085,6 +1281,15 @@ mod tests {
             YOUTUBE_AUTORISATION,
             YOUTUBE_JETON,
             YOUTUBE_CHANNELS,
+            FACEBOOK_AUTORISATION,
+            FACEBOOK_JETON,
+            FACEBOOK_ME,
+            FACEBOOK_PAGES,
+            THREADS_AUTORISATION,
+            THREADS_JETON,
+            THREADS_JETON_LONG,
+            THREADS_RAFRAICHIR,
+            THREADS_ME,
         ] {
             assert!(point.starts_with("https://"), "{point}");
         }
@@ -1156,6 +1361,109 @@ mod tests {
         assert_eq!(params["prompt"], "consent");
         assert_eq!(params["scope"], YOUTUBE_SCOPES);
         assert!(flux.verifieur_scelle.is_none());
+    }
+
+    #[test]
+    fn le_second_connecteur_meta_a_ses_propres_portees() {
+        // La version Facebook est celle du connecteur historique : un bump
+        // de VERSION_GRAPH qui oublie ces URL casse le test.
+        assert!(FACEBOOK_AUTORISATION.contains(crate::adapters::instagram::VERSION_GRAPH));
+        assert!(FACEBOOK_JETON.contains(crate::adapters::instagram::VERSION_GRAPH));
+        for (pf, scopes, hote) in [
+            (
+                PlateformeOauth::InstagramReels,
+                INSTAGRAM_REELS_SCOPES,
+                INSTAGRAM_AUTORISATION,
+            ),
+            (
+                PlateformeOauth::FacebookPage,
+                FACEBOOK_PAGE_SCOPES,
+                FACEBOOK_AUTORISATION,
+            ),
+            (
+                PlateformeOauth::Threads,
+                THREADS_SCOPES,
+                THREADS_AUTORISATION,
+            ),
+        ] {
+            let flux = demarrer(
+                pf,
+                "app-2",
+                "https://social-local.orizn.app/oauth/callback",
+                tenant(),
+                &chiffre(),
+            )
+            .expect("démarrage");
+            let params = parametres(&flux.authorize_url);
+            assert!(
+                flux.authorize_url.starts_with(hote),
+                "{}",
+                flux.authorize_url
+            );
+            assert_eq!(params["scope"], scopes);
+            assert_eq!(
+                params["redirect_uri"],
+                "https://social-local.orizn.app/oauth/callback"
+            );
+            assert!(flux.verifieur_scelle.is_none(), "pas de PKCE documenté");
+            assert!(params.contains_key("state"));
+        }
+        // Pas les portées du connecteur historique (messages, commentaires).
+        assert!(!INSTAGRAM_REELS_SCOPES.contains("manage_messages"));
+        assert!(!INSTAGRAM_REELS_SCOPES.contains("manage_comments"));
+        assert!(
+            INSTAGRAM_SCOPES.contains("instagram_business_manage_messages"),
+            "le connecteur historique garde ses portées"
+        );
+    }
+
+    #[test]
+    fn les_pages_se_lisent_sans_garder_un_jeton_dans_l_erreur() {
+        let corps = br#"{"data":[
+            {"id":"111","name":"Clip","access_token":"JETON-PAGE","tasks":["CREATE_CONTENT"]},
+            {"id":"222","name":"Lecture","access_token":"AUTRE","tasks":["ANALYZE"]},
+            {"id":"333","name":"Sans tache","access_token":"JETON-3"}
+        ],"paging":{"cursors":{"after":"CURSEUR_1"}}}"#;
+        let (pages, suivant) = pages_depuis(200, corps).expect("forme documentée");
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].id, "111");
+        assert_eq!(pages[0].nom, "Clip");
+        assert_eq!(pages[0].jeton.expose_for_transport(), "JETON-PAGE");
+        assert_eq!(pages[1].id, "333");
+        assert_eq!(suivant.as_deref(), Some("CURSEUR_1"));
+        let limite = br#"{"error":{"message":"access_token=NE-DOIT-PAS-FUITER","code":32}}"#;
+        match pages_depuis(400, limite) {
+            Err(err) => {
+                assert_eq!(err, ErreurPlateforme::LimitePublication);
+                assert!(!err.to_string().contains("NE-DOIT-PAS-FUITER"));
+            }
+            Ok(_) => panic!("une limite doit être une erreur"),
+        }
+    }
+
+    #[test]
+    fn l_identite_du_second_connecteur_se_lit_comme_ses_docs() {
+        let ig = identite_depuis(
+            PlateformeOauth::InstagramReels,
+            200,
+            br#"{"user_id":"17841405822304914","username":"cliponit"}"#,
+        )
+        .unwrap();
+        assert_eq!(ig, ("cliponit".into(), "17841405822304914".into()));
+        let fb = identite_depuis(
+            PlateformeOauth::FacebookPage,
+            200,
+            br#"{"id":"99","name":"Ada"}"#,
+        )
+        .unwrap();
+        assert_eq!(fb, ("Ada".into(), "99".into()));
+        let th = identite_depuis(
+            PlateformeOauth::Threads,
+            200,
+            br#"{"id":"77","username":"ada"}"#,
+        )
+        .unwrap();
+        assert_eq!(th, ("ada".into(), "77".into()));
     }
 
     #[test]

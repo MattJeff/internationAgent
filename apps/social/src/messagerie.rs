@@ -565,11 +565,11 @@ mod tests {
         // La v3 du chantier IG/TikTok/YouTube reste dans l'historique des
         // empreintes. La dernière ligne est la table courante : si elle
         // bouge sans bump, `mcp::la_table_ne_change_pas_sans_bumper` tombe.
-        assert_eq!(mcp::VERSION_TABLE, "4");
+        assert_eq!(mcp::VERSION_TABLE, "5");
         let calculee = empreinte(&mcp::description_outils().to_string());
         assert_ne!(
-            calculee, "c157ded060cf557fbf68c1166b34b71a438c46022e54d3e6c132123b33023e78",
-            "la table v4 ne doit pas recopier l'empreinte v3"
+            calculee, "6fafe523394acc902b86150208403d169c242e705da30e2b64b500cde568f9c7",
+            "la table v5 ne doit pas recopier l'empreinte v4"
         );
     }
 
@@ -843,6 +843,8 @@ mod tests {
             oauth_meta: None,
             oauth_tiktok: None,
             oauth_google: None,
+            oauth_meta2: None,
+            oauth_threads: None,
             linkedin_org: false,
             approval_ttl_hours: 72,
             depot: Arc::new(medias::DepotMedias::new()),

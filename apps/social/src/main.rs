@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use axum::extract::{Query, State};
+use axum::extract::{Form, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -33,6 +33,7 @@ pub mod file;
 pub mod mcp;
 pub mod medias;
 pub mod messagerie;
+pub mod meta_conformite;
 pub mod oauth_flux;
 pub mod store;
 pub mod tenants;
@@ -117,6 +118,11 @@ async fn main() -> anyhow::Result<()> {
         oauth_meta: credentiels_env("SOCIAL_META_CLIENT_ID", "SOCIAL_META_CLIENT_SECRET"),
         oauth_tiktok: credentiels_env("SOCIAL_TIKTOK_CLIENT_ID", "SOCIAL_TIKTOK_CLIENT_SECRET"),
         oauth_google: credentiels_env("SOCIAL_GOOGLE_CLIENT_ID", "SOCIAL_GOOGLE_CLIENT_SECRET"),
+        // Second connecteur. Lu seulement si les DEUX variables sont là.
+        // Absent = instagram_reels / facebook_page / threads simplement
+        // injoignables à la connexion. N'écrase pas SOCIAL_META_*.
+        oauth_meta2: credentiels_env("META2_APP_ID", "META2_APP_SECRET"),
+        oauth_threads: credentiels_env("META2_THREADS_APP_ID", "META2_THREADS_APP_SECRET"),
         linkedin_org: drapeau_env("SOCIAL_LINKEDIN_ORG_POSTING"),
         approval_ttl_hours: std::env::var("SOCIAL_APPROVAL_TTL_HOURS")
             .ok()
@@ -180,6 +186,11 @@ fn routeur(etat: Arc<mcp::Etat>) -> Router {
         .route("/livez", get(|| async { "ok" }))
         .route("/oauth/callback", get(retour_oauth))
         .route("/medias/{digest}", get(servir_media))
+        .route("/meta/data-deletion", post(suppression_meta2))
+        .route("/meta/deauthorize", post(desautorisation_meta2))
+        .route("/meta/threads/data-deletion", post(suppression_threads))
+        .route("/meta/threads/deauthorize", post(desautorisation_threads))
+        .route("/meta/deletion-status", get(statut_suppression))
         .with_state(etat)
 }
 
@@ -354,6 +365,9 @@ async fn retour_oauth(
         Ok(j) => j,
         Err(e) => return refus(&e.to_string()),
     };
+    if plateforme == "facebook_page" {
+        return finir_facebook(&etat, tenant, tenant_id, jeton).await;
+    }
     let (handle, id_plateforme) = match oauth_flux::identite(pf, &jeton.acces).await {
         Ok(h) => h,
         Err(e) => return refus(&format!("identite du compte introuvable : {e}")),
@@ -373,21 +387,36 @@ async fn retour_oauth(
         oauth_flux::sceller_rafraichissement(&etat.chiffreur, tenant_id, &plateforme, &handle, r)
             .ok()
     });
-    if store::connecter_compte(
-        &etat.pool,
-        tenant,
-        &plateforme,
-        &handle,
-        Some(&id_plateforme),
-        &scelle,
-        refresh_scelle.as_deref(),
-        // L'heure de mort annoncee du jeton : c'est elle que le
-        // rafraichissement PROACTIF d'Instagram (mcp::jeton_frais) lit.
-        Some(jeton.duree_s as i64),
-    )
-    .await
-    .is_err()
-    {
+    // L'heure de mort annoncee du jeton : c'est elle que le
+    // rafraichissement PROACTIF (Instagram, Reels, Threads) lit.
+    let duree = Some(jeton.duree_s as i64);
+    let enregistre = if plateforme == "instagram_reels" || plateforme == "threads" {
+        store::connecter_compte_sujet(
+            &etat.pool,
+            tenant,
+            &plateforme,
+            &handle,
+            Some(&id_plateforme),
+            &scelle,
+            refresh_scelle.as_deref(),
+            duree,
+            Some(&id_plateforme),
+        )
+        .await
+    } else {
+        store::connecter_compte(
+            &etat.pool,
+            tenant,
+            &plateforme,
+            &handle,
+            Some(&id_plateforme),
+            &scelle,
+            refresh_scelle.as_deref(),
+            duree,
+        )
+        .await
+    };
+    if enregistre.is_err() {
         return refus("le compte n'a pas pu etre enregistre");
     }
     let mut pages = 0usize;
@@ -437,9 +466,195 @@ async fn retour_oauth(
         }
     }
     Html(format!(
-        "<p>Compte <b>{handle}</b> connecte sur {plateforme}. Pages organisation : {pages}. Vous pouvez fermer cet onglet.</p>"
+        "<p>Compte <b>{}</b> connecte sur {}. Pages organisation : {pages}. Vous pouvez fermer cet onglet.</p>",
+        meta_conformite::echapper(&handle),
+        meta_conformite::echapper(&plateforme),
     ))
     .into_response()
+}
+
+/// Facebook Login : on ne scelle PAS le jeton utilisateur. Chaque Page avec
+/// le droit de publier devient une ligne `facebook_page`, jeton de Page,
+/// `meta_user_id` = l'utilisateur qui a consenti (suppression de données).
+async fn finir_facebook(
+    etat: &mcp::Etat,
+    tenant: uuid::Uuid,
+    tenant_id: agentos_domain::ids::TenantId,
+    jeton: oauth_flux::JetonEmis,
+) -> Response {
+    let refus = |pourquoi: &str| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Connexion refusee : {pourquoi}"),
+        )
+            .into_response()
+    };
+    let (nom, user_id) =
+        match oauth_flux::identite(oauth_flux::PlateformeOauth::FacebookPage, &jeton.acces).await {
+            Ok(v) => v,
+            Err(e) => return refus(&format!("identite Facebook introuvable : {e}")),
+        };
+    if !user_id.bytes().all(|b| b.is_ascii_digit()) {
+        return refus("identite Facebook illisible");
+    }
+    let pages = match oauth_flux::lister_pages(&jeton.acces).await {
+        Ok(p) => p,
+        Err(e) => return refus(&e.to_string()),
+    };
+    if pages.is_empty() {
+        return refus(
+            "aucune Page avec le droit de publier (tâche CREATE_CONTENT ou MANAGE sur la Page)",
+        );
+    }
+    let mut noms = Vec::new();
+    for page in pages {
+        let Ok(scelle) = oauth_flux::sceller_jeton(
+            &etat.chiffreur,
+            tenant_id,
+            "facebook_page",
+            &page.id,
+            &page.jeton,
+        ) else {
+            continue;
+        };
+        if store::connecter_compte_sujet(
+            &etat.pool,
+            tenant,
+            "facebook_page",
+            &page.id,
+            Some(&page.id),
+            &scelle,
+            None,
+            None,
+            Some(&user_id),
+        )
+        .await
+        .is_ok()
+        {
+            noms.push(meta_conformite::echapper(&page.nom));
+        }
+    }
+    if noms.is_empty() {
+        return refus("les Pages n'ont pas pu être enregistrées");
+    }
+    Html(format!(
+        "<p>Pages Facebook connectées pour {} : {}. Vous pouvez fermer cet onglet.</p>",
+        meta_conformite::echapper(&nom),
+        noms.join(", ")
+    ))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct FormulaireSigne {
+    signed_request: String,
+}
+
+async fn suppression_meta2(
+    State(etat): State<Arc<mcp::Etat>>,
+    Form(form): Form<FormulaireSigne>,
+) -> Response {
+    traiter_signature(&etat, &form.signed_request, "meta2", true).await
+}
+
+async fn desautorisation_meta2(
+    State(etat): State<Arc<mcp::Etat>>,
+    Form(form): Form<FormulaireSigne>,
+) -> Response {
+    traiter_signature(&etat, &form.signed_request, "meta2", false).await
+}
+
+async fn suppression_threads(
+    State(etat): State<Arc<mcp::Etat>>,
+    Form(form): Form<FormulaireSigne>,
+) -> Response {
+    traiter_signature(&etat, &form.signed_request, "threads", true).await
+}
+
+async fn desautorisation_threads(
+    State(etat): State<Arc<mcp::Etat>>,
+    Form(form): Form<FormulaireSigne>,
+) -> Response {
+    traiter_signature(&etat, &form.signed_request, "threads", false).await
+}
+
+async fn traiter_signature(
+    etat: &mcp::Etat,
+    signed_request: &str,
+    app: &str,
+    avec_statut: bool,
+) -> Response {
+    let credentiels = match app {
+        "threads" => etat.oauth_threads.as_ref(),
+        _ => etat.oauth_meta2.as_ref(),
+    };
+    let Some(credentiels) = credentiels else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "connector_disabled"})),
+        )
+            .into_response();
+    };
+    let Ok(sujet) = meta_conformite::utilisateur_signe(
+        signed_request,
+        credentiels.client_secret.expose_for_transport(),
+    ) else {
+        return (StatusCode::BAD_REQUEST, "signature invalide").into_response();
+    };
+    let comptes = match store::revoquer_sujet_meta(
+        &etat.pool,
+        &sujet,
+        meta_conformite::plateformes_concernees(app),
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    tracing::info!(app, comptes, "suppression ou desautorisation meta");
+    if !avec_statut {
+        return Json(json!({"success": true})).into_response();
+    }
+    let code = meta_conformite::code_confirmation();
+    let comptes_i = i32::try_from(comptes).unwrap_or(i32::MAX);
+    if store::noter_suppression_meta(&etat.pool, &code, app, comptes_i)
+        .await
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    Json(json!({
+        "url": meta_conformite::url_statut(&etat.url_publique, &code),
+        "confirmation_code": code,
+    }))
+    .into_response()
+}
+
+async fn statut_suppression(
+    State(etat): State<Arc<mcp::Etat>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let code = params.get("code").map(String::as_str).unwrap_or("");
+    if !meta_conformite::code_confirmation_valide(code) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Ok(Some(ligne)) = store::lire_suppression_meta(&etat.pool, code).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let page = meta_conformite::page_statut(&meta_conformite::StatutSuppression {
+        code: ligne.code,
+        app: ligne.app,
+        comptes: ligne.comptes,
+        quand: ligne.quand,
+    });
+    (
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+        ],
+        Html(page),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -447,6 +662,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use sqlx::Row;
     use tower::ServiceExt;
 
     async fn etat_nu() -> Option<Arc<mcp::Etat>> {
@@ -464,6 +680,8 @@ mod tests {
             oauth_meta: None,
             oauth_tiktok: None,
             oauth_google: None,
+            oauth_meta2: None,
+            oauth_threads: None,
             linkedin_org: false,
             approval_ttl_hours: 72,
             depot: Arc::new(medias::DepotMedias::new()),
@@ -603,5 +821,125 @@ mod tests {
         etat.depot.retirer(&digest);
         let rep = get(format!("/medias/{digest}")).await;
         assert_eq!(rep.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// La suppression signée révoque le second connecteur et laisse le
+    /// connecteur historique (`instagram`, même sujet posé exprès) intact.
+    #[tokio::test]
+    async fn la_suppression_meta_verifie_la_signature_et_epargne_l_historique() {
+        let Some(nu) = etat_nu().await else { return };
+        let secret = "secret-de-test-meta2";
+        let etat = Arc::new(mcp::Etat {
+            pool: nu.pool.clone(),
+            chiffreur: nu.chiffreur.clone(),
+            adaptateurs: Vec::new(),
+            telechargeur: medias::Telechargeur::new(),
+            url_publique: "https://social-local.orizn.app".into(),
+            oauth_x: None,
+            oauth_linkedin: None,
+            oauth_meta: None,
+            oauth_tiktok: None,
+            oauth_google: None,
+            oauth_meta2: Some(mcp::CredentielsClient {
+                client_id: "app-meta2".into(),
+                client_secret: agentos_providers::Secret::new(secret),
+            }),
+            oauth_threads: None,
+            linkedin_org: false,
+            approval_ttl_hours: 72,
+            depot: Arc::new(medias::DepotMedias::new()),
+            adaptateurs_messagerie: Vec::new(),
+        });
+        let tenant = uuid::Uuid::now_v7();
+        sqlx::query("INSERT INTO social_tenants (id, label, token_hash) VALUES ($1, $2, $3)")
+            .bind(tenant)
+            .bind(format!("meta2-{tenant}"))
+            .bind(vec![0u8; 32])
+            .execute(&etat.pool)
+            .await
+            .unwrap();
+        for plateforme in ["instagram", "instagram_reels"] {
+            store::connecter_compte_sujet(
+                &etat.pool,
+                tenant,
+                plateforme,
+                "ada",
+                Some("218471"),
+                b"jeton-scelle",
+                None,
+                None,
+                Some("218471"),
+            )
+            .await
+            .unwrap();
+        }
+        let signe =
+            meta_conformite::signer(r#"{"algorithm":"HMAC-SHA256","user_id":"218471"}"#, secret);
+        let mauvais = routeur(etat.clone())
+            .oneshot(
+                Request::post("/meta/data-deletion")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("signed_request=pas.une.signature"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mauvais.status(), StatusCode::BAD_REQUEST);
+
+        let rep = routeur(etat.clone())
+            .oneshot(
+                Request::post("/meta/data-deletion")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("signed_request={signe}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rep.status(), StatusCode::OK);
+        let corps = axum::body::to_bytes(rep.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&corps).unwrap();
+        let code = v["confirmation_code"].as_str().unwrap();
+        assert!(v["url"].as_str().unwrap().contains(code));
+        assert!(!v.to_string().contains("218471"));
+
+        let page = routeur(etat.clone())
+            .oneshot(
+                Request::get(format!("/meta/deletion-status?code={code}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        let html = axum::body::to_bytes(page.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let html = String::from_utf8(html.to_vec()).unwrap();
+        assert!(html.contains(code));
+        assert!(!html.contains("218471"));
+
+        let lignes = sqlx::query(
+            "SELECT platform, status, sealed_token IS NOT NULL AS a_un_jeton \
+             FROM social_accounts WHERE tenant_id = $1 ORDER BY platform",
+        )
+        .bind(tenant)
+        .fetch_all(&etat.pool)
+        .await
+        .unwrap();
+        for ligne in lignes {
+            let plateforme: String = ligne.get("platform");
+            let statut: String = ligne.get("status");
+            let a_un_jeton: bool = ligne.get("a_un_jeton");
+            if plateforme == "instagram" {
+                assert_eq!(statut, "connected");
+                assert!(a_un_jeton, "le connecteur historique garde son jeton");
+            } else {
+                assert_eq!(plateforme, "instagram_reels");
+                assert_eq!(statut, "revoked");
+                assert!(!a_un_jeton);
+            }
+        }
     }
 }

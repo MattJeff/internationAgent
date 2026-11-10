@@ -55,6 +55,11 @@ pub struct Etat {
     /// Le client Google (console.cloud.google.com) — la plateforme des tables
     /// s'appelle `youtube`.
     pub oauth_google: Option<CredentielsClient>,
+    /// Second connecteur Meta (Instagram Reels + Pages). Absent = désactivé.
+    /// Ne partage pas `oauth_meta` : autre app, autres comptes.
+    pub oauth_meta2: Option<CredentielsClient>,
+    /// App Threads (`META2_THREADS_*`). Absente = plateforme `threads` désactivée.
+    pub oauth_threads: Option<CredentielsClient>,
     /// `SOCIAL_LINKEDIN_ORG_POSTING` : demande `w_organization_social` et
     /// enregistre une ligne de compte par page, en plus du membre.
     pub linkedin_org: bool,
@@ -94,8 +99,26 @@ impl Etat {
             "instagram" => Some(PlateformeOauth::Instagram).zip(self.oauth_meta.as_ref()),
             "tiktok" => Some(PlateformeOauth::Tiktok).zip(self.oauth_tiktok.as_ref()),
             "youtube" => Some(PlateformeOauth::Youtube).zip(self.oauth_google.as_ref()),
+            "instagram_reels" => {
+                Some(PlateformeOauth::InstagramReels).zip(self.oauth_meta2.as_ref())
+            }
+            "facebook_page" => Some(PlateformeOauth::FacebookPage).zip(self.oauth_meta2.as_ref()),
+            "threads" => Some(PlateformeOauth::Threads).zip(self.oauth_threads.as_ref()),
             _ => None,
         }
+    }
+}
+
+/// Le préfixe des variables d'environnement à citer quand OAuth n'est pas
+/// configuré. `instagram` reste `SOCIAL_META` : le second connecteur ne le
+/// réutilise pas.
+pub(crate) fn prefixe_oauth(plateforme: &str) -> String {
+    match plateforme {
+        "instagram" => "SOCIAL_META".to_owned(),
+        "youtube" => "SOCIAL_GOOGLE".to_owned(),
+        "instagram_reels" | "facebook_page" => "META2_APP".to_owned(),
+        "threads" => "META2_THREADS_APP".to_owned(),
+        autre => format!("SOCIAL_{}", autre.to_uppercase()),
     }
 }
 
@@ -113,7 +136,9 @@ impl Etat {
 /// v4 (phase 1) : fils X, calendrier, approbation. Les six outils d'origine
 /// gardent leurs champs ; `placement` et `delivery` s'ajoutent, optionnels.
 /// `publish_at` est honoré partout par la file durable.
-pub const VERSION_TABLE: &str = "4";
+/// v5 : `instagram_reels`, `facebook_page`, `threads` (second connecteur Meta).
+/// `instagram` ne bouge pas.
+pub const VERSION_TABLE: &str = "5";
 
 /// La table d'éditeur. Le pin SHA-256 du runtime la fige : tout ajout bumpe
 /// [`VERSION_TABLE`]. `approval_decide` est un outil du service pour que la
@@ -128,10 +153,10 @@ pub fn description_outils() -> Value {
         },
         {
             "name": "account_connect_url",
-            "description": "L'URL d'autorisation OAuth a ouvrir pour connecter un compte. Le retour se fait sur GET /oauth/callback.",
+            "description": "L'URL d'autorisation OAuth a ouvrir pour connecter un compte. Le retour se fait sur GET /oauth/callback. instagram_reels, facebook_page et threads sont le second connecteur Meta (META2_*), distinct de instagram.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "platform": { "type": "string", "enum": ["x", "linkedin", "instagram", "tiktok", "youtube"] } },
+                "properties": { "platform": { "type": "string", "enum": ["x", "linkedin", "instagram", "tiktok", "youtube", "instagram_reels", "facebook_page", "threads"] } },
                 "required": ["platform"],
                 "additionalProperties": false
             }
@@ -772,11 +797,7 @@ async fn connecter(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Err
     // l'echange du retour echouerait de toute facon. Les VRAIS noms de
     // variables — la derivation SOCIAL_{PLATFORM}_* mentirait pour instagram
     // (l'app client vit chez Meta) et youtube (chez Google).
-    let prefixe = match plateforme {
-        "instagram" => "SOCIAL_META".to_owned(),
-        "youtube" => "SOCIAL_GOOGLE".to_owned(),
-        autre => format!("SOCIAL_{}", autre.to_uppercase()),
-    };
+    let prefixe = prefixe_oauth(plateforme);
     let Some((pf, credentiels)) = etat.oauth(plateforme) else {
         return Err(Erreur::nouvelle(
             "oauth_non_configure",
@@ -1211,7 +1232,10 @@ pub(crate) fn doit_rafraichir(
     maintenant_epoch: i64,
 ) -> bool {
     const SEPT_JOURS_S: i64 = 7 * 24 * 3600;
-    plateforme == "instagram"
+    // Instagram historique, Reels (même ig_refresh_token) et Threads
+    // (th_refresh_token) : le jeton long meurt pour de bon s'il expire.
+    // Le jeton de Page Facebook, lui, n'expire pas.
+    matches!(plateforme, "instagram" | "instagram_reels" | "threads")
         && expire_epoch.is_some_and(|expire| expire < maintenant_epoch + SEPT_JOURS_S)
 }
 
@@ -1301,10 +1325,15 @@ async fn metriques(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Err
 }
 
 fn verifier_options_plateforme(plateforme: &str, options: &OptionsPost) -> Result<(), Erreur> {
-    if options.placement.is_some() && plateforme != "instagram" {
+    if options.placement.is_some()
+        && !matches!(
+            plateforme,
+            "instagram" | "instagram_reels" | "facebook_page"
+        )
+    {
         return Err(Erreur::nouvelle(
             "argument_invalide",
-            "`placement` n'est servi que par instagram",
+            "`placement` n'est servi que par instagram, instagram_reels et facebook_page",
         ));
     }
     if options.livraison.is_some() && plateforme != "tiktok" {
@@ -2037,6 +2066,11 @@ mod tests {
             "4",
             "6fafe523394acc902b86150208403d169c242e705da30e2b64b500cde568f9c7",
         ),
+        // v5 : enum platform + instagram_reels, facebook_page, threads.
+        (
+            "5",
+            "9031ea9db0f5f3941b3a6f61bdf13137b35d652d8f0078f7ecdf88db490990b3",
+        ),
     ];
 
     #[test]
@@ -2198,6 +2232,8 @@ mod tests {
             oauth_meta: None,
             oauth_tiktok: None,
             oauth_google: None,
+            oauth_meta2: None,
+            oauth_threads: None,
             linkedin_org: false,
             approval_ttl_hours: 72,
             depot: Arc::new(medias::DepotMedias::new()),
@@ -2569,8 +2605,28 @@ mod tests {
         assert!(!doit_rafraichir("instagram", None, maintenant));
         // Les autres plateformes ont un refresh token qui survit au jeton :
         // leur chemin est 401 -> refresh, jamais le proactif.
-        for autre in ["x", "linkedin", "tiktok", "youtube"] {
+        for autre in ["x", "linkedin", "tiktok", "youtube", "facebook_page"] {
             assert!(!doit_rafraichir(autre, Some(maintenant - 1), maintenant));
         }
+        assert!(doit_rafraichir(
+            "instagram_reels",
+            Some(maintenant - 1),
+            maintenant
+        ));
+        assert!(doit_rafraichir("threads", Some(maintenant - 1), maintenant));
+        assert!(!doit_rafraichir(
+            "threads",
+            Some(maintenant + sept_jours + 1),
+            maintenant
+        ));
+    }
+
+    #[test]
+    fn le_second_connecteur_ne_cite_pas_les_variables_historiques() {
+        assert_eq!(prefixe_oauth("instagram"), "SOCIAL_META");
+        assert_eq!(prefixe_oauth("instagram_reels"), "META2_APP");
+        assert_eq!(prefixe_oauth("facebook_page"), "META2_APP");
+        assert_eq!(prefixe_oauth("threads"), "META2_THREADS_APP");
+        assert_ne!(prefixe_oauth("instagram"), prefixe_oauth("instagram_reels"));
     }
 }
