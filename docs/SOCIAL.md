@@ -65,7 +65,12 @@ d'un tiers.
    schéma : la table porte une version, et un test recalcule l'empreinte des
    schémas — changer un schéma sans bumper la version fait échouer le test.
 
-## Le contrat des six outils — et pas un de plus
+## Le contrat des outils d'éditeur
+
+Les six outils d'origine restent. La table v4 (phase 1, novembre 2026) en
+ajoute pour les fils, le calendrier et l'approbation. `approval_decide` est
+sur le service pour la route opérateur ; il n'est pas dans la table des
+employés.
 
 | Outil | Entrée | Sortie |
 |---|---|---|
@@ -75,6 +80,13 @@ d'un tiers.
 | `post_publish` | `{ idempotency_key, account_id, text, media?, poll?, made_with_ai?, expected_media_digests? }` | `{ post_id, platform_post_id, url }` — rejouable sans double ; `expected_media_digests` refuse (`media_change`) si les octets ne sont plus ceux contresignés |
 | `post_metrics` | `{ post_id }` | impressions/likes/reposts si la plateforme les sert — et quand elle ne les sert pas (LinkedIn membre), l'outil LE DIT au lieu de rendre des zéros |
 | `posts_list` | `{ limit? }` | l'historique du tenant |
+| `thread_preview` | `{ account_id, posts[2..25] }` | aperçu de chaque élément + empreinte du fil entier |
+| `thread_publish` | `{ idempotency_key, account_id, posts, publish_at?, expected_media_digests? }` | un fil X, une clé. Échec partiel rapporté ; le rejeu ne republie pas le début |
+| `calendar_list` | `{ account_id?, from?, to? }` | créneaux, attentes, publications |
+| `schedule_post` | post ou fil + `publish_at` | créneau. Sans `release` : `pending_approval` |
+| `schedule_cancel` | `{ scheduled_id, publish_at? }` | annule, ou déplace si `publish_at` est posé |
+| `submit_for_approval` | post ou fil | `pending_approval`. Rien ne part |
+| `approval_decide` | `{ scheduled_id, decision: approve\|reject\|edit }` | humain seulement |
 
 Transport : `POST /mcp` (JSON-RPC 2.0 : `initialize`, `tools/list`,
 `tools/call`), `GET /livez`. Auth : `Authorization: Bearer <jeton par
@@ -129,6 +141,10 @@ Les cinq, chaque limite citée et datée dans son adaptateur :
   membre. Le produit « Share on LinkedIn » est self-serve : onglet Products
   de l'app, sans revue (learn.microsoft.com, Share on LinkedIn, relu
   2026-09-02 ; limites : 150 requêtes/jour/membre, 100 000/jour/app).
+  Page organisation, optionnelle : `SOCIAL_LINKEDIN_ORG_POSTING=1` ajoute
+  `w_organization_social` et une ligne de compte par page
+  (`urn:li:organization:…`), à côté du membre. Même contrainte
+  `UNIQUE (tenant, platform, handle)`.
   **Aucune analytics membre n'existe** (sonde 2026-09-02) : `post_metrics`
   répond « la plateforme ne les sert pas » au lieu de zéros — les analytics
   d'organisation sont derrière le Marketing API Program, hors périmètre.
@@ -139,9 +155,14 @@ Les cinq, chaque limite citée et datée dans son adaptateur :
   300 MB, carrousel 2–10, `is_ai_generated` servi (= `made_with_ai`),
   100 posts API/24 h (verdict informatif). Métriques : like_count +
   comments_count (les insights complets = chemin Facebook Login). Version
-  Graph figée v26.0. Tout rejoué le 2026-09-02 (ig-user/media,
+  Graph v27.0 (phase 1 ; v26.0 relevée le 2026-09-02). Stories :
+  `placement=story`, conteneur `STORIES`, aucun champ `caption`. Tout rejoué
+  le 2026-09-02 pour le reste (ig-user/media,
   content-publishing Instagram Login).
-* **TikTok** — Content Posting API (Direct Post) + Display API. Vidéo
+* **TikTok** — Content Posting API. `delivery=publish` (video.publish, Direct
+  Post) ou `delivery=draft` (video.upload, brouillon dans l'application).
+  FILE_UPLOAD chunké dans les deux cas. Si le niveau demandé n'est pas dans
+  `privacy_level_options` et que `SELF_ONLY` l'est, on retombe dessus. Vidéo
   MP4/WebM/MOV, titre ≤ 2200 unités UTF-16, FILE_UPLOAD direct ; photos
   WebP/JPEG jusqu'à 35, description ≤ 4000, PULL_FROM_URL seul (préfixe
   d'URL à vérifier au portail — voir la liste fondateur) ; `is_aigc` servi ;
@@ -154,16 +175,16 @@ Les cinq, chaque limite citée et datée dans son adaptateur :
   (256 GB côté plateforme, 512 MiB notre plafond), `media[].title`
   OBLIGATOIRE (`snippet.title`), texte = description, une image JPEG/PNG
   accompagnante = miniature (2 MB max, 50 unités), `privacy`
-  private/public/unlisted, `publish_at` (force private — « It can be set
-  only if the privacy status of the video is private », docs/videos, rejoué
-  le 2026-09-02). GRATUIT : le quota est la seule monnaie — le champ de
+  private/public/unlisted. `publish_at` est la file du service, plus
+  `status.publishAt`. GRATUIT : le quota est la seule monnaie — le champ de
   sortie `cout_quota` porte les unités, `cost_estimate_usd` reste `None`.
 
 Les médias (phase médias) : photos, vidéo, sondages, et documents PDF côté
 LinkedIn, dans les ARGUMENTS de `post_preview`/`post_publish` — table
-toujours à six outils, versions bumpées 1 → 2 (médias) → 3 (IG/TikTok/
-YouTube). Threads et les Pages Facebook restent hors périmètre (revues à
-déposer — liste ci-dessous).
+versions bumpées 1 → 2 (médias) → 3 (IG/TikTok/YouTube) → 4 (fils,
+calendrier, approbation). Les Pages Facebook et le réseau Threads restent
+hors périmètre (revues à déposer — liste ci-dessous). Les fils X, eux, sont
+dans l'éditeur.
 
 ## La seconde surface — `/mcp/messagerie`
 
@@ -261,7 +282,13 @@ liste qu'on relit pour rien :
      joignable — Instagram et TikTok tirent les médias dessus).
   2. **Frapper un jeton de tenant** : `agentos-social mint-tenant <label>`.
      Le jeton ne se frappe pas par une route, à dessein ; il se colle dans
-     `integrations_connect`, une fois, par locataire.
+     `integrations_connect`, une fois, par locataire. Ce geste n'est pas
+     automatisé : il se fait sur l'hôte du service, avec l'accord du locataire.
+* **Phase 1, noms seulement** (`.env.example`, compose) : `SOCIAL_LINKEDIN_ORG_POSTING`
+  (pages LinkedIn, `w_organization_social`), `SOCIAL_APPROVAL_TTL_HOURS` (défaut
+  72), `SOCIAL_SCHEDULER_POLL_SECS` (défaut 15). Un compte X connecté avant
+  `media.write`, ou TikTok avant `video.upload`, se répare par un
+  re-consentement (`account_connect_url`).
 * **Ce qui n'était pas nommé et qui l'est maintenant** : tant que la revue
   d'une plateforme n'est pas passée, le compte qui publie doit être un compte
   que cette revue autorise déjà — un RÔLE sur l'app Meta, un des cinq comptes

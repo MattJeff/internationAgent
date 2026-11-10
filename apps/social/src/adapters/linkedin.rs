@@ -666,13 +666,7 @@ impl Plateforme for Linkedin {
                     .to_owned(),
             );
         }
-        if options.publish_at.is_some() {
-            verdicts.push(
-                "linkedin ne sert pas `publish_at` : aucune planification dans posts-api \
-                 (relevé le 2026-09-02)"
-                    .to_owned(),
-            );
-        }
+        // `publish_at` : la file du service, pas posts-api. Informé, pas refusé.
 
         if made_with_ai {
             verdicts.push(
@@ -763,6 +757,11 @@ impl Plateforme for Linkedin {
         }
 
         let media: Vec<ApercuMedia> = medias.iter().map(apercu_media).collect();
+        let limites_ok =
+            !texte.trim().is_empty() && verdicts.is_empty() && media.iter().all(|m| m.limits_ok);
+        if options.publish_at.is_some() {
+            verdicts.push(super::VERDICT_CRENEAU.to_owned());
+        }
         Apercu {
             rendered_text: texte.to_owned(),
             digest: empreinte_globale(texte, medias, sondage, made_with_ai, options),
@@ -770,10 +769,8 @@ impl Plateforme for Linkedin {
             // `FIELD_LENGTH_TOO_LONG` mais ne publie AUCUN nombre pour
             // `commentary` (vérifié dans posts-api et post-api-schema le
             // 2026-09-02). On vérifie donc ce qui est documenté — pas vide —
-            // et rien d'inventé.
-            platform_limits_ok: !texte.trim().is_empty()
-                && verdicts.is_empty()
-                && media.iter().all(|m| m.limits_ok),
+            // et rien d'inventé. Le créneau est ajouté APRÈS ce calcul.
+            platform_limits_ok: limites_ok,
             // LinkedIn ne facture pas la création d'un post : `None`, pas 0.0 —
             // zéro affirmerait un tarif, None dit qu'il n'y a pas de compteur.
             cost_estimate_usd: None,
@@ -952,6 +949,8 @@ mod tests {
     const SANS: OptionsPost = OptionsPost {
         privacy: None,
         publish_at: None,
+        placement: None,
+        livraison: None,
     };
 
     fn avec_alt(mut m: MediaPret, alt: &str) -> MediaPret {

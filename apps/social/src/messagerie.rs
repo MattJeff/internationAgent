@@ -561,11 +561,15 @@ mod tests {
     /// change /mcp sans passer par le paragraphe de bump — interdit : c'est
     /// exactement le travail de ce test de forcer ce paragraphe a etre ecrit.
     #[test]
-    fn la_table_de_l_editeur_reste_celle_du_chantier_ig_tiktok_youtube() {
-        assert_eq!(mcp::VERSION_TABLE, "3");
-        assert_eq!(
-            empreinte(&mcp::description_outils().to_string()),
-            "c157ded060cf557fbf68c1166b34b71a438c46022e54d3e6c132123b33023e78"
+    fn la_table_de_l_editeur_reste_versionnee() {
+        // La v3 du chantier IG/TikTok/YouTube reste dans l'historique des
+        // empreintes. La dernière ligne est la table courante : si elle
+        // bouge sans bump, `mcp::la_table_ne_change_pas_sans_bumper` tombe.
+        assert_eq!(mcp::VERSION_TABLE, "4");
+        let calculee = empreinte(&mcp::description_outils().to_string());
+        assert_ne!(
+            calculee, "c157ded060cf557fbf68c1166b34b71a438c46022e54d3e6c132123b33023e78",
+            "la table v4 ne doit pas recopier l'empreinte v3"
         );
     }
 
@@ -839,6 +843,8 @@ mod tests {
             oauth_meta: None,
             oauth_tiktok: None,
             oauth_google: None,
+            linkedin_org: false,
+            approval_ttl_hours: 72,
             depot: Arc::new(medias::DepotMedias::new()),
             adaptateurs_messagerie: vec![Box::new(FauxMessagerie {
                 reponses: compteurs.reponses.clone(),

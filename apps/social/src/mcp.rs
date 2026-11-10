@@ -16,6 +16,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::adapters::{ErreurPlateforme, MediaPret, OptionsPost, Plateforme, Privacy, Sondage};
+use crate::file;
 use crate::medias;
 use crate::oauth_flux::{self, PlateformeOauth};
 use crate::store::{self, Reclamation};
@@ -54,6 +55,11 @@ pub struct Etat {
     /// Le client Google (console.cloud.google.com) — la plateforme des tables
     /// s'appelle `youtube`.
     pub oauth_google: Option<CredentielsClient>,
+    /// `SOCIAL_LINKEDIN_ORG_POSTING` : demande `w_organization_social` et
+    /// enregistre une ligne de compte par page, en plus du membre.
+    pub linkedin_org: bool,
+    /// Durée de vie d'une approbation, en heures. Défaut 72.
+    pub approval_ttl_hours: i64,
     /// Le dépôt des octets vettés pour les plateformes à modèle « pull »
     /// (images Instagram, photos TikTok). Servi par GET /medias/{digest}
     /// (main.rs) et alimenté par les adaptateurs via ContexteAdaptateurs —
@@ -103,14 +109,16 @@ impl Etat {
 /// echoue, et c'est son travail.
 /// v3 (chantier IG/TikTok/YouTube) : l'enum platform passe à cinq, et
 /// post_preview/post_publish gagnent deux champs optionnels — `privacy`
-/// (REQUIS par TikTok : `privacy_level` est obligatoire au Direct Post, et
-/// servi par YouTube : `status.privacyStatus` ; verdict refus ailleurs) et
-/// `publish_at` (ISO 8601, YouTube seul : `status.publishAt` ; verdict refus
-/// ailleurs) — relevés 2026-09-02.
-pub const VERSION_TABLE: &str = "3";
+/// et `publish_at`.
+/// v4 (phase 1) : fils X, calendrier, approbation. Les six outils d'origine
+/// gardent leurs champs ; `placement` et `delivery` s'ajoutent, optionnels.
+/// `publish_at` est honoré partout par la file durable.
+pub const VERSION_TABLE: &str = "4";
 
-/// Les six outils, et pas un de plus. C'est la piece que le pin SHA-256 du
-/// runtime fige, donc elle est une valeur deterministe, pas du code.
+/// La table d'éditeur. Le pin SHA-256 du runtime la fige : tout ajout bumpe
+/// [`VERSION_TABLE`]. `approval_decide` est un outil du service pour que la
+/// route opérateur puisse l'appeler ; il n'est pas recopié dans la table des
+/// employés (`crates/app/src/mcp_tools/social.rs`).
 pub fn description_outils() -> Value {
     json!([
         {
@@ -172,7 +180,9 @@ pub fn description_outils() -> Value {
                     // (status.publishAt, ISO 8601). Ailleurs : verdict refus
                     // de l'adaptateur, jamais une ignorance silencieuse.
                     "privacy":    { "type": "string", "enum": ["public", "friends", "followers", "private", "unlisted"] },
-                    "publish_at": { "type": "string" }
+                    "publish_at": { "type": "string" },
+                    "placement": { "type": "string", "enum": ["feed", "story", "reel"] },
+                    "delivery": { "type": "string", "enum": ["publish", "draft"] }
                 },
                 "required": ["account_id", "text"],
                 "additionalProperties": false
@@ -213,6 +223,8 @@ pub fn description_outils() -> Value {
                     "made_with_ai": { "type": "boolean" },
                     "privacy":    { "type": "string", "enum": ["public", "friends", "followers", "private", "unlisted"] },
                     "publish_at": { "type": "string" },
+                    "placement": { "type": "string", "enum": ["feed", "story", "reel"] },
+                    "delivery": { "type": "string", "enum": ["publish", "draft"] },
                     "expected_media_digests": {
                         "type": "array",
                         "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
@@ -238,6 +250,126 @@ pub fn description_outils() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": { "limit": { "type": "integer", "minimum": 1, "maximum": 200 } },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "thread_preview",
+            "description": "L'empreinte du fil entier : un aperçu par élément, dans l'ordre, et un digest qui couvre tous les éléments.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "account_id": { "type": "string" },
+                    "posts": { "type": "array", "minItems": 2, "maxItems": 25, "items": { "type": "object" } }
+                },
+                "required": ["account_id", "posts"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "thread_publish",
+            "description": "Publie un fil X (liste ordonnée) comme une seule opération idempotente. Un échec au milieu est rapporté élément par élément ; le rejeu de la même clé ne republie pas ce qui est déjà en ligne.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 200 },
+                    "account_id": { "type": "string" },
+                    "posts": { "type": "array", "minItems": 2, "maxItems": 25, "items": { "type": "object" } },
+                    "publish_at": { "type": "string" },
+                    "expected_media_digests": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["idempotency_key", "account_id", "posts"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "calendar_list",
+            "description": "Le calendrier du tenant : créneaux, approbations en attente, publications, sur une plage de dates optionnelle.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "account_id": { "type": "string" },
+                    "from": { "type": "string" },
+                    "to": { "type": "string" }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "schedule_post",
+            "description": "Pose un créneau. Sans release, le statut est pending_approval : rien ne part avant approval_decide. publish_at est obligatoire.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 200 },
+                    "account_id": { "type": "string" },
+                    "text": { "type": "string" },
+                    "posts": { "type": "array" },
+                    "publish_at": { "type": "string" },
+                    "release": { "type": "boolean" },
+                    "media": { "type": "array" },
+                    "poll": { "type": "object" },
+                    "made_with_ai": { "type": "boolean" },
+                    "privacy": { "type": "string" },
+                    "placement": { "type": "string" },
+                    "delivery": { "type": "string" },
+                    "expected_media_digests": { "type": "array" }
+                },
+                "required": ["idempotency_key", "account_id", "publish_at"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "schedule_cancel",
+            "description": "Annule un créneau, ou le déplace si publish_at est fourni. Un créneau déjà publié ne bouge plus.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scheduled_id": { "type": "string" },
+                    "publish_at": { "type": "string" }
+                },
+                "required": ["scheduled_id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "submit_for_approval",
+            "description": "Crée un post ou un fil en pending_approval. Rien n'est publié tant qu'un humain n'a pas appelé approval_decide.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 200 },
+                    "account_id": { "type": "string" },
+                    "text": { "type": "string" },
+                    "posts": { "type": "array" },
+                    "publish_at": { "type": "string" },
+                    "media": { "type": "array" },
+                    "poll": { "type": "object" },
+                    "made_with_ai": { "type": "boolean" },
+                    "privacy": { "type": "string" },
+                    "placement": { "type": "string" },
+                    "delivery": { "type": "string" },
+                    "expected_media_digests": { "type": "array" }
+                },
+                "required": ["idempotency_key", "account_id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "approval_decide",
+            "description": "Décision humaine : approve publie ou programme, reject refuse, edit remplace le contenu tant que la ligne est pending_approval. Pas un outil d'employé.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scheduled_id": { "type": "string" },
+                    "decision": { "type": "string", "enum": ["approve", "reject", "edit"] },
+                    "note": { "type": "string" },
+                    "text": { "type": "string" },
+                    "posts": { "type": "array" },
+                    "media": { "type": "array" },
+                    "publish_at": { "type": "string" }
+                },
+                "required": ["scheduled_id", "decision"],
                 "additionalProperties": false
             }
         }
@@ -499,6 +631,30 @@ fn parser_contenu(args: &Value) -> Result<Contenu, Erreur> {
                 .to_owned(),
         ),
     };
+    let placement = match args.get("placement") {
+        None => None,
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| invalide("`placement` doit etre une chaine"))?;
+            Some(
+                crate::adapters::Placement::depuis(s)
+                    .ok_or_else(|| invalide("`placement` vaut feed|story|reel"))?,
+            )
+        }
+    };
+    let livraison = match args.get("delivery") {
+        None => None,
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| invalide("`delivery` doit etre une chaine"))?;
+            Some(
+                crate::adapters::Livraison::depuis(s)
+                    .ok_or_else(|| invalide("`delivery` vaut publish|draft"))?,
+            )
+        }
+    };
 
     Ok(Contenu {
         medias,
@@ -507,6 +663,8 @@ fn parser_contenu(args: &Value) -> Result<Contenu, Erreur> {
         options: OptionsPost {
             privacy,
             publish_at,
+            placement,
+            livraison,
         },
     })
 }
@@ -575,6 +733,13 @@ async fn appeler_outil(
         "post_preview" => previsualiser(etat, tenant, args).await,
         "post_publish" => publier(etat, tenant, args).await,
         "post_metrics" => metriques(etat, tenant, args).await,
+        "thread_preview" => previsualiser_fil(etat, tenant, args).await,
+        "thread_publish" => publier_fil(etat, tenant, args, false).await,
+        "calendar_list" => calendrier(etat, tenant, args).await,
+        "schedule_post" => programmer_outil(etat, tenant, args, true).await,
+        "schedule_cancel" => annuler_outil(etat, tenant, args).await,
+        "submit_for_approval" => programmer_outil(etat, tenant, args, false).await,
+        "approval_decide" => decider_outil(etat, tenant, args).await,
         "posts_list" => {
             let limite = args
                 .get("limit")
@@ -624,7 +789,12 @@ async fn connecter(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Err
     // oauth_flux fabrique le state (32 octets d'OS), le defi PKCE (X) et
     // l'URL ; seul le SHA-256 du state atterrit en base — la table ne permet
     // pas de finir un flux.
-    let flux = oauth_flux::demarrer(
+    let demarrer = if plateforme == "linkedin" && etat.linkedin_org {
+        oauth_flux::demarrer_page
+    } else {
+        oauth_flux::demarrer
+    };
+    let flux = demarrer(
         pf,
         &credentiels.client_id,
         &etat.redirect_uri(),
@@ -678,6 +848,23 @@ async fn previsualiser(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value,
 }
 
 async fn publier(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreur> {
+    publier_avec(etat, tenant, args, false).await
+}
+
+pub(crate) async fn publier_depuis_la_file(
+    etat: &Etat,
+    tenant: Uuid,
+    args: &Value,
+) -> Result<Value, Erreur> {
+    publier_avec(etat, tenant, args, true).await
+}
+
+async fn publier_avec(
+    etat: &Etat,
+    tenant: Uuid,
+    args: &Value,
+    depuis_la_file: bool,
+) -> Result<Value, Erreur> {
     let cle = arg_str(args, "idempotency_key")?;
     let compte_id = arg_uuid(args, "account_id")?;
     let texte = arg_str(args, "text")?;
@@ -764,6 +951,27 @@ async fn publier(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreu
         ));
     }
 
+    // `publish_at` reste dans l'empreinte (c'est le contreseing) mais ne part
+    // pas à la plateforme : la file le tient, sauf quand c'est elle qui nous
+    // réveille — là on poste tout de suite.
+    if contenu.options.publish_at.is_some() && !depuis_la_file {
+        let quand = file::parse_quand(contenu.options.publish_at.as_deref().unwrap_or(""))?;
+        return file::poser(
+            etat,
+            tenant,
+            compte_id,
+            cle,
+            "post",
+            args,
+            &apercu.digest,
+            Some(quand),
+            false,
+        )
+        .await;
+    }
+    let mut options_envoi = contenu.options.clone();
+    options_envoi.publish_at = None;
+
     // La meme empreinte GLOBALE que post_preview a montree (texte + digest de
     // chaque media + sondage, contrat C3) : c'est elle que l'approbation
     // humaine a contresignee, et elle que le rejeu compare — une image
@@ -828,11 +1036,14 @@ async fn publier(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreu
     let medias: &[MediaPret] = &medias_prets;
     let sondage = contenu.sondage.as_ref();
     let made_with_ai = contenu.made_with_ai;
-    let options = &contenu.options;
-    let resultat = avec_rejeu_401(etat, tenant, &compte, Arc::new(jeton), |j| async move {
-        adaptateur
-            .publier(&j, handle, texte, medias, sondage, made_with_ai, options)
-            .await
+    let options = options_envoi;
+    let resultat = avec_rejeu_401(etat, tenant, &compte, Arc::new(jeton), |j| {
+        let options = options.clone();
+        async move {
+            adaptateur
+                .publier(&j, handle, texte, medias, sondage, made_with_ai, &options)
+                .await
+        }
     })
     .await;
 
@@ -1089,6 +1300,614 @@ async fn metriques(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Err
     }
 }
 
+fn verifier_options_plateforme(plateforme: &str, options: &OptionsPost) -> Result<(), Erreur> {
+    if options.placement.is_some() && plateforme != "instagram" {
+        return Err(Erreur::nouvelle(
+            "argument_invalide",
+            "`placement` n'est servi que par instagram",
+        ));
+    }
+    if options.livraison.is_some() && plateforme != "tiktok" {
+        return Err(Erreur::nouvelle(
+            "argument_invalide",
+            "`delivery` n'est servi que par tiktok",
+        ));
+    }
+    Ok(())
+}
+
+struct ElementPrepare {
+    texte: String,
+    medias: Vec<MediaPret>,
+    sondage: Option<Sondage>,
+    made_with_ai: bool,
+    digest: String,
+    media_json: Value,
+    media_digests: Vec<String>,
+    poll_json: Option<Value>,
+    limites_ok: bool,
+    apercu: crate::adapters::Apercu,
+}
+
+async fn preparer_element(
+    etat: &Etat,
+    adaptateur: &dyn Plateforme,
+    element: &Value,
+    options: &OptionsPost,
+) -> Result<ElementPrepare, Erreur> {
+    let texte = element
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalide("chaque élément du fil a un `text`"))?
+        .to_owned();
+    let contenu = parser_contenu(element)?;
+    let medias = telecharger_tous(etat, &contenu.medias).await?;
+    let apercu = adaptateur.apercu(
+        &texte,
+        &medias,
+        contenu.sondage.as_ref(),
+        contenu.made_with_ai,
+        options,
+    );
+    let media_digests: Vec<String> = medias.iter().map(|m| m.digest.clone()).collect();
+    Ok(ElementPrepare {
+        texte,
+        medias,
+        sondage: contenu.sondage,
+        made_with_ai: contenu.made_with_ai,
+        digest: apercu.digest.clone(),
+        media_json: element.get("media").cloned().unwrap_or(json!([])),
+        media_digests,
+        poll_json: element.get("poll").cloned(),
+        limites_ok: apercu.platform_limits_ok && apercu.media.iter().all(|m| m.limits_ok),
+        apercu,
+    })
+}
+
+async fn previsualiser_fil(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreur> {
+    let compte_id = arg_uuid(args, "account_id")?;
+    let compte = store::compte_scelle(&etat.pool, tenant, compte_id)
+        .await?
+        .ok_or_else(|| {
+            Erreur::nouvelle("compte_inconnu", "ce compte n'appartient pas a ce tenant")
+        })?;
+    if compte.platform != "x" {
+        return Err(Erreur::nouvelle(
+            "fil_reserve_a_x",
+            "un fil se publie sur X ; les autres réseaux prennent un post",
+        ));
+    }
+    let adaptateur = etat
+        .adaptateur("x")
+        .ok_or_else(|| Erreur::nouvelle("plateforme_inconnue", "pas d'adaptateur `x`"))?;
+    let posts = args
+        .get("posts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalide("`posts` est un tableau de 2 à 25 éléments"))?;
+    if !(2..=25).contains(&posts.len()) {
+        return Err(invalide("`posts` porte 2 à 25 éléments"));
+    }
+    let mut elements = Vec::new();
+    for post in posts {
+        elements.push(preparer_element(etat, adaptateur, post, &OptionsPost::default()).await?);
+    }
+    let digests: Vec<String> = elements.iter().map(|e| e.digest.clone()).collect();
+    let ok = elements.iter().all(|e| e.limites_ok);
+    let cout: f64 = elements
+        .iter()
+        .filter_map(|e| e.apercu.cost_estimate_usd)
+        .sum();
+    Ok(json!({
+        "digest": crate::adapters::empreinte_fil(&digests),
+        "platform_limits_ok": ok,
+        "cost_estimate_usd": cout,
+        "posts": elements.iter().map(|e| serde_json::to_value(&e.apercu).expect("apercu")).collect::<Vec<_>>()
+    }))
+}
+
+pub(crate) async fn publier_fil(
+    etat: &Etat,
+    tenant: Uuid,
+    args: &Value,
+    depuis_la_file: bool,
+) -> Result<Value, Erreur> {
+    let cle = arg_str(args, "idempotency_key")?;
+    let compte_id = arg_uuid(args, "account_id")?;
+    let compte = store::compte_scelle(&etat.pool, tenant, compte_id)
+        .await?
+        .ok_or_else(|| {
+            Erreur::nouvelle("compte_inconnu", "ce compte n'appartient pas a ce tenant")
+        })?;
+    if compte.platform != "x" {
+        return Err(Erreur::nouvelle(
+            "fil_reserve_a_x",
+            "un fil se publie sur X ; les autres réseaux prennent un post",
+        ));
+    }
+    let adaptateur = etat
+        .adaptateur("x")
+        .ok_or_else(|| Erreur::nouvelle("plateforme_inconnue", "pas d'adaptateur `x`"))?;
+    let posts = args
+        .get("posts")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| invalide("`posts` est un tableau de 2 à 25 éléments"))?;
+    if !(2..=25).contains(&posts.len()) {
+        return Err(invalide("`posts` porte 2 à 25 éléments"));
+    }
+    let mut options = OptionsPost::default();
+    if let Some(quand) = args.get("publish_at").and_then(Value::as_str) {
+        options.publish_at = Some(quand.to_owned());
+    }
+    let mut elements = Vec::new();
+    for post in &posts {
+        elements.push(preparer_element(etat, adaptateur, post, &options).await?);
+    }
+    if elements.iter().any(|e| !e.limites_ok) {
+        return Err(Erreur::nouvelle(
+            "limites_plateforme",
+            "un élément du fil est hors limites — thread_preview donne le verdict",
+        ));
+    }
+    let attendus = parser_digests_attendus(args)?;
+    if let Some(attendus) = &attendus {
+        let plats: Vec<String> = elements
+            .iter()
+            .flat_map(|e| e.media_digests.clone())
+            .collect();
+        if attendus.len() != plats.len() || attendus.iter().zip(&plats).any(|(a, b)| a != b) {
+            return Err(Erreur::nouvelle(
+                "media_change",
+                "les médias du fil ont changé depuis l'aperçu",
+            ));
+        }
+    }
+    let digests: Vec<String> = elements.iter().map(|e| e.digest.clone()).collect();
+    let digest = crate::adapters::empreinte_fil(&digests);
+    if options.publish_at.is_some() && !depuis_la_file {
+        let quand = file::parse_quand(options.publish_at.as_deref().unwrap_or(""))?;
+        return file::poser(
+            etat,
+            tenant,
+            compte_id,
+            cle,
+            "thread",
+            args,
+            &digest,
+            Some(quand),
+            false,
+        )
+        .await;
+    }
+    let medias_plats: Vec<String> = elements
+        .iter()
+        .flat_map(|e| e.media_digests.clone())
+        .collect();
+    let id = match store::reclamer(
+        &etat.pool,
+        tenant,
+        compte_id,
+        cle,
+        &elements[0].texte,
+        &digest,
+        &medias_plats,
+    )
+    .await?
+    {
+        Reclamation::ANous(id) => id,
+        Reclamation::DejaPublie(p) => {
+            let items = store::elements(&etat.pool, p.id).await?;
+            return Ok(json_fil(p.id, &digest, true, "published", &items));
+        }
+        Reclamation::TexteDifferent => {
+            return Err(Erreur::nouvelle(
+                "cle_reutilisee",
+                "cette idempotency_key a déjà servi pour un AUTRE fil",
+            ));
+        }
+        Reclamation::EnVol => {
+            return Err(Erreur::nouvelle(
+                "publication_en_cours",
+                "un fil avec cette clé est en vol ; rejouer dans un instant",
+            ));
+        }
+    };
+    let a_poser: Vec<store::ElementFil> = elements
+        .iter()
+        .enumerate()
+        .map(|(i, e)| store::ElementFil {
+            position: i as i32,
+            text_body: e.texte.clone(),
+            digest: e.digest.clone(),
+            media: e.media_json.clone(),
+            media_digests: e.media_digests.clone(),
+            made_with_ai: e.made_with_ai,
+            poll: e.poll_json.clone(),
+            status: "pending".into(),
+            platform_post_id: None,
+            url: None,
+            last_error: None,
+        })
+        .collect();
+    store::poser_elements(&etat.pool, id, &a_poser).await?;
+    let mut deja = store::elements(&etat.pool, id).await?;
+    let mut precedent: Option<String> = None;
+    let mut echec = false;
+    for (i, element) in elements.iter().enumerate() {
+        if deja.get(i).is_some_and(|d| d.status == "published") {
+            precedent = deja[i].platform_post_id.clone();
+            continue;
+        }
+        if echec {
+            break;
+        }
+        let jeton = match jeton_frais(etat, tenant, &compte).await {
+            Ok(secret) => secret,
+            Err(e) => {
+                store::marquer_element(
+                    &etat.pool,
+                    id,
+                    i as i32,
+                    "failed",
+                    None,
+                    None,
+                    Some(&e.message),
+                )
+                .await?;
+                break;
+            }
+        };
+        let reponse = element.texte.clone();
+        let medias = element.medias.clone();
+        let sondage = element.sondage.clone();
+        let made = element.made_with_ai;
+        let parent = precedent.clone();
+        let handle = compte.handle.clone();
+        let resultat = avec_rejeu_401(etat, tenant, &compte, Arc::new(jeton), |j| {
+            let reponse = reponse.clone();
+            let medias = medias.clone();
+            let sondage = sondage.clone();
+            let parent = parent.clone();
+            let handle = handle.clone();
+            async move {
+                adaptateur
+                    .publier_en_reponse(
+                        &j,
+                        &handle,
+                        &reponse,
+                        &medias,
+                        sondage.as_ref(),
+                        made,
+                        &OptionsPost::default(),
+                        parent.as_deref(),
+                    )
+                    .await
+            }
+        })
+        .await;
+        match resultat {
+            Ok(publie) => {
+                store::marquer_element(
+                    &etat.pool,
+                    id,
+                    i as i32,
+                    "published",
+                    Some(&publie.id_plateforme),
+                    Some(&publie.url),
+                    None,
+                )
+                .await?;
+                precedent = Some(publie.id_plateforme);
+            }
+            Err(e) => {
+                store::marquer_element(
+                    &etat.pool,
+                    id,
+                    i as i32,
+                    "failed",
+                    None,
+                    None,
+                    Some(&e.to_string()),
+                )
+                .await?;
+                echec = true;
+            }
+        }
+        deja = store::elements(&etat.pool, id).await?;
+    }
+    let items = store::elements(&etat.pool, id).await?;
+    let tous = items.iter().all(|e| e.status == "published");
+    let aucun = items.iter().all(|e| e.status != "published");
+    if tous {
+        let premier = items
+            .first()
+            .and_then(|e| e.platform_post_id.clone())
+            .unwrap_or_default();
+        let url = items.first().and_then(|e| e.url.clone());
+        store::marquer_publie(&etat.pool, id, &premier, url.as_deref()).await?;
+        Ok(json_fil(id, &digest, false, "published", &items))
+    } else if aucun {
+        store::marquer_echec(&etat.pool, id).await?;
+        Ok(json_fil(id, &digest, false, "failed", &items))
+    } else {
+        store::marquer_partiel(&etat.pool, id).await?;
+        Ok(json_fil(id, &digest, false, "partial", &items))
+    }
+}
+
+fn json_fil(
+    id: Uuid,
+    digest: &str,
+    replayed: bool,
+    status: &str,
+    items: &[store::ElementFil],
+) -> Value {
+    json!({
+        "post_id": id,
+        "digest": digest,
+        "status": status,
+        "replayed": replayed,
+        "items": items.iter().map(|e| json!({
+            "index": e.position,
+            "status": e.status,
+            "platform_post_id": e.platform_post_id,
+            "url": e.url,
+            "erreur": e.last_error,
+        })).collect::<Vec<_>>()
+    })
+}
+
+async fn calendrier(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreur> {
+    let compte = match args.get("account_id").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => {
+            Some(Uuid::parse_str(s).map_err(|_| invalide("`account_id` n'est pas un uuid"))?)
+        }
+        _ => None,
+    };
+    let debut = match args.get("from").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => Some(file::parse_quand(s)?),
+        _ => None,
+    };
+    let fin = match args.get("to").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => Some(file::parse_quand(s)?),
+        _ => None,
+    };
+    let lignes = store::lister_file(&etat.pool, tenant, compte, debut, fin).await?;
+    Ok(json!({
+        "entries": lignes.iter().map(|l| file::json_ligne(l, false)).collect::<Vec<_>>()
+    }))
+}
+
+/// `exiger_date` : schedule_post. Sinon submit_for_approval (date optionnelle).
+/// Les deux restent en attente d'un humain, sauf `release: true` sur un créneau.
+async fn programmer_outil(
+    etat: &Etat,
+    tenant: Uuid,
+    args: &Value,
+    exiger_date: bool,
+) -> Result<Value, Erreur> {
+    let cle = arg_str(args, "idempotency_key")?;
+    let compte_id = arg_uuid(args, "account_id")?;
+    let compte = store::compte_scelle(&etat.pool, tenant, compte_id)
+        .await?
+        .ok_or_else(|| {
+            Erreur::nouvelle("compte_inconnu", "ce compte n'appartient pas a ce tenant")
+        })?;
+    let adaptateur = etat.adaptateur(&compte.platform).ok_or_else(|| {
+        Erreur::nouvelle(
+            "plateforme_inconnue",
+            format!("pas d'adaptateur `{}`", compte.platform),
+        )
+    })?;
+    let quand = match args.get("publish_at").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => Some(file::parse_quand(s)?),
+        _ if exiger_date => {
+            return Err(invalide("`publish_at` est obligatoire pour programmer"));
+        }
+        _ => None,
+    };
+    let (kind, digest) = if args.get("posts").is_some() {
+        if compte.platform != "x" {
+            return Err(Erreur::nouvelle(
+                "fil_reserve_a_x",
+                "un fil se programme sur X",
+            ));
+        }
+        let vu = previsualiser_fil(etat, tenant, args).await?;
+        if vu.get("platform_limits_ok") == Some(&json!(false)) {
+            return Err(Erreur::nouvelle(
+                "limites_plateforme",
+                "le fil est hors limites",
+            ));
+        }
+        let digest = vu
+            .get("digest")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        ("thread", digest)
+    } else {
+        let texte = arg_str(args, "text")?;
+        let contenu = parser_contenu(args)?;
+        verifier_options_plateforme(&compte.platform, &contenu.options)?;
+        let medias = telecharger_tous(etat, &contenu.medias).await?;
+        let apercu = adaptateur.apercu(
+            texte,
+            &medias,
+            contenu.sondage.as_ref(),
+            contenu.made_with_ai,
+            &contenu.options,
+        );
+        if !apercu.platform_limits_ok || apercu.media.iter().any(|m| !m.limits_ok) {
+            return Err(Erreur::nouvelle(
+                "limites_plateforme",
+                "contenu hors limites — post_preview donne le verdict",
+            ));
+        }
+        ("post", apercu.digest)
+    };
+    let release = args
+        .get("release")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let en_attente = !release;
+    file::poser(
+        etat, tenant, compte_id, cle, kind, args, &digest, quand, en_attente,
+    )
+    .await
+}
+
+async fn annuler_outil(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreur> {
+    let id = arg_uuid(args, "scheduled_id")?;
+    if let Some(quand) = args.get("publish_at").and_then(Value::as_str) {
+        let date = file::parse_quand(quand)?;
+        let ligne = store::reprogrammer_file(&etat.pool, tenant, id, date)
+            .await?
+            .ok_or_else(|| {
+                Erreur::nouvelle(
+                    "creneau_fige",
+                    "ce créneau n'est pas déplaçable (inconnu, déjà publié, ou en cours)",
+                )
+            })?;
+        return Ok(file::json_ligne(&ligne, false));
+    }
+    let ligne = store::annuler_file(&etat.pool, tenant, id)
+        .await?
+        .ok_or_else(|| {
+            Erreur::nouvelle(
+                "creneau_fige",
+                "ce créneau n'est pas annulable (inconnu, déjà publié, ou en cours)",
+            )
+        })?;
+    Ok(file::json_ligne(&ligne, false))
+}
+
+async fn decider_outil(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Erreur> {
+    let id = arg_uuid(args, "scheduled_id")?;
+    let decision = arg_str(args, "decision")?;
+    let note = args.get("note").and_then(Value::as_str);
+    match decision {
+        "reject" => {
+            let ligne = store::decider_file(&etat.pool, tenant, id, "rejected", note)
+                .await?
+                .ok_or_else(|| {
+                    Erreur::nouvelle("approbation_figee", "cette ligne n'est plus en attente")
+                })?;
+            Ok(file::json_ligne(&ligne, false))
+        }
+        "edit" => {
+            let actuelle = store::file_par_id(&etat.pool, tenant, id)
+                .await?
+                .ok_or_else(|| Erreur::nouvelle("approbation_inconnue", "ligne inconnue"))?;
+            if actuelle.status != "pending_approval" {
+                return Err(Erreur::nouvelle(
+                    "approbation_figee",
+                    "on n'édite qu'une ligne en attente",
+                ));
+            }
+            let mut payload = actuelle.payload.clone();
+            if let Some(objet) = payload.as_object_mut() {
+                for cle in [
+                    "text",
+                    "posts",
+                    "media",
+                    "publish_at",
+                    "privacy",
+                    "placement",
+                    "delivery",
+                ] {
+                    if args.get(cle).is_some() {
+                        objet.insert(cle.to_owned(), args[cle].clone());
+                    }
+                }
+            }
+            let digest = empreinte_payload(etat, tenant, &payload).await?;
+            let ligne = store::editer_file(&etat.pool, tenant, id, &payload, &digest)
+                .await?
+                .ok_or_else(|| Erreur::nouvelle("approbation_figee", "édition refusée"))?;
+            Ok(file::json_ligne(&ligne, false))
+        }
+        "approve" => {
+            store::expirer_file(&etat.pool).await?;
+            let ligne = store::decider_file(&etat.pool, tenant, id, "scheduled", note)
+                .await?
+                .ok_or_else(|| {
+                    Erreur::nouvelle(
+                        "approbation_figee",
+                        "cette ligne n'est plus en attente (expirée, refusée, ou déjà tranchée)",
+                    )
+                })?;
+            let due = ligne.publish_at.is_none_or(|d| d <= chrono::Utc::now());
+            if !due {
+                return Ok(file::json_ligne(&ligne, false));
+            }
+            // Dû maintenant : le worker pourrait le prendre. On le poste ici
+            // pour que l'humain voie le résultat de son clic.
+            let mut immediate = ligne;
+            immediate.status = "publishing".to_owned();
+            match file::executer(etat, &immediate).await {
+                Ok(valeur) => {
+                    if let Some(post_id) = valeur
+                        .get("post_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                    {
+                        store::marquer_file_publiee(&etat.pool, id, post_id).await?;
+                    }
+                    Ok(valeur)
+                }
+                Err(e) => {
+                    store::marquer_file_echec(
+                        &etat.pool,
+                        id,
+                        true,
+                        store::delai_reessai(1),
+                        &e.message,
+                    )
+                    .await?;
+                    Err(e)
+                }
+            }
+        }
+        _ => Err(invalide("`decision` vaut approve|reject|edit")),
+    }
+}
+
+async fn empreinte_payload(etat: &Etat, tenant: Uuid, payload: &Value) -> Result<String, Erreur> {
+    if payload.get("posts").is_some() {
+        let vu = previsualiser_fil(etat, tenant, payload).await?;
+        return Ok(vu
+            .get("digest")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned());
+    }
+    let compte_id = payload
+        .get("account_id")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| invalide("account_id manquant"))?;
+    let compte = store::compte_scelle(&etat.pool, tenant, compte_id)
+        .await?
+        .ok_or_else(|| Erreur::nouvelle("compte_inconnu", "compte inconnu"))?;
+    let adaptateur = etat
+        .adaptateur(&compte.platform)
+        .ok_or_else(|| Erreur::nouvelle("plateforme_inconnue", "adaptateur manquant"))?;
+    let texte = payload.get("text").and_then(Value::as_str).unwrap_or("");
+    let contenu = parser_contenu(payload)?;
+    let medias = telecharger_tous(etat, &contenu.medias).await?;
+    Ok(adaptateur
+        .apercu(
+            texte,
+            &medias,
+            contenu.sondage.as_ref(),
+            contenu.made_with_ai,
+            &contenu.options,
+        )
+        .digest)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1174,7 +1993,14 @@ mod tests {
                 "post_preview",
                 "post_publish",
                 "post_metrics",
-                "posts_list"
+                "posts_list",
+                "thread_preview",
+                "thread_publish",
+                "calendar_list",
+                "schedule_post",
+                "schedule_cancel",
+                "submit_for_approval",
+                "approval_decide",
             ]
         );
     }
@@ -1203,6 +2029,13 @@ mod tests {
         (
             "3",
             "c157ded060cf557fbf68c1166b34b71a438c46022e54d3e6c132123b33023e78",
+        ),
+        // v4 : fils, calendrier, approbation, placement, delivery.
+        // L'empreinte est posée par le test au premier passage ; ne pas
+        // réécrire les lignes 1 à 3.
+        (
+            "4",
+            "6fafe523394acc902b86150208403d169c242e705da30e2b64b500cde568f9c7",
         ),
     ];
 
@@ -1365,6 +2198,8 @@ mod tests {
             oauth_meta: None,
             oauth_tiktok: None,
             oauth_google: None,
+            linkedin_org: false,
+            approval_ttl_hours: 72,
             depot: Arc::new(medias::DepotMedias::new()),
             adaptateurs_messagerie: Vec::new(),
         };
@@ -1385,6 +2220,68 @@ mod tests {
             result["isError"].as_bool().unwrap(),
             serde_json::from_str(texte).unwrap(),
         )
+    }
+
+    /// Le créneau est une ligne, pas un post. Le rejeu de la clé ne la
+    /// duplique pas, et l'approbation d'une date future ne parle pas à la
+    /// plateforme.
+    #[tokio::test]
+    async fn un_creneau_rejoue_reste_unique_et_l_approbation_ne_publie_pas() {
+        let Some((etat, tenant, compte, publications)) = etat_de_test().await else {
+            return;
+        };
+        let args = json!({
+            "idempotency_key": "cle-creneau",
+            "account_id": compte,
+            "text": "bonjour",
+            "publish_at": "2026-12-01T09:00:00Z"
+        });
+        let (err, v1) = appel(&etat, tenant, "schedule_post", args.clone()).await;
+        assert!(!err, "{v1}");
+        assert_eq!(v1["status"], "pending_approval");
+        let (err, v2) = appel(&etat, tenant, "schedule_post", args).await;
+        assert!(!err, "{v2}");
+        assert_eq!(v1["scheduled_id"], v2["scheduled_id"]);
+        assert_eq!(v2["replayed"], true);
+        assert_eq!(publications.load(Ordering::SeqCst), 0);
+        let (err, decide) = appel(
+            &etat,
+            tenant,
+            "approval_decide",
+            json!({"scheduled_id": v1["scheduled_id"], "decision": "approve"}),
+        )
+        .await;
+        assert!(!err, "{decide}");
+        assert_eq!(decide["status"], "scheduled");
+        assert_eq!(publications.load(Ordering::SeqCst), 0);
+    }
+
+    /// Un fil dont le deuxième élément échoue ne renvoie pas le premier au
+    /// rejeu de la même clé.
+    #[tokio::test]
+    async fn un_fil_partiel_ne_republie_pas_le_debut() {
+        let Some((etat, tenant, compte, publications)) = etat_de_test().await else {
+            return;
+        };
+        let args = json!({
+            "idempotency_key": "fil-1",
+            "account_id": compte,
+            "posts": [{"text": "un"}, {"text": "deux"}, {"text": "trois"}]
+        });
+        let (err, v) = appel(&etat, tenant, "thread_publish", args.clone()).await;
+        assert!(!err, "{v}");
+        assert_eq!(v["status"], "partial");
+        assert_eq!(v["items"][0]["status"], "published");
+        assert_eq!(v["items"][1]["status"], "failed");
+        assert_eq!(publications.load(Ordering::SeqCst), 1);
+        let (err, v2) = appel(&etat, tenant, "thread_publish", args).await;
+        assert!(!err, "{v2}");
+        assert_eq!(v2["status"], "partial");
+        assert_eq!(
+            publications.load(Ordering::SeqCst),
+            1,
+            "le premier élément du fil ne repart pas"
+        );
     }
 
     #[tokio::test]

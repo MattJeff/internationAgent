@@ -584,23 +584,16 @@ impl Plateforme for Youtube {
             },
         }
         if options.publish_at.is_some() {
-            infos.push(
-                "publish_at : status.publishAt force privacyStatus=private (« réglable \
-                 seulement si privacyStatus=private ; une date passée publie \
-                 immédiatement » — docs/videos, relevé le 2026-09-02) — la vidéo restera \
-                 privée jusqu'à la date"
-                    .to_owned(),
-            );
+            infos.push(super::VERDICT_CRENEAU.to_owned());
         }
         infos.push(CITATION_BUCKET_INSERT.to_owned());
         infos.push(CITATION_AVANT_AUDIT.to_owned());
         infos.push(format!(
             "privacyStatus = {} (défaut sans `privacy` : private — la seule visibilité \
              d'un projet non audité de toute façon)",
-            match (options.publish_at.is_some(), options.privacy) {
-                (true, _) => "private",
-                (false, Some(p)) => privacy_youtube(p).unwrap_or(PRIVACY_DEFAUT),
-                (false, None) => PRIVACY_DEFAUT,
+            match options.privacy {
+                Some(p) => privacy_youtube(p).unwrap_or(PRIVACY_DEFAUT),
+                None => PRIVACY_DEFAUT,
             }
         ));
 
@@ -984,6 +977,8 @@ mod tests {
     const SANS: OptionsPost = OptionsPost {
         privacy: None,
         publish_at: None,
+        placement: None,
+        livraison: None,
     };
 
     fn video_titree() -> MediaPret {
@@ -1201,6 +1196,8 @@ mod tests {
         let amis = OptionsPost {
             privacy: Some(Privacy::Friends),
             publish_at: None,
+            placement: None,
+            livraison: None,
         };
         assert!(
             !Youtube
@@ -1250,14 +1247,13 @@ mod tests {
         let differe = OptionsPost {
             privacy: Some(Privacy::Public),
             publish_at: Some("2026-10-01T09:00:00Z".to_owned()),
+            placement: None,
+            livraison: None,
         };
         let apercu = Youtube.apercu("d", &[video_titree()], None, false, &differe);
         assert!(apercu.platform_limits_ok, "{:?}", apercu.verdicts);
         assert!(
-            apercu
-                .verdicts
-                .iter()
-                .any(|v| v.contains("force privacyStatus=private")),
+            apercu.verdicts.iter().any(|v| v.contains("file durable")),
             "{:?}",
             apercu.verdicts
         );

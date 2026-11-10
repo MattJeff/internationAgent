@@ -19,5 +19,49 @@ services:
       timeout: 3s
       retries: 30
 
+  # Base séparée de celle du runtime : SOCIAL_DATABASE_URL ne pointe pas
+  # vers `agentos`. Le binaire est dans la même image ; l'entrypoint du
+  # serveur reste agentos-server, celui-ci le remplace.
+  social-db:
+    image: postgres:18-bookworm
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: social
+    ports: ["5443:5432"]
+    volumes: [socialdata:/var/lib/postgresql]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d social"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  social:
+    build: .
+    entrypoint: ["/usr/local/bin/agentos-social"]
+    environment:
+      SOCIAL_DATABASE_URL: postgres://postgres:postgres@social-db:5432/social
+      SOCIAL_MASTER_KEY: ${SOCIAL_MASTER_KEY:-}
+      SOCIAL_BIND: 0.0.0.0:8791
+      SOCIAL_PUBLIC_URL: ${SOCIAL_PUBLIC_URL:-http://127.0.0.1:8791}
+      SOCIAL_APPROVAL_TTL_HOURS: ${SOCIAL_APPROVAL_TTL_HOURS:-72}
+      SOCIAL_SCHEDULER_POLL_SECS: ${SOCIAL_SCHEDULER_POLL_SECS:-15}
+      SOCIAL_LINKEDIN_ORG_POSTING: ${SOCIAL_LINKEDIN_ORG_POSTING:-}
+      SOCIAL_X_CLIENT_ID: ${SOCIAL_X_CLIENT_ID:-}
+      SOCIAL_X_CLIENT_SECRET: ${SOCIAL_X_CLIENT_SECRET:-}
+      SOCIAL_LINKEDIN_CLIENT_ID: ${SOCIAL_LINKEDIN_CLIENT_ID:-}
+      SOCIAL_LINKEDIN_CLIENT_SECRET: ${SOCIAL_LINKEDIN_CLIENT_SECRET:-}
+      SOCIAL_META_CLIENT_ID: ${SOCIAL_META_CLIENT_ID:-}
+      SOCIAL_META_CLIENT_SECRET: ${SOCIAL_META_CLIENT_SECRET:-}
+      SOCIAL_TIKTOK_CLIENT_ID: ${SOCIAL_TIKTOK_CLIENT_ID:-}
+      SOCIAL_TIKTOK_CLIENT_SECRET: ${SOCIAL_TIKTOK_CLIENT_SECRET:-}
+      SOCIAL_GOOGLE_CLIENT_ID: ${SOCIAL_GOOGLE_CLIENT_ID:-}
+      SOCIAL_GOOGLE_CLIENT_SECRET: ${SOCIAL_GOOGLE_CLIENT_SECRET:-}
+    ports: ["8791:8791"]
+    depends_on:
+      social-db:
+        condition: service_healthy
+
 volumes:
   pgdata:
+  socialdata:

@@ -66,6 +66,10 @@ use crate::medias::DepotMedias;
 pub const POINT_CREATOR_INFO: &str =
     "https://open.tiktokapis.com/v2/post/publish/creator_info/query/";
 pub const POINT_VIDEO_INIT: &str = "https://open.tiktokapis.com/v2/post/publish/video/init/";
+/// Brouillon inbox : scope `video.upload`. Le créateur finalise dans l'app.
+/// <https://developers.tiktok.com/docs/content-posting-api/media-transfer-guide/>
+pub const POINT_BROUILLON_VIDEO: &str =
+    "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/";
 pub const POINT_CONTENT_INIT: &str = "https://open.tiktokapis.com/v2/post/publish/content/init/";
 /// Micro-sonde du 2026-09-02 (content-posting-api-reference-get-video-status).
 pub const POINT_STATUS: &str = "https://open.tiktokapis.com/v2/post/publish/status/fetch/";
@@ -146,6 +150,33 @@ pub fn plan_chunks(taille: u64) -> (u64, u64, Vec<(u64, u64)>) {
     (TAILLE_CHUNK, total, bornes)
 }
 
+/// Le privacy effectif. Si le niveau demandé n'est pas offert (app non
+/// auditée : souvent `SELF_ONLY` seul) et que `SELF_ONLY` l'est, on retombe
+/// dessus au lieu d'échouer l'init.
+pub fn privacy_effectif(demande: &str, offerts: &[String]) -> Option<String> {
+    if offerts.iter().any(|p| p == demande) {
+        return Some(demande.to_owned());
+    }
+    if demande != PRIVACY_DEFAUT && offerts.iter().any(|p| p == PRIVACY_DEFAUT) {
+        return Some(PRIVACY_DEFAUT.to_owned());
+    }
+    None
+}
+
+/// Brouillon `video.upload` : pas de `post_info` (la légende se pose dans
+/// l'application). Le chunking FILE_UPLOAD est le même que le post direct.
+pub fn corps_video_brouillon(taille: u64) -> serde_json::Value {
+    let (chunk, total, _) = plan_chunks(taille);
+    json!({
+        "source_info": {
+            "source": "FILE_UPLOAD",
+            "video_size": taille,
+            "chunk_size": chunk,
+            "total_chunk_count": total
+        }
+    })
+}
+
 /// Le corps de `POST /v2/post/publish/video/init/` — direct-post, relevé le
 /// 2026-09-02. `is_aigc` vit dans `post_info` pour la vidéo, et n'apparaît
 /// que quand il est vrai : un champ absent et un champ nul ne sont pas la
@@ -222,6 +253,30 @@ pub fn corps_status(publish_id: &str) -> serde_json::Value {
 /// `Content-Range: bytes {FIRST}-{LAST}/{TOTAL}` — direct-post, 2026-09-02.
 pub fn content_range(premier: u64, dernier: u64, total: u64) -> String {
     format!("bytes {premier}-{dernier}/{total}")
+}
+
+/// PUT séquentiel des chunks FILE_UPLOAD. 201 sur le dernier, 206 sur les
+/// autres — tout 2xx passe (media-transfer-guide).
+pub async fn deposer_chunks(upload_url: &str, m: &MediaPret) -> Result<(), ErreurPlateforme> {
+    let taille = m.octets.len() as u64;
+    let (_, _, bornes) = plan_chunks(taille);
+    for (premier, dernier) in bornes {
+        let chunk = m.octets[premier as usize..=dernier as usize].to_vec();
+        let (statut, _corps) = envoyer(
+            http_upload()
+                .put(upload_url)
+                .header("Content-Type", m.type_detecte.mime())
+                .header("Content-Range", content_range(premier, dernier, taille))
+                .body(chunk),
+        )
+        .await?;
+        if !(200..=299).contains(&statut) {
+            return Err(
+                ErreurPlateforme::depuis_statut(statut).unwrap_or(ErreurPlateforme::Illisible)
+            );
+        }
+    }
+    Ok(())
 }
 
 /// TikTok répond 200 avec `error.code` : un code autre que « ok » est un
@@ -492,7 +547,7 @@ impl Tiktok {
         &self,
         jeton: &Secret,
         privacy_level: &str,
-    ) -> Result<(), ErreurPlateforme> {
+    ) -> Result<String, ErreurPlateforme> {
         let (statut, corps) = envoyer(
             http()
                 .post(POINT_CREATOR_INFO)
@@ -501,13 +556,7 @@ impl Tiktok {
         )
         .await?;
         let permis = creator_info_depuis(statut, &corps)?;
-        if permis.iter().any(|p| p == privacy_level) {
-            Ok(())
-        } else {
-            // Le 400 est le nôtre : le privacy demandé n'est pas offert à ce
-            // créateur (avant audit : SELF_ONLY seul) — l'aperçu l'a déjà dit.
-            Err(ErreurPlateforme::Refus { statut: 400 })
-        }
+        privacy_effectif(privacy_level, &permis).ok_or(ErreurPlateforme::Refus { statut: 400 })
     }
 
     /// Poll status/fetch jusqu'à un état terminal, sous budget.
@@ -548,36 +597,27 @@ impl Tiktok {
         titre: &str,
         privacy_level: &str,
         is_aigc: bool,
+        brouillon: bool,
     ) -> Result<String, ErreurPlateforme> {
         let taille = m.octets.len() as u64;
+        let (point, corps) = if brouillon {
+            (POINT_BROUILLON_VIDEO, corps_video_brouillon(taille))
+        } else {
+            (
+                POINT_VIDEO_INIT,
+                corps_video_init(titre, privacy_level, is_aigc, taille),
+            )
+        };
         let (statut, corps) = envoyer(
             http()
-                .post(POINT_VIDEO_INIT)
+                .post(point)
                 .bearer_auth(jeton.expose_for_transport())
-                .json(&corps_video_init(titre, privacy_level, is_aigc, taille)),
+                .json(&corps),
         )
         .await?;
         let (publish_id, upload_url) = init_depuis(statut, &corps)?;
         let upload_url = upload_url.ok_or(ErreurPlateforme::Illisible)?;
-        let (_, _, bornes) = plan_chunks(taille);
-        for (premier, dernier) in bornes {
-            let chunk = m.octets[premier as usize..=dernier as usize].to_vec();
-            let (statut, _corps) = envoyer(
-                http_upload()
-                    .put(&upload_url)
-                    .header("Content-Type", m.type_detecte.mime())
-                    .header("Content-Range", content_range(premier, dernier, taille))
-                    .body(chunk),
-            )
-            .await?;
-            // 201 par chunk final, 206 (Partial Content) pour les autres —
-            // tout 2xx passe, un 4xx/5xx sort nommé.
-            if !(200..=299).contains(&statut) {
-                return Err(
-                    ErreurPlateforme::depuis_statut(statut).unwrap_or(ErreurPlateforme::Illisible)
-                );
-            }
-        }
+        deposer_chunks(&upload_url, m).await?;
         Ok(publish_id)
     }
 
@@ -676,9 +716,12 @@ impl Plateforme for Tiktok {
         // made_with_ai : SERVI — TikTok a `is_aigc` (relevé le 2026-09-02).
         let _ = made_with_ai;
         if options.publish_at.is_some() {
+            infos.push(super::VERDICT_CRENEAU.to_owned());
+        }
+        if options.livraison == Some(super::Livraison::Brouillon) && videos != 1 {
             refus.push(
-                "tiktok ne sert pas `publish_at` : aucune planification dans la Content \
-                 Posting API (relevé le 2026-09-02)"
+                "le brouillon TikTok (video.upload) est une vidéo FILE_UPLOAD : pas de \
+                 photos, pas de texte seul"
                     .to_owned(),
             );
         }
@@ -746,22 +789,31 @@ impl Plateforme for Tiktok {
     ) -> Result<Publication, ErreurPlateforme> {
         // C7 : l'aperçu passe avant — sondage/publish_at/unlisted/mélange
         // sont déjà refusés. Un contournement prend un refus local.
-        let Some(privacy_level) = Self::privacy_level(options) else {
+        let Some(demande) = Self::privacy_level(options) else {
             return Err(ErreurPlateforme::Refus { statut: 400 });
         };
-        self.verifier_creator_info(jeton, privacy_level).await?;
+        let brouillon = options.livraison == Some(super::Livraison::Brouillon);
+        // Le brouillon (video.upload) ne porte pas de privacy_level : le
+        // créateur le choisit dans l'application. Le post direct, lui, doit
+        // coller à creator_info — avec repli SELF_ONLY si l'app n'est pas
+        // auditée.
+        let privacy_level = if brouillon {
+            demande.to_owned()
+        } else {
+            self.verifier_creator_info(jeton, demande).await?
+        };
 
         let publish_id = match medias {
             [] => return Err(ErreurPlateforme::Refus { statut: 400 }),
             [seul] if seul.type_detecte == TypeMedia::Mp4 => {
-                self.publier_video(jeton, seul, texte, privacy_level, made_with_ai)
+                self.publier_video(jeton, seul, texte, &privacy_level, made_with_ai, brouillon)
                     .await?
             }
             tous if tous
                 .iter()
                 .all(|m| matches!(m.type_detecte, TypeMedia::Jpeg | TypeMedia::Webp)) =>
             {
-                self.publier_photos(jeton, tous, texte, privacy_level, made_with_ai)
+                self.publier_photos(jeton, tous, texte, &privacy_level, made_with_ai)
                     .await?
             }
             _ => return Err(ErreurPlateforme::Refus { statut: 400 }),
@@ -1061,6 +1113,8 @@ mod tests {
     const SANS: OptionsPost = OptionsPost {
         privacy: None,
         publish_at: None,
+        placement: None,
+        livraison: None,
     };
 
     fn tiktok() -> Tiktok {
@@ -1145,6 +1199,23 @@ mod tests {
             true,
         );
         assert_eq!(corps["media_type"], "PHOTO");
+        let brouillon = corps_video_brouillon(10_000_000);
+        assert!(brouillon.get("post_info").is_none());
+        assert_eq!(brouillon["source_info"]["source"], "FILE_UPLOAD");
+        assert_eq!(brouillon["source_info"]["total_chunk_count"], 1);
+        assert_eq!(
+            privacy_effectif("PUBLIC_TO_EVERYONE", &["SELF_ONLY".into()]).as_deref(),
+            Some("SELF_ONLY")
+        );
+        assert_eq!(
+            privacy_effectif(
+                "SELF_ONLY",
+                &["SELF_ONLY".into(), "PUBLIC_TO_EVERYONE".into()]
+            )
+            .as_deref(),
+            Some("SELF_ONLY")
+        );
+        assert!(privacy_effectif("PUBLIC_TO_EVERYONE", &[]).is_none());
         assert_eq!(corps["post_mode"], "DIRECT_POST");
         assert_eq!(corps["source_info"]["source"], "PULL_FROM_URL");
         assert_eq!(
@@ -1332,6 +1403,8 @@ mod tests {
         let unlisted = OptionsPost {
             privacy: Some(Privacy::Unlisted),
             publish_at: None,
+            placement: None,
+            livraison: None,
         };
         let apercu = tiktok.apercu("t", &[mp4(10)], None, false, &unlisted);
         assert!(!apercu.platform_limits_ok);
@@ -1344,11 +1417,15 @@ mod tests {
         let differe = OptionsPost {
             privacy: None,
             publish_at: Some("2026-10-01T09:00:00Z".to_owned()),
+            placement: None,
+            livraison: None,
         };
+        let apercu = tiktok.apercu("t", &[mp4(10)], None, false, &differe);
+        assert!(apercu.platform_limits_ok, "{:?}", apercu.verdicts);
         assert!(
-            !tiktok
-                .apercu("t", &[mp4(10)], None, false, &differe)
-                .platform_limits_ok
+            apercu.verdicts.iter().any(|v| v.contains("file durable")),
+            "{:?}",
+            apercu.verdicts
         );
         // Texte seul : pas de post texte chez TikTok.
         assert!(
@@ -1461,6 +1538,7 @@ mod tests {
         for point in [
             POINT_CREATOR_INFO,
             POINT_VIDEO_INIT,
+            POINT_BROUILLON_VIDEO,
             POINT_CONTENT_INIT,
             POINT_STATUS,
             POINT_VIDEO_QUERY,
@@ -1469,5 +1547,57 @@ mod tests {
         ] {
             assert!(point.starts_with("https://open.tiktokapis.com/"), "{point}");
         }
+    }
+
+    /// FILE_UPLOAD : le PUT porte `Content-Range` sur toute la taille. Un
+    /// fichier sous 5 Mo tient en un seul chunk (media-transfer-guide).
+    #[tokio::test]
+    async fn le_put_chunke_envoie_le_content_range_au_serveur_local() {
+        use std::sync::Mutex;
+
+        use axum::Router;
+        use axum::extract::State;
+        use axum::routing::put;
+
+        let ranges = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let app = Router::new()
+            .route(
+                "/upload",
+                put(
+                    |State(ranges): State<std::sync::Arc<Mutex<Vec<String>>>>,
+                     headers: axum::http::HeaderMap,
+                     body: axum::body::Bytes| async move {
+                        let range = headers
+                            .get("content-range")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_owned();
+                        ranges
+                            .lock()
+                            .expect("verrou")
+                            .push(format!("{range}:{}", body.len()));
+                        axum::http::StatusCode::CREATED
+                    },
+                ),
+            )
+            .with_state(ranges.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adresse = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let octets = vec![9u8; 8];
+        let media = MediaPret {
+            octets: std::sync::Arc::new(octets.clone()),
+            type_detecte: TypeMedia::Mp4,
+            digest: "ab".into(),
+            alt_text: None,
+            title: None,
+        };
+        deposer_chunks(&format!("http://{adresse}/upload"), &media)
+            .await
+            .unwrap();
+        let g = ranges.lock().expect("verrou");
+        assert_eq!(g.as_slice(), ["bytes 0-7/8:8".to_owned()]);
     }
 }

@@ -436,27 +436,37 @@ Ce qui reste hors de portée est le graphe des liens entrants (qui cite un
 concurrent et pas nous) : il ne se lit dans aucune page de résultats, quatre
 sociétés le vendent, elles sont nommées au § 9 et aucune n'est appelée.
 
-### 3.5 Les réseaux sociaux — le câblage est fait, les comptes ne le sont pas
+### 3.5 Les réseaux sociaux — la phase 1 est dans le code, le branchement reste humain
 
-Cinq outils (`social_accounts_list`, `social_connect_url_get`,
-`social_post_preview_get`, `social_post_publish`, `social_posts_list`) par
-`apps/social`, branché comme n'importe quel connecteur sous le handle `social`
-via `catalog::CUSTOM`.
+Le service `apps/social` (binaire `agentos-social`, image et service compose)
+publie sur X, LinkedIn, Instagram, TikTok et YouTube. La table v4 ajoute, à
+côté des cinq outils produit d'origine :
 
-**Où ça s'arrête :** trois choses hors du code, écrites dans `docs/SOCIAL.md`
-§ « Les revues d'app ». L'app Meta du fondateur ne sert que les comptes qui ont
-un *rôle* dessus ; TikTok reste `SELF_ONLY` et plafonné à cinq comptes avant
-audit ; l'écran Google en `Testing` rend un jeton de rafraîchissement qui meurt
-en sept jours. Et le service lui-même n'est pas déployé — c'est la raison pour
-laquelle il n'a pas d'entrée nommée au catalogue, une ligne `Provision::Dial`
-sur une URL qui ne répond pas étant *la première affirmation fausse* de ce
-fichier.
+* `social_calendar_list`, `social_calendar_create`, `social_calendar_set`,
+  `social_calendar_remove` — file Postgres `social_scheduled` (migration
+  `0007_file_et_fils.sql`), worker, rejeu par `idempotency_key` ;
+* `social_thread_preview_get`, `social_thread_publish` — fil X, échec partiel,
+  pas de double envoi au rejeu ;
+* `social_approval_propose` — statut `pending_approval`. Rien ne part.
 
-Deuxième limite, celle que personne ne dit : **un employé ne publie pas.**
-`social_post_publish` est un outil MCP — donc un humain ou Claude Code depuis
-un terminal. Pour qu'un siège publie pendant son tour, il lui faut
-`call_mcp_tool` vers le connecteur `social`, et donc un opérateur qui a déclaré
-l'outil au digest. Ce n'est pas un bug, c'est la conséquence des treize verbes.
+La décision (`approve` / `reject` / `edit`, expiration) est
+`POST /v1/social/approvals/decide`. Elle n'est pas dans la table des employés.
+Instagram est en Graph v27.0, avec les Stories (`placement=story`, sans
+légende). TikTok a le post direct et le brouillon (`delivery`), le chunking
+FILE_UPLOAD, et le repli `SELF_ONLY`. LinkedIn membre reste le défaut ;
+`SOCIAL_LINKEDIN_ORG_POSTING` ajoute les pages organisation, un compte par
+handle.
+
+**Où ça s'arrête encore, et c'est un geste humain, pas un trou de code.**
+Les revues d'app de `docs/SOCIAL.md` tiennent : Meta ne sert que les comptes
+qui ont un rôle sur l'app, TikTok public attend l'audit, l'écran Google en
+`Testing` fait mourir le refresh en sept jours. L'image sait construire le
+binaire ; personne ne l'a démarré sur un hôte public dans ce dépôt, et aucune
+entrée `Provision::Dial` ne nomme une URL qui ne répond pas. Brancher un
+locataire (ClipOnIt, par exemple) reste la liste du § « Comment un locataire
+publie » de `docs/SOCIAL.md` : déployer, `mint-tenant` sur l'hôte du service,
+`integrations_connect` sous le handle `social`, `discover`, `declare_tool`,
+puis un humain ouvre chaque URL OAuth. Ce chantier ne le fait pas.
 
 ### 3.6 Coder le projet — le siège existe, avec zéro outil
 

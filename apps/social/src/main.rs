@@ -29,6 +29,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 pub mod adapters;
+pub mod file;
 pub mod mcp;
 pub mod medias;
 pub mod messagerie;
@@ -116,10 +117,31 @@ async fn main() -> anyhow::Result<()> {
         oauth_meta: credentiels_env("SOCIAL_META_CLIENT_ID", "SOCIAL_META_CLIENT_SECRET"),
         oauth_tiktok: credentiels_env("SOCIAL_TIKTOK_CLIENT_ID", "SOCIAL_TIKTOK_CLIENT_SECRET"),
         oauth_google: credentiels_env("SOCIAL_GOOGLE_CLIENT_ID", "SOCIAL_GOOGLE_CLIENT_SECRET"),
+        linkedin_org: drapeau_env("SOCIAL_LINKEDIN_ORG_POSTING"),
+        approval_ttl_hours: std::env::var("SOCIAL_APPROVAL_TTL_HOURS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|h: &i64| *h > 0)
+            .unwrap_or(72),
         depot,
         // La seconde surface — l'absence d'un adaptateur EST le refus, cite
         // (LinkedIn : linkedin::refus_messagerie).
         adaptateurs_messagerie: adapters::adaptateurs_messagerie(&ctx),
+    });
+
+    let ouvrier = etat.clone();
+    tokio::spawn(async move {
+        let pas = std::env::var("SOCIAL_SCHEDULER_POLL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(15);
+        loop {
+            if let Err(e) = file::passer(&ouvrier).await {
+                tracing::warn!(erreur = %e.message, "file sociale");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(pas)).await;
+        }
     });
 
     let ecoute = tokio::net::TcpListener::bind(&bind).await.context(bind)?;
@@ -130,6 +152,13 @@ async fn main() -> anyhow::Result<()> {
 
 /// Un couple client_id/client_secret d'environnement, ou rien — les deux ou
 /// aucun : un seul des deux est une demi-configuration qu'on refuse de deviner.
+fn drapeau_env(nom: &str) -> bool {
+    matches!(
+        std::env::var(nom).ok().as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
 fn credentiels_env(id: &str, secret: &str) -> Option<mcp::CredentielsClient> {
     match (std::env::var(id), std::env::var(secret)) {
         (Ok(client_id), Ok(client_secret)) => Some(mcp::CredentielsClient {
@@ -361,8 +390,54 @@ async fn retour_oauth(
     {
         return refus("le compte n'a pas pu etre enregistre");
     }
+    let mut pages = 0usize;
+    if plateforme == "linkedin" && etat.linkedin_org {
+        match oauth_flux::lister_organisations(&jeton.acces).await {
+            Ok(orgs) => {
+                for org in orgs {
+                    let Ok(scelle_org) = oauth_flux::sceller_jeton(
+                        &etat.chiffreur,
+                        tenant_id,
+                        "linkedin",
+                        &org,
+                        &jeton.acces,
+                    ) else {
+                        continue;
+                    };
+                    let refresh_org = jeton.rafraichissement.as_ref().and_then(|r| {
+                        oauth_flux::sceller_rafraichissement(
+                            &etat.chiffreur,
+                            tenant_id,
+                            "linkedin",
+                            &org,
+                            r,
+                        )
+                        .ok()
+                    });
+                    if store::connecter_compte(
+                        &etat.pool,
+                        tenant,
+                        "linkedin",
+                        &org,
+                        Some(&org),
+                        &scelle_org,
+                        refresh_org.as_deref(),
+                        Some(jeton.duree_s as i64),
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        pages += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(erreur = %e, "pages LinkedIn non listees");
+            }
+        }
+    }
     Html(format!(
-        "<p>Compte <b>{handle}</b> connecte sur {plateforme}. Vous pouvez fermer cet onglet.</p>"
+        "<p>Compte <b>{handle}</b> connecte sur {plateforme}. Pages organisation : {pages}. Vous pouvez fermer cet onglet.</p>"
     ))
     .into_response()
 }
@@ -389,6 +464,8 @@ mod tests {
             oauth_meta: None,
             oauth_tiktok: None,
             oauth_google: None,
+            linkedin_org: false,
+            approval_ttl_hours: 72,
             depot: Arc::new(medias::DepotMedias::new()),
             adaptateurs_messagerie: Vec::new(),
         }))
@@ -445,8 +522,8 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&corps).unwrap();
         assert_eq!(
             v["result"]["tools"].as_array().unwrap().len(),
-            6,
-            "les six outils, pas un de plus"
+            mcp::description_outils().as_array().unwrap().len(),
+            "la table de l'editeur"
         );
 
         // Et la seconde surface sert SA table : les quatorze outils.

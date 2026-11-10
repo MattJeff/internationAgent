@@ -542,9 +542,9 @@ Pannes possibles, et ce qu'elles veulent dire :
 ### 1.4i Publier sur les réseaux sociaux — un connecteur, pas un service interne
 
 `apps/social` (`docs/SOCIAL.md`) est un serveur MCP **séparé** : sa base, ses
-jetons par tenant, ses six outils, ses cinq plateformes. Le produit ne l'héberge
-pas et ne le branche pour personne tout seul — un locataire le branche comme il
-branche GitHub, et publie ensuite par quatre chemins de ce déploiement.
+jetons par tenant, sa table v4, ses cinq plateformes. L'image et le service
+compose le construisent ; le produit ne le branche pour personne tout seul —
+un locataire le branche comme il branche GitHub.
 
 Prérequis, dans l'ordre. Les trois premiers sont des outils qui existaient déjà,
 et c'est le but :
@@ -572,17 +572,23 @@ curl -sX PUT $API/v1/mcp/servers/social/tools/post_publish -H "$AUTH" \
 panne la plus probable d'un premier essai, et elle se lit `403
 tool_not_declared`.
 
-Puis les quatre routes, toutes sous la clé du locataire :
+Puis les routes, toutes sous la clé du locataire :
 
 ```
-GET  /v1/social/accounts           # les comptes connectés (plateforme, handle, état)
+GET  /v1/social/accounts
 POST /v1/social/accounts/connect   # {"platform":"x|linkedin|instagram|tiktok|youtube"}
-                                   #   -> l'URL OAuth qu'un HUMAIN ouvre
-POST /v1/social/preview            # {"account_id","text","media"?,"poll"?,…}
-                                   #   -> le contenu exact + l'empreinte à contresigner
-POST /v1/social/posts              # idem + "idempotency_key" (obligatoire) et
-                                   #   "expected_media_digests" (celles de l'aperçu)
-GET  /v1/social/posts?limit=<1..200>  # ce qui est parti
+POST /v1/social/preview
+POST /v1/social/posts              # idempotency_key obligatoire
+GET  /v1/social/posts?limit=<1..200>
+POST /v1/social/threads/preview    # le fil entier, une empreinte
+POST /v1/social/threads            # publie le fil (X), une clé
+GET  /v1/social/calendar?account_id&from&to
+POST /v1/social/calendar           # créneau, pending_approval par défaut
+POST /v1/social/calendar/move      # {"scheduled_id","publish_at"}
+POST /v1/social/calendar/cancel    # {"scheduled_id"}
+POST /v1/social/approvals          # soumettre, ne publie pas
+POST /v1/social/approvals/decide   # HUMAIN : approve | reject | edit
+                                   # absent de la table d'outils des employés
 ```
 
 Le corps part **tel quel** comme arguments de l'outil : le service est
@@ -601,9 +607,9 @@ est **200 avec `isError: true`**, parce que c'est une réponse et pas une panne.
 | `200` avec `isError: true` | la plateforme ou l'aperçu a refusé, avec le mot du service |
 
 Deux choses que ce câblage ne fait pas, et c'est écrit dans le code plutôt que
-promis ici : il ne sait prononcer que **cinq noms d'outils**, tous de la table
-d'éditeur, aucun de la seconde table `/mcp/messagerie` — un test crible la liste
-et le source du module. Et il ne mint, ne stocke et ne déchiffre aucun jeton de
+promis ici : il ne prononce aucun outil de `/mcp/messagerie` — un test crible
+la liste et le source du module. La décision d'approbation est une route, pas
+un outil d'employé. Et il ne mint, ne stocke et ne déchiffre aucun jeton de
 plateforme : ceux-ci vivent scellés chez le service, sous **sa** clé maître.
 
 ### 1.5 The policy ceiling you have to install
