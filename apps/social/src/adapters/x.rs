@@ -1059,6 +1059,7 @@ pub fn profil_depuis(statut: u16, corps: &[u8]) -> Result<ProfilLu, ErreurPlatef
         username: lire("username")?,
         nom: lire("name")?,
         third_party: true,
+        ..ProfilLu::default()
     })
 }
 

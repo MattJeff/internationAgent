@@ -285,6 +285,7 @@ pub fn profil_depuis(statut: u16, corps: &[u8]) -> Result<ProfilLu, ErreurPlatef
         username: titre.to_owned(),
         nom: titre.to_owned(),
         third_party: true,
+        ..ProfilLu::default()
     })
 }
 

@@ -158,6 +158,33 @@ pub const INSTAGRAM_SCOPES: &str = "instagram_business_basic,instagram_business_
 /// `user.info.basic` (identité) — tiktok-api-scopes, relevé 2026-09-02.
 /// Séparés par des VIRGULES (« comma-separated », oauth-user-access-token).
 pub const TIKTOK_SCOPES: &str = "user.info.basic,video.list,video.publish,video.upload";
+/// Les seuls scopes que `SOCIAL_TIKTOK_EXTRA_SCOPES` peut ajouter :
+/// `user.info.profile` (bio_description, profile_deep_link, is_verified,
+/// username) et `user.info.stats` (follower_count, following_count,
+/// likes_count, video_count) — user/info, relevé 2026-11-11. Demander à
+/// l'OAuth un scope que l'app n'a pas fait échouer la connexion : la variable
+/// est vide par défaut.
+pub const TIKTOK_SCOPES_OPTIONNELS: [&str; 2] = ["user.info.profile", "user.info.stats"];
+
+/// Lit `SOCIAL_TIKTOK_EXTRA_SCOPES` (virgules ou espaces) : les scopes
+/// acceptés, dans l'ordre de [`TIKTOK_SCOPES_OPTIONNELS`] et sans doublon,
+/// puis les entrées refusées — que l'appelant signale et ignore.
+pub fn scopes_tiktok_optionnels(brut: &str) -> (Vec<&'static str>, Vec<String>) {
+    let demandes: Vec<&str> = brut
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let acceptes = TIKTOK_SCOPES_OPTIONNELS
+        .into_iter()
+        .filter(|s| demandes.contains(s))
+        .collect();
+    let refuses = demandes
+        .iter()
+        .filter(|d| !TIKTOK_SCOPES_OPTIONNELS.contains(d))
+        .map(|d| (*d).to_owned())
+        .collect();
+    (acceptes, refuses)
+}
 /// `youtube.upload` publie ; `youtube.force-ssl` couvre commentaires, likes,
 /// recherche et lectures (commentThreads/insert, videos/rate — relevés
 /// 2026-09-02). Google sépare les scopes par des ESPACES, comme X/LinkedIn.
@@ -365,6 +392,7 @@ pub fn demarrer(
         chiffre,
         false,
         None,
+        &[],
     )
 }
 
@@ -385,6 +413,7 @@ pub fn demarrer_page(
         chiffre,
         true,
         None,
+        &[],
     )
 }
 
@@ -412,6 +441,28 @@ pub fn demarrer_facebook_business(
         chiffre,
         false,
         Some(config_id),
+        &[],
+    )
+}
+
+/// TikTok avec les scopes optionnels de `SOCIAL_TIKTOK_EXTRA_SCOPES`, ajoutés
+/// après [`TIKTOK_SCOPES`]. `scopes_extra` vide rend l'URL de [`demarrer`].
+pub fn demarrer_tiktok(
+    client_id: &str,
+    scopes_extra: &[&str],
+    redirect_uri: &str,
+    tenant: TenantId,
+    chiffre: &LocalEnvelopeSecretStore,
+) -> Result<FluxDemarre, ProviderError> {
+    demarrer_interne(
+        PlateformeOauth::Tiktok,
+        client_id,
+        redirect_uri,
+        tenant,
+        chiffre,
+        false,
+        None,
+        scopes_extra,
     )
 }
 
@@ -420,6 +471,7 @@ pub fn config_id_meta2_valide(s: &str) -> bool {
     !s.is_empty() && s.len() <= 32 && s.bytes().all(|b| b.is_ascii_digit())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn demarrer_interne(
     plateforme: PlateformeOauth,
     client_id: &str,
@@ -428,6 +480,7 @@ fn demarrer_interne(
     chiffre: &LocalEnvelopeSecretStore,
     page_linkedin: bool,
     config_id: Option<&str>,
+    scopes_tiktok_extra: &[&str],
 ) -> Result<FluxDemarre, ProviderError> {
     let state = aleatoire_b64url(STATE_OCTETS);
     let empreinte = empreinte_state(&state);
@@ -451,6 +504,13 @@ fn demarrer_interne(
             (FACEBOOK_AUTORISATION, "")
         }
         PlateformeOauth::Threads => (THREADS_AUTORISATION, THREADS_SCOPES),
+    };
+    let scopes_tiktok;
+    let scopes = if plateforme == PlateformeOauth::Tiktok && !scopes_tiktok_extra.is_empty() {
+        scopes_tiktok = format!("{TIKTOK_SCOPES},{}", scopes_tiktok_extra.join(","));
+        scopes_tiktok.as_str()
+    } else {
+        scopes
     };
     // TikTok nomme son identifiant client `client_key` — le seul des cinq
     // (oauth-user-access-token-management, relevé 2026-09-02). Les scopes,
@@ -1446,6 +1506,78 @@ mod tests {
         assert!(params["scope"].contains("video.upload"));
         assert!(params["scope"].contains("video.publish"));
         assert!(flux.verifieur_scelle.is_none());
+    }
+
+    /// Sans `SOCIAL_TIKTOK_EXTRA_SCOPES`, l'URL est celle d'avant la
+    /// variable, à l'octet près (le state, aléatoire, est lu puis recollé).
+    #[test]
+    fn tiktok_sans_scopes_extra_garde_son_url_a_l_octet() {
+        const ATTENDUE: &str = "https://www.tiktok.com/v2/auth/authorize/?response_type=code&client_key=clef-tiktok&redirect_uri=https%3A%2F%2Fsocial.example%2Foauth%2Fcallback&scope=user.info.basic%2Cvideo.list%2Cvideo.publish%2Cvideo.upload&state=";
+        let historique = demarrer(
+            PlateformeOauth::Tiktok,
+            "clef-tiktok",
+            "https://social.example/oauth/callback",
+            tenant(),
+            &chiffre(),
+        )
+        .expect("démarrage");
+        let sans_extra = demarrer_tiktok(
+            "clef-tiktok",
+            &[],
+            "https://social.example/oauth/callback",
+            tenant(),
+            &chiffre(),
+        )
+        .expect("démarrage");
+        for flux in [historique, sans_extra] {
+            let state = &parametres(&flux.authorize_url)["state"];
+            assert_eq!(flux.authorize_url, format!("{ATTENDUE}{state}"));
+        }
+    }
+
+    #[test]
+    fn tiktok_avec_scopes_extra_les_ajoute_apres_les_quatre() {
+        let (extra, refuses) = scopes_tiktok_optionnels("user.info.profile,user.info.stats");
+        assert!(refuses.is_empty());
+        let flux = demarrer_tiktok(
+            "clef-tiktok",
+            &extra,
+            "https://social.example/oauth/callback",
+            tenant(),
+            &chiffre(),
+        )
+        .expect("démarrage");
+        let params = parametres(&flux.authorize_url);
+        assert_eq!(
+            params["scope"],
+            "user.info.basic,video.list,video.publish,video.upload,user.info.profile,user.info.stats"
+        );
+        assert_eq!(params["client_key"], "clef-tiktok");
+    }
+
+    #[test]
+    fn les_scopes_extra_tiktok_ne_laissent_passer_que_les_deux_connus() {
+        assert_eq!(scopes_tiktok_optionnels(""), (vec![], vec![]));
+        assert_eq!(scopes_tiktok_optionnels("  "), (vec![], vec![]));
+        // Ordre canonique, doublon retiré, espaces ou virgules.
+        assert_eq!(
+            scopes_tiktok_optionnels("user.info.stats, user.info.profile user.info.stats"),
+            (vec!["user.info.profile", "user.info.stats"], vec![])
+        );
+        // video.manage n'a pas d'endpoint public : refusé comme tout le reste,
+        // sans emporter le scope valide posé à côté.
+        assert_eq!(
+            scopes_tiktok_optionnels("video.manage,user.info.stats,USER.INFO.PROFILE"),
+            (
+                vec!["user.info.stats"],
+                vec!["video.manage".to_owned(), "USER.INFO.PROFILE".to_owned()]
+            )
+        );
+        // Un scope déjà dans TIKTOK_SCOPES n'est pas « en plus ».
+        assert_eq!(
+            scopes_tiktok_optionnels("video.list"),
+            (vec![], vec!["video.list".to_owned()])
+        );
     }
 
     #[test]

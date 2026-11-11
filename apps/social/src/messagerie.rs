@@ -846,6 +846,7 @@ mod tests {
             oauth_meta2: None,
             oauth_threads: None,
             meta2_fb_config_id: None,
+            tiktok_scopes_extra: Vec::new(),
             linkedin_org: false,
             approval_ttl_hours: 72,
             depot: Arc::new(medias::DepotMedias::new()),

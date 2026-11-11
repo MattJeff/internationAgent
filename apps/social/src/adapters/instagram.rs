@@ -1110,6 +1110,7 @@ mod tests {
         ContexteAdaptateurs {
             base_publique: "https://social.example".to_owned(),
             depot: Arc::new(DepotMedias::new()),
+            tiktok_scopes_extra: Vec::new(),
         }
     }
 
