@@ -550,6 +550,35 @@ L'accès au-delà des rôles de l'app exige la vérification. Business Manager
 * **L'audit** (« undergo an audit to verify compliance with our Terms of
   Service », rejoué le 2026-09-02) lève tout. Gratuit.
   **Délai : non publié par la doc.**
+* **Scopes optionnels : `SOCIAL_TIKTOK_EXTRA_SCOPES`** (vide par défaut).
+  La connexion demande toujours `user.info.basic,video.list,video.publish,
+  video.upload` ; la variable y ajoute `user.info.profile` et/ou
+  `user.info.stats`, séparés par des virgules, et rien d'autre — une entrée
+  inconnue (`video.manage` compris : aucun endpoint public) est signalée au
+  démarrage et ignorée. **Ne la poser qu'une fois le scope approuvé dans le
+  portail** : demander à l'OAuth un scope que l'app n'a pas fait échouer la
+  connexion. Vide, l'URL d'autorisation est celle d'avant la variable, à
+  l'octet près (testé).
+  Ce que `GET /v2/user/info/?fields=…` sert par scope (relevé le
+  2026-11-11) : `user.info.basic` — open_id, union_id, avatar_url,
+  avatar_url_100, avatar_large_url, display_name ; `user.info.profile` —
+  bio_description, profile_deep_link, is_verified, username ;
+  `user.info.stats` — follower_count, following_count, likes_count,
+  video_count.
+  `read_profile` (messagerie) demande les champs des scopes configurés et
+  rend alors, en plus de `id`/`username`/`nom` : `bio`, `profile_url`,
+  `is_verified`, `follower_count`, `following_count`, `likes_count`,
+  `video_count` — chacun seulement si TikTok l'a rendu, jamais un zéro
+  inventé ; `username` devient le vrai @username. Le service ne stocke pas
+  les scopes accordés par compte : si TikTok refuse l'appel enrichi pour une
+  raison de scope (`scope_not_authorized` 401 ou `scope_permission_missed`
+  400, tiktok-api-v2-error-handling, relevé le 2026-11-11), l'appel repart
+  avec les champs de base et rend le profil de base — un compte connecté
+  avant la variable continue de marcher, et **doit être reconnecté** pour
+  gagner les nouveaux champs. Tout ou rien : un compte qui n'a accordé
+  qu'un des deux scopes configurés retombe aussi sur la base. La table
+  messagerie ne bouge pas (v1, empreinte intacte) : ni description ni
+  schéma d'outil n'ont changé.
 
 ### Google/YouTube — jour un en Testing, DEUX verrous INDÉPENDANTS
 

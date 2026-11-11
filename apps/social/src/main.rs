@@ -83,9 +83,21 @@ async fn main() -> anyhow::Result<()> {
     // (images Instagram, photos TikTok : la plateforme tire NOS octets
     // vettes, jamais l'URL du client).
     let depot = Arc::new(medias::DepotMedias::new());
+    // Vide par défaut : demander un scope que l'app TikTok n'a pas fait
+    // échouer la connexion. Une entrée inconnue est signalée et ignorée.
+    let (tiktok_scopes_extra, refuses) = oauth_flux::scopes_tiktok_optionnels(
+        &std::env::var("SOCIAL_TIKTOK_EXTRA_SCOPES").unwrap_or_default(),
+    );
+    if !refuses.is_empty() {
+        tracing::warn!(
+            ?refuses,
+            "SOCIAL_TIKTOK_EXTRA_SCOPES n'accepte que user.info.profile et user.info.stats — entrées ignorées"
+        );
+    }
     let ctx = adapters::ContexteAdaptateurs {
         base_publique: url_publique.clone(),
         depot: depot.clone(),
+        tiktok_scopes_extra: tiktok_scopes_extra.clone(),
     };
     let etat = Arc::new(mcp::Etat {
         pool,
@@ -127,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty()),
+        tiktok_scopes_extra,
         linkedin_org: drapeau_env("SOCIAL_LINKEDIN_ORG_POSTING"),
         approval_ttl_hours: std::env::var("SOCIAL_APPROVAL_TTL_HOURS")
             .ok()
@@ -751,6 +764,7 @@ mod tests {
             oauth_meta2: None,
             oauth_threads: None,
             meta2_fb_config_id: None,
+            tiktok_scopes_extra: Vec::new(),
             linkedin_org: false,
             approval_ttl_hours: 72,
             depot: Arc::new(medias::DepotMedias::new()),
@@ -915,6 +929,7 @@ mod tests {
             }),
             oauth_threads: None,
             meta2_fb_config_id: None,
+            tiktok_scopes_extra: Vec::new(),
             linkedin_org: false,
             approval_ttl_hours: 72,
             depot: Arc::new(medias::DepotMedias::new()),

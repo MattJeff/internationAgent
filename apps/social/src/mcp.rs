@@ -64,6 +64,9 @@ pub struct Etat {
     /// Chiffres, pas un secret. Sans lui, `instagram_reels` et `facebook_page`
     /// ne démarrent pas de dialogue.
     pub meta2_fb_config_id: Option<String>,
+    /// `SOCIAL_TIKTOK_EXTRA_SCOPES`, déjà filtrée : `user.info.profile` et/ou
+    /// `user.info.stats`, demandés à la connexion en plus de `TIKTOK_SCOPES`.
+    pub tiktok_scopes_extra: Vec<&'static str>,
     /// `SOCIAL_LINKEDIN_ORG_POSTING` : demande `w_organization_social` et
     /// enregistre une ligne de compte par page, en plus du membre.
     pub linkedin_org: bool,
@@ -868,13 +871,23 @@ async fn connecter(etat: &Etat, tenant: Uuid, args: &Value) -> Result<Value, Err
     } else {
         oauth_flux::demarrer
     };
-    let flux = demarrer(
-        pf,
-        &credentiels.client_id,
-        &etat.redirect_uri(),
-        TenantId::from_uuid(tenant),
-        &etat.chiffreur,
-    )
+    let flux = if plateforme == "tiktok" {
+        oauth_flux::demarrer_tiktok(
+            &credentiels.client_id,
+            &etat.tiktok_scopes_extra,
+            &etat.redirect_uri(),
+            TenantId::from_uuid(tenant),
+            &etat.chiffreur,
+        )
+    } else {
+        demarrer(
+            pf,
+            &credentiels.client_id,
+            &etat.redirect_uri(),
+            TenantId::from_uuid(tenant),
+            &etat.chiffreur,
+        )
+    }
     .map_err(|_| Erreur::nouvelle("scellement", "le flux n'a pas pu etre scelle"))?;
 
     store::creer_attente_oauth(
@@ -2288,6 +2301,7 @@ mod tests {
             oauth_meta2: None,
             oauth_threads: None,
             meta2_fb_config_id: None,
+            tiktok_scopes_extra: Vec::new(),
             linkedin_org: false,
             approval_ttl_hours: 72,
             depot: Arc::new(medias::DepotMedias::new()),

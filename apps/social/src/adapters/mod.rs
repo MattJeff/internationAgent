@@ -209,6 +209,9 @@ impl OptionsPost {
 pub struct ContexteAdaptateurs {
     pub base_publique: String,
     pub depot: std::sync::Arc<crate::medias::DepotMedias>,
+    /// `SOCIAL_TIKTOK_EXTRA_SCOPES`, déjà filtrée
+    /// (`oauth_flux::scopes_tiktok_optionnels`). Vide = profil de base.
+    pub tiktok_scopes_extra: Vec<&'static str>,
 }
 
 /// L'adresse publique d'un média vetté, dérivée du digest — LA fonction pure
@@ -405,12 +408,28 @@ pub struct PostsLus {
 }
 
 /// Un profil lu — contenu de tiers comme le reste.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ProfilLu {
     pub id: String,
     pub username: String,
     pub nom: String,
     pub third_party: bool,
+    // Ce qui suit n'existe que si la plateforme l'a rendu : `None` ne part
+    // pas sur le fil, et un compteur absent n'est jamais un zéro.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_verified: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follower_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub following_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub likes_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_count: Option<u64>,
 }
 
 /// Une action sans corps intéressant (like, bookmark, repost…) : ce qui reste

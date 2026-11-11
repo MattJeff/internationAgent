@@ -429,6 +429,65 @@ pub fn utilisateur_depuis(statut: u16, corps: &[u8]) -> Result<(String, String),
     Ok((lire("open_id")?, lire("display_name")?))
 }
 
+/// Les `fields` de user/info selon les scopes optionnels configurés
+/// (`SOCIAL_TIKTOK_EXTRA_SCOPES`). Demander un champ sans son scope fait
+/// échouer l'appel : sans scope en plus, la liste est celle de
+/// `user.info.basic` (user/info, relevé le 2026-11-11).
+pub fn champs_user_info(scopes_extra: &[&str]) -> String {
+    let mut champs = "open_id,display_name".to_owned();
+    if scopes_extra.contains(&"user.info.profile") {
+        champs.push_str(",bio_description,profile_deep_link,is_verified,username");
+    }
+    if scopes_extra.contains(&"user.info.stats") {
+        champs.push_str(",follower_count,following_count,likes_count,video_count");
+    }
+    champs
+}
+
+/// Lit `data.user` de user/info en profil. Seuls open_id et display_name
+/// sont exigés ; un champ de `user.info.profile` ou `user.info.stats` que
+/// TikTok n'a pas rendu reste `None` — jamais une chaîne vide ni un zéro
+/// inventés.
+pub fn profil_depuis(statut: u16, corps: &[u8]) -> Result<ProfilLu, ErreurPlateforme> {
+    let (open_id, display_name) = utilisateur_depuis(statut, corps)?;
+    let document: serde_json::Value =
+        serde_json::from_slice(corps).map_err(|_| ErreurPlateforme::Illisible)?;
+    let champ = |nom: &str| document.pointer(&format!("/data/user/{nom}"));
+    let texte = |nom: &str| champ(nom).and_then(|v| v.as_str()).map(str::to_owned);
+    let compteur = |nom: &str| champ(nom).and_then(|v| v.as_u64());
+    Ok(ProfilLu {
+        id: open_id,
+        // Sans user.info.profile, TikTok ne sert pas le @username : le
+        // display_name est ce qu'on tient.
+        username: texte("username").unwrap_or_else(|| display_name.clone()),
+        nom: display_name,
+        third_party: true,
+        bio: texte("bio_description"),
+        profile_url: texte("profile_deep_link"),
+        is_verified: champ("is_verified").and_then(|v| v.as_bool()),
+        follower_count: compteur("follower_count"),
+        following_count: compteur("following_count"),
+        likes_count: compteur("likes_count"),
+        video_count: compteur("video_count"),
+    })
+}
+
+/// Vrai quand TikTok refuse pour une raison de scope : `scope_not_authorized`
+/// (401, « The user did not authorize the scope required ») ou
+/// `scope_permission_missed` (400, des champs demandent un scope en plus) —
+/// tiktok-api-v2-error-handling, relevé le 2026-11-11. Seul `error.code` est
+/// lu : le message ne sort jamais d'ici.
+fn refus_de_scope(corps: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(corps)
+        .ok()
+        .and_then(|d| {
+            d.pointer("/error/code")
+                .and_then(|v| v.as_str())
+                .map(|c| matches!(c, "scope_not_authorized" | "scope_permission_missed"))
+        })
+        .unwrap_or(false)
+}
+
 /// Le poids « UTF-16 runes » cité par TikTok : des unités UTF-16, comptées
 /// comme la doc les compte.
 pub fn poids_utf16(texte: &str) -> usize {
@@ -522,6 +581,9 @@ fn apercu_media(m: &MediaPret) -> ApercuMedia {
 pub struct Tiktok {
     base_publique: String,
     depot: Arc<DepotMedias>,
+    scopes_extra: Vec<&'static str>,
+    /// [`POINT_USER_INFO`] ; les tests y mettent leur serveur local.
+    point_user_info: String,
 }
 
 impl Tiktok {
@@ -529,7 +591,34 @@ impl Tiktok {
         Self {
             base_publique: ctx.base_publique.trim_end_matches('/').to_owned(),
             depot: ctx.depot.clone(),
+            scopes_extra: ctx.tiktok_scopes_extra.clone(),
+            point_user_info: POINT_USER_INFO.to_owned(),
         }
+    }
+
+    /// Le profil du compte du jeton. Avec des scopes optionnels configurés,
+    /// l'appel enrichi part d'abord ; le service ne stocke pas les scopes
+    /// accordés par compte, donc un refus de scope (compte connecté avant la
+    /// variable) se rattrape par l'appel de base, qui rend le profil de base.
+    // ponytail: tout ou rien — un compte qui n'a accordé qu'un des deux
+    // scopes configurés retombe sur la base ; un essai par scope si ça compte.
+    async fn lire_profil(&self, jeton: &Secret) -> Result<ProfilLu, ErreurPlateforme> {
+        let demander = |champs: String| {
+            envoyer(
+                http()
+                    .get(&self.point_user_info)
+                    .query(&[("fields", champs)])
+                    .bearer_auth(jeton.expose_for_transport()),
+            )
+        };
+        if !self.scopes_extra.is_empty() {
+            let (statut, corps) = demander(champs_user_info(&self.scopes_extra)).await?;
+            if !refus_de_scope(&corps) {
+                return profil_depuis(statut, &corps);
+            }
+        }
+        let (statut, corps) = demander(champs_user_info(&[])).await?;
+        profil_depuis(statut, &corps)
     }
 
     /// Le privacy_level effectif : mapping de la table, défaut SELF_ONLY.
@@ -1045,27 +1134,13 @@ impl PlateformeMessagerie for Tiktok {
         jeton: &Secret,
         username: &str,
     ) -> Result<ProfilLu, ErreurMessagerie> {
-        let (statut, corps) = envoyer(
-            http()
-                .get(POINT_USER_INFO)
-                .query(&[("fields", "open_id,display_name")])
-                .bearer_auth(jeton.expose_for_transport()),
-        )
-        .await?;
-        let (open_id, display_name) = utilisateur_depuis(statut, &corps)?;
+        let profil = self.lire_profil(jeton).await?;
         // Son propre profil UNIQUEMENT : un autre nom est un tiers, refusé
         // avec la citation — jamais un appel qui « essaie ».
-        if username != open_id && username != display_name {
+        if username != profil.id && username != profil.nom && username != profil.username {
             return Err(ne_sert_pas(CITATION_PAS_DE_TIERS, "rien"));
         }
-        Ok(ProfilLu {
-            id: open_id,
-            // user.info.basic ne sert pas le @username (scope
-            // user.info.profile) : le display_name est ce qu'on tient.
-            username: display_name.clone(),
-            nom: display_name,
-            third_party: true,
-        })
+        Ok(profil)
     }
 
     /// SES vidéos publiques : video/list, max_count 20 — uniquement si
@@ -1121,6 +1196,7 @@ mod tests {
         Tiktok::nouvel(&ContexteAdaptateurs {
             base_publique: "https://social.example".to_owned(),
             depot: Arc::new(DepotMedias::new()),
+            tiktok_scopes_extra: Vec::new(),
         })
     }
 
@@ -1330,6 +1406,7 @@ mod tests {
                 format!("{:?}", statut_publication_depuis(statut, hostile)),
                 format!("{:?}", metriques_depuis(statut, hostile)),
                 format!("{:?}", utilisateur_depuis(statut, hostile)),
+                format!("{:?}", profil_depuis(statut, hostile)),
             ];
             for rendu in rendus {
                 assert!(!rendu.contains("JETON-SECRET"), "le jeton a fui: {rendu}");
@@ -1599,5 +1676,171 @@ mod tests {
             .unwrap();
         let g = ranges.lock().expect("verrou");
         assert_eq!(g.as_slice(), ["bytes 0-7/8:8".to_owned()]);
+    }
+
+    #[test]
+    fn les_champs_demandes_suivent_les_scopes_configures() {
+        assert_eq!(champs_user_info(&[]), "open_id,display_name");
+        assert_eq!(
+            champs_user_info(&["user.info.profile"]),
+            "open_id,display_name,bio_description,profile_deep_link,is_verified,username"
+        );
+        assert_eq!(
+            champs_user_info(&["user.info.stats"]),
+            "open_id,display_name,follower_count,following_count,likes_count,video_count"
+        );
+        assert_eq!(
+            champs_user_info(&["user.info.profile", "user.info.stats"]),
+            "open_id,display_name,bio_description,profile_deep_link,is_verified,username,\
+             follower_count,following_count,likes_count,video_count"
+        );
+    }
+
+    const CORPS_BASE: &str =
+        r#"{"data":{"user":{"open_id":"abc-123","display_name":"Orizn"}},"error":{"code":"ok"}}"#;
+    const CORPS_ENRICHI: &str = r#"{"data":{"user":{"open_id":"abc-123","display_name":"Orizn","bio_description":"visas","profile_deep_link":"https://vm.tiktok.com/x","is_verified":false,"username":"orizn","follower_count":12,"following_count":0,"likes_count":340,"video_count":7}},"error":{"code":"ok"}}"#;
+
+    /// Le profil de base sort sur le fil EXACTEMENT comme avant les champs
+    /// optionnels ; l'enrichi porte ce que TikTok a rendu, zéro compris
+    /// quand c'est TikTok qui le dit.
+    #[test]
+    fn le_profil_ne_porte_que_ce_que_tiktok_a_rendu() {
+        let base = profil_depuis(200, CORPS_BASE.as_bytes()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&base).unwrap(),
+            json!({ "id": "abc-123", "username": "Orizn", "nom": "Orizn", "third_party": true })
+        );
+        assert_eq!(base.follower_count, None);
+
+        let enrichi = profil_depuis(200, CORPS_ENRICHI.as_bytes()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&enrichi).unwrap(),
+            json!({
+                "id": "abc-123", "username": "orizn", "nom": "Orizn", "third_party": true,
+                "bio": "visas", "profile_url": "https://vm.tiktok.com/x", "is_verified": false,
+                "follower_count": 12, "following_count": 0, "likes_count": 340, "video_count": 7
+            })
+        );
+    }
+
+    /// Un faux user/info local : l'appel enrichi (reconnu à `follower_count`
+    /// dans `fields`) reçoit `enrichi`, l'appel de base toujours 200. Rend le
+    /// journal des `fields` reçus.
+    async fn faux_user_info(
+        enrichi: (u16, &'static str),
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::extract::Query;
+        use axum::routing::get;
+
+        let journal = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let vu = journal.clone();
+        let app = axum::Router::new().route(
+            "/v2/user/info/",
+            get(
+                move |Query(q): Query<std::collections::HashMap<String, String>>,
+                      headers: axum::http::HeaderMap| async move {
+                    assert_eq!(headers["authorization"], "Bearer JETON-SECRET");
+                    let champs = q.get("fields").cloned().unwrap_or_default();
+                    let (statut, corps) = if champs.contains("follower_count") {
+                        enrichi
+                    } else {
+                        (200, CORPS_BASE)
+                    };
+                    vu.lock().expect("verrou").push(champs);
+                    (axum::http::StatusCode::from_u16(statut).unwrap(), corps)
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adresse = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{adresse}/v2/user/info/"), journal)
+    }
+
+    fn tiktok_vers(point: String, scopes_extra: Vec<&'static str>) -> Tiktok {
+        Tiktok {
+            scopes_extra,
+            point_user_info: point,
+            ..tiktok()
+        }
+    }
+
+    const LES_DEUX: [&str; 2] = ["user.info.profile", "user.info.stats"];
+    const BASE: &str = "open_id,display_name";
+    const TOUT: &str = "open_id,display_name,bio_description,profile_deep_link,is_verified,username,follower_count,following_count,likes_count,video_count";
+
+    #[tokio::test]
+    async fn sans_scope_configure_un_seul_appel_de_base() {
+        let (point, journal) = faux_user_info((200, CORPS_ENRICHI)).await;
+        let profil = tiktok_vers(point, vec![])
+            .read_profile(&Secret::new("JETON-SECRET"), "abc-123")
+            .await
+            .unwrap();
+        assert_eq!(profil, profil_depuis(200, CORPS_BASE.as_bytes()).unwrap());
+        assert_eq!(journal.lock().unwrap().as_slice(), [BASE]);
+    }
+
+    #[tokio::test]
+    async fn avec_les_scopes_le_profil_enrichi_sort_en_un_appel() {
+        let (point, journal) = faux_user_info((200, CORPS_ENRICHI)).await;
+        let t = tiktok_vers(point, LES_DEUX.to_vec());
+        let jeton = Secret::new("JETON-SECRET");
+        // Le @username servi par user.info.profile désigne aussi son profil.
+        let profil = t.read_profile(&jeton, "orizn").await.unwrap();
+        assert_eq!(profil.follower_count, Some(12));
+        assert_eq!(profil.following_count, Some(0));
+        assert_eq!(profil.bio.as_deref(), Some("visas"));
+        assert_eq!(profil.is_verified, Some(false));
+        assert_eq!(journal.lock().unwrap().as_slice(), [TOUT]);
+        // Un tiers reste refusé avec la citation.
+        let refus = t
+            .read_profile(&jeton, "quelqu-un-d-autre")
+            .await
+            .unwrap_err();
+        assert!(format!("{refus:?}").contains("pas de lecture de tiers"));
+    }
+
+    /// Un compte connecté AVANT la variable n'a pas les scopes : les deux
+    /// formes de refus documentées retombent sur les champs de base.
+    #[tokio::test]
+    async fn un_refus_de_scope_retombe_sur_le_profil_de_base() {
+        for refus in [
+            (
+                401,
+                r#"{"error":{"code":"scope_not_authorized","message":"Bearer JETON-SECRET sans scope","log_id":"x"}}"#,
+            ),
+            (
+                400,
+                r#"{"error":{"code":"scope_permission_missed","message":"Bearer JETON-SECRET sans scope","log_id":"x"}}"#,
+            ),
+        ] {
+            let (point, journal) = faux_user_info(refus).await;
+            let profil = tiktok_vers(point, LES_DEUX.to_vec())
+                .read_profile(&Secret::new("JETON-SECRET"), "Orizn")
+                .await
+                .unwrap();
+            assert_eq!(profil, profil_depuis(200, CORPS_BASE.as_bytes()).unwrap());
+            assert_eq!(journal.lock().unwrap().as_slice(), [TOUT, BASE]);
+        }
+    }
+
+    /// Un refus qui n'est PAS de scope ne déclenche aucun second appel, et
+    /// ni le jeton ni le message de TikTok ne sortent dans l'erreur.
+    #[tokio::test]
+    async fn un_autre_refus_ne_retombe_pas_et_ne_laisse_rien_fuir() {
+        let (point, journal) = faux_user_info((
+            401,
+            r#"{"error":{"code":"access_token_invalid","message":"Bearer JETON-SECRET refuse"}}"#,
+        ))
+        .await;
+        let erreur = tiktok_vers(point, LES_DEUX.to_vec())
+            .read_profile(&Secret::new("JETON-SECRET"), "Orizn")
+            .await
+            .unwrap_err();
+        let rendu = format!("{erreur:?} {erreur}");
+        assert!(!rendu.contains("JETON-SECRET"), "le jeton a fui: {rendu}");
+        assert_eq!(journal.lock().unwrap().as_slice(), [TOUT]);
     }
 }
