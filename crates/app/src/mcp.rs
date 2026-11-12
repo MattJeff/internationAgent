@@ -786,19 +786,37 @@ impl McpServer {
         // request. Closing it is one line (`reqwest::Client::builder()
         // .resolve(host, addr)` fed to `StreamableHttpClientTransport::
         // with_client`) the day `reqwest` is a direct dependency of this crate.
-        let mut config = StreamableHttpClientTransportConfig::with_uri(url.as_str());
-        if let Some(token) = token {
-            // `auth_header` takes the token WITHOUT the `Bearer ` prefix; rmcp
-            // writes the scheme itself. Prefixing it here would send
-            // `Bearer Bearer …`, which every server answers 401 to and no error
-            // message explains.
-            config = config.auth_header(token.expose_for_transport());
-        }
-        let transport = StreamableHttpClientTransport::from_config(config);
-        let info = ClientInfo::new(
-            ClientCapabilities::default(),
-            Implementation::new(CLIENT_NAME, CLIENT_VERSION),
-        );
+        // ponytail: config is rebuilt per attempt because the transport is
+        // consumed by `serve`; two attempts at most, so no builder type.
+        let attempt =
+            |mode: ClientLifecycleMode, version: Option<ProtocolVersion>, ct: CancellationToken| {
+                let mut config = StreamableHttpClientTransportConfig::with_uri(url.as_str());
+                if let Some(token) = token {
+                    // `auth_header` takes the token WITHOUT the `Bearer ` prefix; rmcp
+                    // writes the scheme itself. Prefixing it here would send
+                    // `Bearer Bearer …`, which every server answers 401 to and no error
+                    // message explains.
+                    config = config.auth_header(token.expose_for_transport());
+                }
+                let transport = StreamableHttpClientTransport::from_config(config);
+                let mut info = ClientInfo::new(
+                    ClientCapabilities::default(),
+                    Implementation::new(CLIENT_NAME, CLIENT_VERSION),
+                );
+                if let Some(version) = version {
+                    info = info.with_protocol_version(version);
+                }
+                async move {
+                    let client = serve_client_with_lifecycle_and_ct(info, transport, mode, ct)
+                        .await
+                        .map_err(|e| McpError::Connect(e.to_string()))?;
+                    // `list_all_tools` walks `next_cursor` for us; a partial inventory
+                    // would silently classify the tools on page two as undeclared.
+                    let discovered = client.list_all_tools().await?;
+                    let tools = inventory(&discovered, declared)?;
+                    Ok::<_, McpError>((client, tools))
+                }
+            };
         // Everything from here to the inventory is somebody else's server
         // talking, and until this timeout existed none of it was bounded. See
         // [`BIND_TIMEOUT`] for whose outage that became. It wraps both exchanges
@@ -828,54 +846,62 @@ impl McpServer {
         // Un enfant annulé ne remonte pas à son parent, et un parent annulé
         // emporte ses enfants : l'arrêt du processus ferme toujours les clients.
         let ct = ct.child_token();
-        let bound = tokio::time::timeout(BIND_TIMEOUT, async move {
-            let client = serve_client_with_lifecycle_and_ct(
-                info,
-                transport,
-                // `Auto`, not `Discover`. The note that used to sit here said to
-                // switch it "the day a server that predates the revision has to be
-                // supported — it is the same one literal", and that day arrived the
-                // first time this client was pointed at a server somebody else
-                // wrote. `Discover` is sessionless — no `initialize`, no session id,
-                // the protocol version on every request — and `rmcp` is explicit
-                // that it "does not fall back; a legacy server is an error". Every
-                // MCP server in the wild today is that error: the reference SDKs
-                // answer `server/discover` with `-32601 Method not found`, and the
-                // real Orizn server (2025-06-18) is one of them, so `Discover` made
-                // `bind` a function that could not bind anything a tenant owns.
-                //
-                // `Auto` probes with `server/discover` first and falls back to the
-                // legacy `initialize` handshake on a correlated JSON-RPC error or
-                // after ten seconds of silence. It costs one extra round trip at
-                // bind time — which happens once, in a background loop, never on a
-                // turn — and it buys the entire installed base.
-                //
-                // `legacy_version` is `V_2025_06_18` rather than `None` (which would
-                // leave `ClientInfo`'s own `LATEST`, currently 2025-11-25) because
-                // the fallback is for servers that are *behind*, and a fallback that
-                // opens by naming a revision older servers reject is a fallback that
-                // fails on the servers it exists for. 2025-06-18 is the oldest
-                // revision that still carries the tool-annotation fields
-                // `RiskClass::from_hints` reads.
-                ClientLifecycleMode::Auto {
-                    preferred_versions: vec![ProtocolVersion::V_2026_07_28],
-                    legacy_version: Some(ProtocolVersion::V_2025_06_18),
-                },
-                ct,
-            )
-            .await
-            .map_err(|e| McpError::Connect(e.to_string()))?;
-
-            // `list_all_tools` walks `next_cursor` for us; a partial inventory
-            // would silently classify the tools on page two as undeclared.
-            let discovered = client.list_all_tools().await?;
-            let tools = inventory(&discovered, declared)?;
-            Ok::<_, McpError>((client, tools))
-        })
-        .await
-        .map_err(|_| McpError::BindTimedOut {
-            secs: BIND_TIMEOUT.as_secs(),
-        })?;
+        let started = tokio::time::Instant::now();
+        // `Auto`, not `Discover`. The note that used to sit here said to
+        // switch it "the day a server that predates the revision has to be
+        // supported — it is the same one literal", and that day arrived the
+        // first time this client was pointed at a server somebody else
+        // wrote. `Discover` is sessionless — no `initialize`, no session id,
+        // the protocol version on every request — and `rmcp` is explicit
+        // that it "does not fall back; a legacy server is an error". Every
+        // MCP server in the wild today is that error: the reference SDKs
+        // answer `server/discover` with `-32601 Method not found`, and the
+        // real Orizn server (2025-06-18) is one of them, so `Discover` made
+        // `bind` a function that could not bind anything a tenant owns.
+        //
+        // `Auto` probes with `server/discover` first and falls back to the
+        // legacy `initialize` handshake on a correlated JSON-RPC error or
+        // after ten seconds of silence. It costs one extra round trip at
+        // bind time — which happens once, in a background loop, never on a
+        // turn — and it buys the entire installed base.
+        //
+        // `legacy_version` is `V_2025_06_18` rather than `None` (which would
+        // leave `ClientInfo`'s own `LATEST`, currently 2025-11-25) because
+        // the fallback is for servers that are *behind*, and a fallback that
+        // opens by naming a revision older servers reject is a fallback that
+        // fails on the servers it exists for. 2025-06-18 is the oldest
+        // revision that still carries the tool-annotation fields
+        // `RiskClass::from_hints` reads.
+        let auto = ClientLifecycleMode::Auto {
+            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            legacy_version: Some(ProtocolVersion::V_2025_06_18),
+        };
+        // **Un serveur qui annonce 2026-07-28 et se tait ensuite.** ElevenLabs
+        // (2026-11-04) répond à `server/discover`, puis ne rend jamais
+        // `tools/list` en mode sans session ; le même serveur liste ses outils
+        // sans difficulté après un `initialize` classique. `Auto` ne retombe
+        // que sur un silence *au moment de discover*, pas après : on garde donc
+        // la moitié du budget pour un second essai en poignée de main
+        // historique. Le plafond total reste [`BIND_TIMEOUT`].
+        let half = BIND_TIMEOUT / 2;
+        let bound = match tokio::time::timeout(half, attempt(auto, None, ct.child_token())).await {
+            Ok(result) => result,
+            Err(_) => {
+                let left = BIND_TIMEOUT.saturating_sub(started.elapsed());
+                tokio::time::timeout(
+                    left,
+                    attempt(
+                        ClientLifecycleMode::Initialize,
+                        Some(ProtocolVersion::V_2025_06_18),
+                        ct,
+                    ),
+                )
+                .await
+                .map_err(|_| McpError::BindTimedOut {
+                    secs: BIND_TIMEOUT.as_secs(),
+                })?
+            }
+        };
         let (client, tools) = bound?;
 
         Ok(Self {
@@ -2976,7 +3002,9 @@ mod tests {
         assert_eq!(err.code(), "bind_timed_out", "{err}");
         // Reachable and mute, not unreachable — the accept count is what says
         // so, and the code has to agree or an operator debugs the wrong end.
-        assert_eq!(*accepted.lock().expect("not poisoned"), 1);
+        // At least the `Auto` attempt; the legacy retry may not connect
+        // before the paused clock runs its half of the deadline out.
+        assert!(*accepted.lock().expect("not poisoned") >= 1);
     }
 
     #[tokio::test]
