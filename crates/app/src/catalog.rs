@@ -2023,6 +2023,47 @@ pub const CATALOG: &[Connector] = &[
         opt_outs: OptOuts::NoStrangers,
     },
     Connector {
+        key: "cliponit",
+        label: "ClipOnIt — short clips and explainer videos",
+        // Le serveur MCP de ClipOnIt, en Streamable HTTP. Relevé le
+        // 2026-11-11, pas deviné :
+        //
+        //   POST https://cliponit.app/mcp → 401, www-authenticate: Bearer
+        //     resource_metadata="https://cliponit.app/.well-known/oauth-protected-resource",
+        //     scope="clips"
+        //   GET  https://cliponit.app/.well-known/oauth-authorization-server →
+        //     authorization_code + refresh_token, PKCE S256,
+        //     token_endpoint_auth_methods_supported: ["none"],
+        //     client_id_metadata_document_supported: true
+        //
+        // Même chemin qu'`elevenlabs` : un client public identifié par le
+        // document que ce déploiement sert. ClipOnIt le récupère à
+        // `/oauth/authorize` et exige `client_id` == URL et des
+        // `redirect_uris` en https (src/routes/oauth.rs du dépôt ClipOnIt).
+        // Chaque société branche SON compte ClipOnIt : les vidéos, quotas et
+        // exports sont ceux de ce compte.
+        provision: Provision::Dial("https://cliponit.app/mcp"),
+        reach: Reach::Public,
+        credential: Credential::OAuth(&OAuth {
+            authorize: "https://cliponit.app/oauth/authorize",
+            token: "https://cliponit.app/oauth/token",
+            scopes: "clips",
+            auth: ClientAuth::MetadataDocument,
+        }),
+        // `Write` : importer, découper et exporter consomme le quota mensuel du
+        // compte, et `delete_video`/`delete_clip` effacent — ces deux-là sont à
+        // laisser non déclarés (donc refusés) par le locataire.
+        floor: RiskClass::Write,
+        // Lu sur le `tools/list` du serveur (src/mcp.rs de ClipOnIt) le
+        // 2026-11-11 : `publish_tiktok` ne publie pas, il rend un lien que
+        // l'humain confirme sur ClipOnIt ; les `hub_*` n'envoient ni message
+        // Discord ni publication (`hub_member` ajoute un compte ClipOnIt déjà
+        // existant). Aucun outil n'écrit à une adresse. Le falsificateur : un
+        // outil qui publie sans clic ou qui envoie un message, et cette entrée
+        // devient `HeldHere`.
+        opt_outs: OptOuts::NoStrangers,
+    },
+    Connector {
         key: "x",
         label: "X",
         // Le serveur MCP hébergé de X, en Streamable HTTP — docs.x.com/tools/mcp.md
@@ -2527,14 +2568,14 @@ pub const CATALOG: &[Connector] = &[
 /// It is `pub` because it is the artifact the obligation actually needs: the
 /// list of connectors this deployment asserts have no unsubscribe list
 /// anywhere, in one place, readable by whoever has to answer for it.
-pub const NO_OUTREACH: [&str; 21] = {
-    let mut out = [""; 21];
+pub const NO_OUTREACH: [&str; 22] = {
+    let mut out = [""; 22];
     let (mut i, mut n) = (0, 0);
     while i < CATALOG.len() {
         vet(&CATALOG[i]);
         if matches!(CATALOG[i].opt_outs, OptOuts::NoStrangers) {
             assert!(
-                n < 21,
+                n < 22,
                 "a connector claiming `OptOuts::NoStrangers` was added to CATALOG and \
                  NO_OUTREACH's length was not updated. That claim is read off the vendor's \
                  own tool list — every tool this server serves, and not one of them can put \
@@ -2549,7 +2590,7 @@ pub const NO_OUTREACH: [&str; 21] = {
         i += 1;
     }
     assert!(
-        n == 21,
+        n == 22,
         "a connector stopped claiming `OptOuts::NoStrangers` and NO_OUTREACH's length was \
          not updated"
     );
