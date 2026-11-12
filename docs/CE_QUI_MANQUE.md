@@ -461,12 +461,16 @@ handle.
 Les revues d'app de `docs/SOCIAL.md` tiennent : Meta ne sert que les comptes
 qui ont un rôle sur l'app, TikTok public attend l'audit, l'écran Google en
 `Testing` fait mourir le refresh en sept jours. L'image sait construire le
-binaire ; personne ne l'a démarré sur un hôte public dans ce dépôt, et aucune
-entrée `Provision::Dial` ne nomme une URL qui ne répond pas. Brancher un
-locataire (ClipOnIt, par exemple) reste la liste du § « Comment un locataire
-publie » de `docs/SOCIAL.md` : déployer, `mint-tenant` sur l'hôte du service,
-`integrations_connect` sous le handle `social`, `discover`, `declare_tool`,
-puis un humain ouvre chaque URL OAuth. Ce chantier ne le fait pas.
+binaire. Le 2026-11-10 il tourne en local (écoute `127.0.0.1:8791`, callback
+`https://social-local.orizn.app/oauth/callback`) ; la marche pour le refaire,
+les apps officielles et ce que LinkedIn refuse de mettre sur une seule app,
+est dans `docs/SOCIAL_APPS_SETUP.md`. Ce dépôt ne contient toujours pas
+d'hôte public, et aucune entrée `Provision::Dial` ne nomme une URL qui ne
+répond pas. Brancher un locataire (ClipOnIt, par exemple) reste la liste du
+§ « Comment un locataire publie » de `docs/SOCIAL.md` : déployer,
+`mint-tenant` sur l'hôte du service, `integrations_connect` sous le handle
+`social`, `discover`, `declare_tool`, puis un humain ouvre chaque URL OAuth.
+Ce chantier ne le fait pas.
 
 ### 3.6 Coder le projet — le siège existe, avec zéro outil
 
