@@ -21,8 +21,10 @@ VAGUES = ETAT / "vagues/upsell-1112/envoyes.jsonl"
 SERVER = os.environ.get("SITE_SERVER", "root@204.168.244.123")
 DRY = os.environ.get("DRY_RUN", "false") == "true"
 MAX_PAR_JOUR = int(os.environ.get("UPSELL_MAX", "6"))
-STARTER = "https://visa.orizn.app/visa-api/dashboard/billing?plan=starter"
-PRO = "https://visa.orizn.app/visa-api/dashboard/billing?plan=pro"
+# Même forme que checkoutUrl() du site : connexion puis paiement, et `source` est enregistré
+# dans visa_payment_funnel_events, ce qui attribue chaque paiement à ces mails.
+STARTER = "https://visa.orizn.app/visa-api/login?next=%2Fvisa-api%2Fdashboard%2Fbilling%3Fplan%3Dstarter%26source%3Dupsell_auto"
+PRO = "https://visa.orizn.app/visa-api/login?next=%2Fvisa-api%2Fdashboard%2Fbilling%3Fplan%3Dpro%26source%3Dupsell_auto"
 DOCS = "https://visa.orizn.app/visa-api/docs"
 INK, BRASS, MUTED, RULE = "#141517", "#b08d57", "#5b5e66", "#e4e4e7"
 FREEMAIL = re.compile(r"@(gmail|googlemail|outlook|hotmail|live|yahoo|icloud|me|proton|protonmail|qq|163|126|foxmail|mail|yandex|gmx|aol)\.", re.I)
