@@ -301,6 +301,57 @@ impl OauthClients {
     fn get(&self, connector: &str) -> Option<&Client> {
         self.0.get(connector)
     }
+
+    /// Register every [`ClientAuth::MetadataDocument`] connector of
+    /// [`catalog::CATALOG`] under the `client_id` this deployment publishes for
+    /// it: [`metadata_document_url`] over `origin` (`PUBLIC_HOST`).
+    ///
+    /// # Why the registry and not a branch in four places
+    ///
+    /// `has`, `start`, `complete` and `refresh_due` all go through
+    /// [`registration`], so putting the derived id *here*, once, at boot, is
+    /// the whole change: the catalogue offers the connector, the consent URL
+    /// carries the URL as `client_id`, and the exchange and every refresh send
+    /// the same string — with no new parameter threaded to any of them. The
+    /// secret is empty and [`post_token`]'s `MetadataDocument` arm never reads
+    /// it. The derived entry wins over an `AGENTOS_OAUTH_CLIENTS` line for the
+    /// same connector, because the provider will only accept the URL.
+    #[must_use]
+    pub fn with_metadata_documents(mut self, origin: &str) -> Self {
+        for connector in catalog::CATALOG {
+            if connector
+                .credential
+                .oauth()
+                .is_some_and(|o| o.auth == ClientAuth::MetadataDocument)
+            {
+                self.0.insert(
+                    connector.key.to_owned(),
+                    Client {
+                        id: metadata_document_url(origin, connector.key),
+                        secret: Secret::new(String::new()),
+                    },
+                );
+            }
+        }
+        self
+    }
+
+    /// The `client_id` registered for a connector. Not a secret: it is in every
+    /// consent URL. Read by the route that serves the metadata document, so the
+    /// document's `client_id` is the very string `start` sends, not a rebuild.
+    pub fn client_id(&self, connector: &str) -> Option<&str> {
+        self.0.get(connector).map(|c| c.id.as_str())
+    }
+}
+
+/// Where this deployment publishes a connector's client metadata document, and
+/// therefore that connector's `client_id`. Same origin as the callback, so the
+/// provider sees one host on both.
+pub fn metadata_document_url(origin: &str, connector: &str) -> String {
+    format!(
+        "{}/v1/mcp/oauth/client/{connector}.json",
+        origin.trim_end_matches('/')
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -921,6 +972,9 @@ async fn post_token(
             body.push(("client_id", &client.id));
             body.push(("client_secret", client.secret.expose_for_transport()));
         }
+        // A public client (`token_endpoint_auth_method: "none"`): the id in the
+        // form, no secret anywhere, and PKCE — already in `form` — as the proof.
+        ClientAuth::MetadataDocument => body.push(("client_id", &client.id)),
     }
 
     let response = request
@@ -1694,7 +1748,11 @@ mod tests {
     /// One authentication method per request, and it is the one the entry names.
     #[tokio::test]
     async fn the_client_secret_goes_exactly_one_place() {
-        for auth in [ClientAuth::Basic, ClientAuth::Post] {
+        for auth in [
+            ClientAuth::Basic,
+            ClientAuth::Post,
+            ClientAuth::MetadataDocument,
+        ] {
             let provider = FakeProvider::start(FakeProvider::issuing()).await;
             let connector = connector_for(&provider, auth);
             run_flow(&provider, connector).await;
@@ -1733,8 +1791,33 @@ mod tests {
                         "RFC 6749 §2.3: never two authentication methods"
                     );
                 }
+                // A public client: the id, the verifier, and no secret even
+                // though the registry happens to hold one.
+                ClientAuth::MetadataDocument => {
+                    assert_eq!(seen.form["client_id"], "our-client-id");
+                    assert!(seen.form.contains_key("code_verifier"));
+                    assert!(!seen.form.contains_key("client_secret"));
+                    assert!(seen.authorization.is_none(), "no Basic header");
+                }
             }
         }
+    }
+
+    /// A metadata-document connector needs no `AGENTOS_OAUTH_CLIENTS` line: its
+    /// `client_id` is the URL this deployment serves, and it wins over one.
+    #[test]
+    fn a_metadata_document_client_is_registered_from_the_origin() {
+        assert!(!OauthClients::default().has("elevenlabs"));
+        let clients = OauthClients::parse("elevenlabs:typed:by-hand,github:g:s")
+            .expect("parse")
+            .with_metadata_documents("https://agentos.test/");
+        assert_eq!(
+            clients.client_id("elevenlabs"),
+            Some("https://agentos.test/v1/mcp/oauth/client/elevenlabs.json")
+        );
+        // Basic and Post entries are left exactly as configured.
+        assert_eq!(clients.client_id("github"), Some("g"));
+        assert!(!clients.has("sentry"));
     }
 
     /// A 200 that is not a token response is not a token.

@@ -425,6 +425,13 @@ pub fn router(state: McpState) -> Router {
 pub fn public_router(state: McpState) -> Router {
     Router::new()
         .route(CALLBACK_PATH, axum::routing::get(oauth_callback))
+        // The client metadata document a CIMD provider fetches to learn who
+        // `client_id` is. Public because the provider's server fetches it, with
+        // no key; it holds nothing that is not already in every consent URL.
+        .route(
+            "/v1/mcp/oauth/client/{file}",
+            axum::routing::get(client_document),
+        )
         .with_state(state)
 }
 
@@ -2606,6 +2613,38 @@ fn bind_failed(server: &Slug) -> impl FnOnce(agentos_app::mcp::McpError) -> ApiE
     }
 }
 
+/// `GET /v1/mcp/oauth/client/{connector}.json`: the Client ID Metadata
+/// Document of a [`catalog::ClientAuth::MetadataDocument`] connector.
+///
+/// The provider requires the document's own `client_id` to equal the URL it was
+/// fetched from, so it is read back from the registry — the very string
+/// `oauth::start` puts in the consent URL — rather than rebuilt here. And its
+/// one `redirect_uris` entry is [`McpState::redirect_uri`], the same single
+/// string the flow sends. 404 for anything not in the catalogue in that mode.
+async fn client_document(State(state): State<McpState>, Path(file): Path<String>) -> Response {
+    let client_id = file
+        .strip_suffix(".json")
+        .and_then(|key| catalog::find_in(state.catalog, key))
+        .filter(|c| {
+            c.credential
+                .oauth()
+                .is_some_and(|o| o.auth == catalog::ClientAuth::MetadataDocument)
+        })
+        .and_then(|c| state.clients.client_id(c.key));
+    let Some(client_id) = client_id else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    Json(json!({
+        "client_id": client_id,
+        "client_name": "InternationalAgent",
+        "redirect_uris": [&*state.redirect_uri],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }))
+    .into_response()
+}
+
 /// Whether this deployment can actually offer this connector.
 ///
 /// A named function and not an inline closure, because it is the whole of the
@@ -2795,7 +2834,8 @@ mod tests {
             // tested directly in `an_unregistered_oauth_connector_is_not_offered`.
             let clients = Arc::new(
                 OauthClients::parse("github:cid:csecret,acme:acme-client-id:acme-client-secret")
-                    .expect("clients"),
+                    .expect("clients")
+                    .with_metadata_documents("https://agentos.test"),
             );
             let state = McpState::new(
                 db.clone(),
@@ -4549,6 +4589,72 @@ mod tests {
             filtered > 0,
             "no OAuth entry in CATALOG, so the branch above proved nothing"
         );
+    }
+
+    /// ElevenLabs is offered with no `AGENTOS_OAUTH_CLIENTS` line at all: its
+    /// `client_id` is derived from the deployment's origin.
+    #[test]
+    fn a_metadata_document_connector_is_offered_without_a_registration() {
+        let elevenlabs = catalog::find("elevenlabs").expect("in the catalogue");
+        let clients = OauthClients::default().with_metadata_documents("https://agentos.test");
+        assert!(offered(elevenlabs, &clients));
+        // And it does not drag a confidential client in with it.
+        assert!(!offered(catalog::find("github").expect("github"), &clients));
+    }
+
+    /// The client metadata document: public, its `client_id` is its own URL,
+    /// its one redirect is our callback, and nothing else is served.
+    #[tokio::test]
+    async fn the_client_metadata_document_names_itself_and_our_callback() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let get = |uri: &'static str| {
+            let public = h.public.clone();
+            async move {
+                let req = HttpRequest::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request");
+                public.oneshot(req).await.expect("service")
+            }
+        };
+
+        let path = "/v1/mcp/oauth/client/elevenlabs.json";
+        let response = get(path).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/json",
+            "a CIMD fetch expects JSON"
+        );
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let doc: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(doc["client_id"], format!("https://agentos.test{path}"));
+        assert_eq!(
+            doc["redirect_uris"],
+            json!([format!("https://agentos.test{CALLBACK_PATH}")])
+        );
+        assert_eq!(doc["client_name"], "InternationalAgent");
+        assert_eq!(doc["token_endpoint_auth_method"], "none");
+        assert_eq!(
+            doc["grant_types"],
+            json!(["authorization_code", "refresh_token"])
+        );
+        assert_eq!(doc["response_types"], json!(["code"]));
+
+        // A confidential client, an unknown key, and a missing suffix: none of
+        // them has a document.
+        for uri in [
+            "/v1/mcp/oauth/client/github.json",
+            "/v1/mcp/oauth/client/nope.json",
+            "/v1/mcp/oauth/client/elevenlabs",
+        ] {
+            assert_eq!(get(uri).await.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
     }
 
     /// The route is on the tier a browser can reach, and only that one.
